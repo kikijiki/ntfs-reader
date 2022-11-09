@@ -5,6 +5,7 @@
 pub mod aligned_reader;
 pub mod api;
 pub mod attribute;
+pub mod errors;
 pub mod file;
 pub mod file_info;
 pub mod journal;

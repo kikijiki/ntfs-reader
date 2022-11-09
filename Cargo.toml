@@ -1,6 +1,6 @@
 [package]
 name = "ntfs-reader"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -10,6 +10,7 @@ keywords = ["filesystem", "ntfs"]
 categories = ["filesystem"]
 
 [dependencies]
+thiserror = "1.0.37"
 binread = { version = "2.2.0", features = ["const_generics"] }
 time = { version = "0.3.9", features = ["large-dates", "macros"] }
 chrono = "0.4.21"

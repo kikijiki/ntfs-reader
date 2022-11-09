@@ -102,13 +102,6 @@ fn get_usn_record_path(
     }
 }
 
-//fn get_usn_record_current_path(
-//    volume: &Foundation::HANDLE,
-//    record: &Ioctl::USN_RECORD_V3,
-//) -> PathBuf {
-//    return get_file_path(&volume, &record.FileReferenceNumber).unwrap_or_default();
-//}
-
 #[derive(Debug, Clone)]
 pub struct UsnRecord {
     pub usn: i64,
@@ -357,10 +350,12 @@ mod test {
     use std::fs::File;
     use std::io::Write;
 
+    use crate::errors::NtfsReaderResult;
+
     use super::*;
 
     #[test]
-    fn file_create() -> Result<(), Box<dyn std::error::Error>> {
+    fn file_create() -> NtfsReaderResult<()> {
         let volume = Volume::new("\\\\?\\C:")?;
         let mut journal = Journal::new(volume, JournalOptions::default())?;
 
@@ -377,7 +372,7 @@ mod test {
     }
 
     #[test]
-    fn file_move() -> Result<(), Box<dyn std::error::Error>> {
+    fn file_move() -> NtfsReaderResult<()> {
         let volume = Volume::new("\\\\?\\C:")?;
         let mut journal = Journal::new(volume, JournalOptions::default())?;
 

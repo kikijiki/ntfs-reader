@@ -12,7 +12,8 @@ use std::{
 use tracing::info;
 
 use crate::{
-    aligned_reader::open_volume, api::*, attribute::NtfsAttribute, file::NtfsFile, volume::Volume,
+    aligned_reader::open_volume, api::*, attribute::NtfsAttribute, errors::NtfsReaderResult,
+    file::NtfsFile, volume::Volume,
 };
 
 pub type MftCache = HashMap<u64, PathBuf>;
@@ -25,7 +26,7 @@ pub struct Mft {
 }
 
 impl Mft {
-    pub fn new(volume: Volume) -> std::io::Result<Self> {
+    pub fn new(volume: Volume) -> NtfsReaderResult<Self> {
         let mut reader = open_volume(&volume.path)?;
 
         let mft_record = Self::get_record_fs(
@@ -233,7 +234,8 @@ mod tests {
     use std::time::Instant;
 
     use crate::{
-        file_info::FileInformation,
+        errors::NtfsReaderResult,
+        file_info::FileInfo,
         mft::{Mft, MftCache},
         volume::Volume,
     };
@@ -249,10 +251,10 @@ mod tests {
     }
 
     #[test]
-    fn iterate_files() -> Result<(), Box<dyn std::error::Error>> {
+    fn iterate_files() -> NtfsReaderResult<()> {
         set_global_tracing_subscriber();
 
-        let vol = Volume::new("\\\\.\\C:").unwrap();
+        let vol = Volume::new("\\\\.\\C:")?;
         let mft = Mft::new(vol.clone())?;
 
         let mut files = Vec::new();
@@ -261,7 +263,7 @@ mod tests {
         let start_time = Instant::now();
         let mut counter = 0usize;
         mft.iterate_files(|file| {
-            files.push(FileInformation::new(&mft, &file, None));
+            files.push(FileInfo::new(&mft, &file, None));
             counter += 1;
             if counter % 100000 == 0 {
                 info!(
@@ -282,10 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn iterate_files_cache() -> Result<(), Box<dyn std::error::Error>> {
+    fn iterate_files_cache() -> NtfsReaderResult<()> {
         set_global_tracing_subscriber();
 
-        let vol = Volume::new("\\\\.\\C:").unwrap();
+        let vol = Volume::new("\\\\.\\C:")?;
         let mft = Mft::new(vol.clone())?;
         let mut cache = MftCache::default();
 
@@ -295,7 +297,7 @@ mod tests {
         let start_time = Instant::now();
         let mut counter = 0usize;
         mft.iterate_files(|file| {
-            files.push(FileInformation::new(&mft, &file, Some(&mut cache)));
+            files.push(FileInfo::new(&mft, &file, Some(&mut cache)));
             counter += 1;
             if counter % 100000 == 0 {
                 info!(

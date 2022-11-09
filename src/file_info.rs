@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[derive(Default)]
-pub struct FileInformation {
+pub struct FileInfo {
     pub name: String,
     pub path: PathBuf,
     pub is_directory: bool,
@@ -24,9 +24,9 @@ pub struct FileInformation {
     pub modified: DateTime<Utc>,
 }
 
-impl FileInformation {
+impl FileInfo {
     pub fn new(mft: &Mft, file: &NtfsFile, cache: Option<&mut MftCache>) -> Self {
-        let mut info = FileInformation::default();
+        let mut info = FileInfo::default();
 
         let mut accessed = None;
         let mut created = None;

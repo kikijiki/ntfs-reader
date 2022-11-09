@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use binread::BinReaderExt;
 
-use crate::{aligned_reader::open_volume, api::*};
+use crate::{aligned_reader::open_volume, api::*, errors::NtfsReaderResult};
 
 #[derive(Clone)]
 pub struct Volume {
@@ -19,7 +19,7 @@ pub struct Volume {
 }
 
 impl Volume {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> NtfsReaderResult<Self> {
         let mut reader = open_volume(path.as_ref())?;
         let boot_sector = reader.read_le::<BootSector>()?;
 
