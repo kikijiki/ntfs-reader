@@ -5,10 +5,8 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
-use chrono::{DateTime, Utc};
 use time::OffsetDateTime;
 
 use crate::{
@@ -57,15 +55,14 @@ impl<'a> FileInfoCache<'a> for VecCache {
     }
 }
 
-#[derive(Default)]
 pub struct FileInfo {
     pub name: String,
     pub path: PathBuf,
     pub is_directory: bool,
     pub size: u64,
-    pub created: DateTime<Utc>,
-    pub accessed: DateTime<Utc>,
-    pub modified: DateTime<Utc>,
+    pub created: Option<OffsetDateTime>,
+    pub accessed: Option<OffsetDateTime>,
+    pub modified: Option<OffsetDateTime>,
 }
 
 impl FileInfo {
@@ -86,11 +83,10 @@ impl FileInfo {
     }
 
     fn _new(file: &NtfsFile) -> Self {
-        let mut info = FileInfo::default();
-
         let mut accessed = None;
         let mut created = None;
         let mut modified = None;
+        let mut size = 0u64;
 
         file.attributes(|att| {
             if att.header.type_id == NtfsAttributeType::StandardInformation as u32 {
@@ -103,20 +99,22 @@ impl FileInfo {
 
             if att.header.type_id == NtfsAttributeType::Data as u32 {
                 if att.header.is_non_resident == 0 {
-                    info.size = att.header_res.value_length as u64;
+                    size = att.header_res.value_length as u64;
                 } else {
-                    info.size = att.header_nonres.data_size;
+                    size = att.header_nonres.data_size;
                 }
             }
         });
 
-        info.created = SystemTime::from(created.unwrap_or(OffsetDateTime::UNIX_EPOCH)).into();
-        info.accessed = SystemTime::from(accessed.unwrap_or(OffsetDateTime::UNIX_EPOCH)).into();
-        info.modified = SystemTime::from(modified.unwrap_or(OffsetDateTime::UNIX_EPOCH)).into();
-
-        info.is_directory = file.is_directory();
-
-        info
+        FileInfo {
+            name: String::new(),
+            path: PathBuf::new(),
+            is_directory: file.is_directory(),
+            size,
+            created,
+            accessed,
+            modified,
+        }
     }
 
     fn _compute_path(&mut self, mft: &Mft, file: &NtfsFile) {
