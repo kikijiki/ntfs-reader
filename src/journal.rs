@@ -3,17 +3,23 @@
 // See the LICENSE files in the project root for details.
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::mem::size_of;
 use std::os::raw::c_void;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
+use windows::core::PCSTR;
 use windows::Win32::Foundation;
-use windows::Win32::Storage::FileSystem;
+use windows::Win32::Storage::FileSystem::{self, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Ioctl;
 use windows::Win32::System::IO;
 
 use crate::volume::Volume;
+
+#[repr(align(64))]
+#[derive(Debug, Clone, Copy)]
+struct AlignedBuffer<const N: usize>([u8; N]);
 
 fn get_usn_record_time(record: &Ioctl::USN_RECORD_V3) -> std::time::Duration {
     std::time::Duration::from_nanos((record.TimeStamp as u64) * 100u64)
@@ -36,7 +42,7 @@ fn get_usn_record_name(record: &Ioctl::USN_RECORD_V3) -> String {
 }
 
 fn get_file_path(
-    volume_handle: &Foundation::HANDLE,
+    volume_handle: Foundation::HANDLE,
     file_id: &FileSystem::FILE_ID_128,
 ) -> Option<PathBuf> {
     let file_id_desc = FileSystem::FILE_ID_DESCRIPTOR {
@@ -51,13 +57,14 @@ fn get_file_path(
         let file_handle = FileSystem::OpenFileById(
             volume_handle,
             &file_id_desc,
-            FileSystem::FILE_GENERIC_READ,
+            FileSystem::FILE_GENERIC_READ.0,
             FileSystem::FILE_SHARE_READ
                 | FileSystem::FILE_SHARE_WRITE
                 | FileSystem::FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            0,
-        );
+            None,
+            FILE_FLAGS_AND_ATTRIBUTES::default(),
+        )
+        .unwrap_or(Foundation::INVALID_HANDLE_VALUE);
 
         if file_handle.is_invalid() {
             return None;
@@ -73,28 +80,31 @@ fn get_file_path(
             info_buffer_size as u32,
         );
 
-        Foundation::CloseHandle(file_handle);
+        let _ = Foundation::CloseHandle(file_handle);
 
-        if info_result.as_bool() {
-            let (_, body, _) = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>();
-            let info = &body[0];
-            let name_len = info.FileNameLength as usize / size_of::<u16>();
-            let name_u16 =
-                std::slice::from_raw_parts(info.FileName.as_ptr() as *const u16, name_len);
-            let path = PathBuf::from(std::ffi::OsString::from_wide(name_u16));
-            return Some(path);
-        } else {
-            return None;
+        match info_result {
+            Ok(_) => {
+                let (_, body, _) = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>();
+                let info = &body[0];
+                let name_len = info.FileNameLength as usize / size_of::<u16>();
+                let name_u16 =
+                    std::slice::from_raw_parts(info.FileName.as_ptr() as *const u16, name_len);
+                let path = PathBuf::from(std::ffi::OsString::from_wide(name_u16));
+                return Some(path);
+            }
+            Err(_) => {
+                return None;
+            }
         }
     }
 }
 
 fn get_usn_record_path(
     volume_path: &Path,
-    volume_handle: &Foundation::HANDLE,
+    volume_handle: Foundation::HANDLE,
     record: &Ioctl::USN_RECORD_V3,
 ) -> PathBuf {
-    let parent_path = get_file_path(&volume_handle, &record.ParentFileReferenceNumber);
+    let parent_path = get_file_path(volume_handle, &record.ParentFileReferenceNumber);
     let file_name = get_usn_record_name(&record);
     match parent_path {
         Some(path) => volume_path.join(path).join(&file_name),
@@ -157,39 +167,36 @@ impl Journal {
         let volume_handle: Foundation::HANDLE;
 
         unsafe {
+            // Needs to be null terminated.
+            let path = CString::new(volume.path.to_str().unwrap()).unwrap();
+
             volume_handle = FileSystem::CreateFileA(
-                volume.path.to_string_lossy().to_string(),
-                FileSystem::FILE_GENERIC_READ | FileSystem::FILE_GENERIC_WRITE,
+                PCSTR::from_raw(path.as_bytes_with_nul().as_ptr()),
+                (FileSystem::FILE_GENERIC_READ | FileSystem::FILE_GENERIC_WRITE).0,
                 FileSystem::FILE_SHARE_READ
                     | FileSystem::FILE_SHARE_WRITE
                     | FileSystem::FILE_SHARE_DELETE,
-                std::ptr::null_mut(),
-                FileSystem::OPEN_EXISTING,
-                0,
                 None,
-            );
-            if volume_handle.is_invalid() {
-                return Err(std::io::Error::last_os_error());
-            }
+                FileSystem::OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES::default(),
+                None,
+            )?;
         }
 
         let mut journal = Ioctl::USN_JOURNAL_DATA_V2::default();
 
         unsafe {
             let mut ioctl_bytes_returned = 0;
-            let result = IO::DeviceIoControl(
+            IO::DeviceIoControl(
                 volume_handle,
                 Ioctl::FSCTL_QUERY_USN_JOURNAL,
-                std::ptr::null_mut(),
+                None,
                 0,
-                &mut journal as *mut _ as *mut c_void,
+                Some(&mut journal as *mut _ as *mut c_void),
                 size_of::<Ioctl::USN_JOURNAL_DATA_V2>() as u32,
-                &mut ioctl_bytes_returned,
-                std::ptr::null_mut(),
-            );
-            if result.0 == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+                Some(&mut ioctl_bytes_returned),
+                None,
+            )?;
         }
 
         let next_usn = match options.next_usn {
@@ -234,33 +241,28 @@ impl Journal {
             MaxMajorVersion: 3,
         };
 
-        let mut buffer = [0u8; BUFFER_SIZE];
+        let mut buffer = AlignedBuffer::<BUFFER_SIZE>([0u8; BUFFER_SIZE]);
+
         let mut ioctl_bytes_returned = 0;
 
         unsafe {
-            let ioctl_result = IO::DeviceIoControl(
+            let _ioctl_result = IO::DeviceIoControl(
                 self.volume_handle,
                 Ioctl::FSCTL_READ_USN_JOURNAL,
-                &mut read as *mut _ as *mut c_void,
+                Some(&mut read as *mut _ as *mut c_void),
                 size_of::<Ioctl::READ_USN_JOURNAL_DATA_V1>() as u32,
-                &mut buffer as *mut _ as *mut c_void,
+                Some(&mut buffer as *mut _ as *mut c_void),
                 BUFFER_SIZE as u32,
-                &mut ioctl_bytes_returned,
-                std::ptr::null_mut(),
-            );
-
-            if ioctl_result.0 == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+                Some(&mut ioctl_bytes_returned),
+                None,
+            )?;
         }
 
-        unsafe {
-            let next_usn = *(buffer.as_ptr() as *const i64);
-            if next_usn == 0 || next_usn < self.next_usn {
-                return Ok(results);
-            } else {
-                self.next_usn = next_usn;
-            }
+        let next_usn = i64::from_le_bytes(buffer.0[0..8].try_into().unwrap());
+        if next_usn == 0 || next_usn < self.next_usn {
+            return Ok(results);
+        } else {
+            self.next_usn = next_usn;
         }
 
         let mut offset = 8; // sizeof(USN)
@@ -270,7 +272,7 @@ impl Journal {
 
             unsafe {
                 let record_raw = std::mem::transmute::<*const u8, *const Ioctl::USN_RECORD_UNION>(
-                    buffer[offset as usize..].as_ptr(),
+                    buffer.0[offset as usize..].as_ptr(),
                 );
                 let header = &(*record_raw).Header;
 
@@ -288,7 +290,7 @@ impl Journal {
                 file_id: u128::from_le_bytes(record.FileReferenceNumber.Identifier),
                 parent_id: u128::from_le_bytes(record.ParentFileReferenceNumber.Identifier),
                 reason: record.Reason,
-                path: get_usn_record_path(&self.volume.path, &self.volume_handle, &record),
+                path: get_usn_record_path(&self.volume.path, self.volume_handle, &record),
             };
 
             if record.reason
@@ -335,12 +337,91 @@ impl Journal {
     pub fn get_next_usn(&self) -> i64 {
         self.next_usn
     }
+
+    pub fn get_reason_str(reason: u32) -> String {
+        let mut reason_str = String::new();
+
+        if reason & Ioctl::USN_REASON_BASIC_INFO_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_BASIC_INFO_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_CLOSE != 0 {
+            reason_str.push_str("USN_REASON_CLOSE ");
+        }
+        if reason & Ioctl::USN_REASON_COMPRESSION_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_COMPRESSION_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_DATA_EXTEND != 0 {
+            reason_str.push_str("USN_REASON_DATA_EXTEND ");
+        }
+        if reason & Ioctl::USN_REASON_DATA_OVERWRITE != 0 {
+            reason_str.push_str("USN_REASON_DATA_OVERWRITE ");
+        }
+        if reason & Ioctl::USN_REASON_DATA_TRUNCATION != 0 {
+            reason_str.push_str("USN_REASON_DATA_TRUNCATION ");
+        }
+        if reason & Ioctl::USN_REASON_DESIRED_STORAGE_CLASS_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_DESIRED_STORAGE_CLASS_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_EA_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_EA_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_ENCRYPTION_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_ENCRYPTION_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_FILE_CREATE != 0 {
+            reason_str.push_str("USN_REASON_FILE_CREATE ");
+        }
+        if reason & Ioctl::USN_REASON_FILE_DELETE != 0 {
+            reason_str.push_str("USN_REASON_FILE_DELETE ");
+        }
+        if reason & Ioctl::USN_REASON_HARD_LINK_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_HARD_LINK_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_INDEXABLE_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_INDEXABLE_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_INTEGRITY_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_INTEGRITY_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_NAMED_DATA_EXTEND != 0 {
+            reason_str.push_str("USN_REASON_NAMED_DATA_EXTEND ");
+        }
+        if reason & Ioctl::USN_REASON_NAMED_DATA_OVERWRITE != 0 {
+            reason_str.push_str("USN_REASON_NAMED_DATA_OVERWRITE ");
+        }
+        if reason & Ioctl::USN_REASON_NAMED_DATA_TRUNCATION != 0 {
+            reason_str.push_str("USN_REASON_NAMED_DATA_TRUNCATION ");
+        }
+        if reason & Ioctl::USN_REASON_OBJECT_ID_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_OBJECT_ID_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_RENAME_NEW_NAME != 0 {
+            reason_str.push_str("USN_REASON_RENAME_NEW_NAME ");
+        }
+        if reason & Ioctl::USN_REASON_RENAME_OLD_NAME != 0 {
+            reason_str.push_str("USN_REASON_RENAME_OLD_NAME ");
+        }
+        if reason & Ioctl::USN_REASON_REPARSE_POINT_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_REPARSE_POINT_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_SECURITY_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_SECURITY_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_STREAM_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_STREAM_CHANGE ");
+        }
+        if reason & Ioctl::USN_REASON_TRANSACTED_CHANGE != 0 {
+            reason_str.push_str("USN_REASON_TRANSACTED_CHANGE ");
+        }
+
+        reason_str
+    }
 }
 
 impl Drop for Journal {
     fn drop(&mut self) {
         unsafe {
-            Foundation::CloseHandle(self.volume_handle);
+            let _ = Foundation::CloseHandle(self.volume_handle);
         }
     }
 }
@@ -358,6 +439,7 @@ mod test {
     fn file_create() -> NtfsReaderResult<()> {
         let volume = Volume::new("\\\\?\\C:")?;
         let mut journal = Journal::new(volume, JournalOptions::default())?;
+        let _ = journal.read()?;
 
         // Make sure there is something to read.
         for x in 0..10 {
@@ -376,23 +458,35 @@ mod test {
         let volume = Volume::new("\\\\?\\C:")?;
         let mut journal = Journal::new(volume, JournalOptions::default())?;
 
-        let path_old = std::env::temp_dir().join("usn-journal-test-move.txt");
+        let path_old = std::env::temp_dir()
+            .canonicalize()?
+            .join("usn-journal-test-move.txt");
         let path_new = path_old.with_extension("moved");
 
+        let _ = std::fs::remove_file(path_new.as_path());
+        let _ = std::fs::remove_file(path_old.as_path());
+
         File::create(path_old.as_path())?.write_all(b"test")?;
+
+        let _ = journal.read()?;
         std::fs::rename(path_old.as_path(), path_new.as_path())?;
 
-        let results = journal.read()?;
-        for result in results {
-            if (result.reason & Ioctl::USN_REASON_RENAME_NEW_NAME != 0) && result.path == path_new {
-                if let Some(path) = journal.match_rename(&result) {
-                    assert_eq!(path, path_old);
-                } else {
-                    panic!("No old path found for {}", result.path.to_str().unwrap());
+        // Retry a few times in case there is a lot of unrelated activity.
+        for _ in 0..10 {
+            for result in journal.read()? {
+                if (result.reason & Ioctl::USN_REASON_RENAME_NEW_NAME != 0)
+                    && result.path == path_new
+                {
+                    if let Some(path) = journal.match_rename(&result) {
+                        assert_eq!(path, path_old);
+                        return Ok(());
+                    } else {
+                        panic!("No old path found for {}", result.path.to_str().unwrap());
+                    }
                 }
             }
         }
 
-        Ok(())
+        panic!("The file move was not detected");
     }
 }

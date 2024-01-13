@@ -102,6 +102,7 @@ pub enum NtfsFileNamespace {
 }
 
 #[repr(C, packed)]
+#[derive(Copy, Clone)]
 pub struct NtfsFileNameHeader {
     pub parent_directory_reference: u64,
     pub crap_0: [u8; 32],
@@ -132,9 +133,28 @@ pub enum NtfsFileNameFlags {
 }
 
 #[repr(C, packed)]
+#[derive(Copy, Clone)]
 pub struct NtfsFileName {
     pub header: NtfsFileNameHeader,
     pub data: [u16; 255],
+}
+
+#[repr(C, packed)]
+pub struct NtfsAttributeListEntry {
+    pub type_id: u32,
+    pub length: u16,
+    pub name_length: u8,
+    pub name_offset: u8,
+    pub starting_vcn: u64,
+    pub base_file_reference: u64,
+    pub id: u16,
+    //pub name: Option<String>,
+}
+
+impl NtfsAttributeListEntry {
+    pub fn reference(&self) -> u64 {
+        self.base_file_reference & 0x0000_FFFF_FFFF_FFFF
+    }
 }
 
 impl NtfsFileName {

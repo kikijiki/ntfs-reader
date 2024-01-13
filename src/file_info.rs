@@ -120,10 +120,11 @@ impl FileInfo {
     fn _compute_path(&mut self, mft: &Mft, file: &NtfsFile) {
         let mut next_parent;
 
-        if let Some(name) = file.get_best_file_name() {
+        if let Some(name) = file.get_best_file_name(mft) {
             self.name = name.to_string();
             next_parent = name.parent();
         } else {
+            //warn!("No name for file {}", file.number);
             return;
         }
 
@@ -139,7 +140,7 @@ impl FileInfo {
             }
             let cur_file = cur_file.unwrap();
 
-            if let Some(cur_name_att) = cur_file.get_best_file_name() {
+            if let Some(cur_name_att) = cur_file.get_best_file_name(mft) {
                 let cur_name = cur_name_att.to_string();
                 components.push((cur_file.number(), PathBuf::from(cur_name)));
                 next_parent = cur_name_att.parent();
@@ -165,7 +166,7 @@ impl FileInfo {
     ) {
         let mut next_parent;
 
-        if let Some(name) = file.get_best_file_name() {
+        if let Some(name) = file.get_best_file_name(mft) {
             self.name = name.to_string();
             next_parent = name.parent();
         } else {
@@ -191,7 +192,7 @@ impl FileInfo {
             }
             let cur_file = cur_file.unwrap();
 
-            if let Some(cur_name_att) = cur_file.get_best_file_name() {
+            if let Some(cur_name_att) = cur_file.get_best_file_name(mft) {
                 let cur_name = cur_name_att.to_string();
                 components.push((cur_file.number(), PathBuf::from(cur_name)));
                 next_parent = cur_name_att.parent();

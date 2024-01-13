@@ -6,7 +6,17 @@ use std::path::{Path, PathBuf};
 
 use binread::BinReaderExt;
 
-use crate::{aligned_reader::open_volume, api::*, errors::NtfsReaderResult};
+use windows::Win32::{
+    Foundation::HANDLE,
+    Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
+};
+
+use crate::{
+    aligned_reader::open_volume,
+    api::*,
+    errors::{NtfsReaderError, NtfsReaderResult},
+};
 
 #[derive(Clone)]
 pub struct Volume {
@@ -20,6 +30,10 @@ pub struct Volume {
 
 impl Volume {
     pub fn new<P: AsRef<Path>>(path: P) -> NtfsReaderResult<Self> {
+        if !Self::is_elevated().unwrap_or(false) {
+            return Err(NtfsReaderError::ElevationError);
+        }
+
         let mut reader = open_volume(path.as_ref())?;
         let boot_sector = reader.read_le::<BootSector>()?;
 
@@ -42,5 +56,25 @@ impl Volume {
             file_record_size,
             mft_position,
         })
+    }
+
+    fn is_elevated() -> windows::core::Result<bool> {
+        unsafe {
+            let mut handle: HANDLE = HANDLE(0);
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle)?;
+
+            let mut elevation = TOKEN_ELEVATION::default();
+            let mut returned_length = 0;
+
+            GetTokenInformation(
+                handle,
+                TokenElevation,
+                Some(&mut elevation as *mut _ as *mut _),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned_length,
+            )?;
+
+            Ok(elevation.TokenIsElevated != 0)
+        }
     }
 }

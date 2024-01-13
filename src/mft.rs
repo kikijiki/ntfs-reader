@@ -234,126 +234,111 @@ impl Mft {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Instant};
+
+    use std::time::Instant;
 
     use crate::{
-        errors::NtfsReaderResult,
-        file_info::{FileInfo, HashMapCache, VecCache},
-        mft::Mft,
-        volume::Volume,
+        errors::NtfsReaderResult, file::NtfsFile, file_info::FileInfo, mft::Mft, volume::Volume,
     };
     use tracing::{info, Level};
     use tracing_subscriber::FmtSubscriber;
 
-    pub fn set_global_tracing_subscriber() {
+    fn test_iteration<F>(name: &str, mft: &Mft, mut file_info_creator: F) -> NtfsReaderResult<()>
+    where
+        F: FnMut(&Mft, &NtfsFile) -> FileInfo,
+    {
+        let mut files = Vec::new();
+        files.reserve(mft.max_record as usize);
+
+        info!("======== Testing {} ========", name);
+        let mut counter = 0usize;
+
+        mft.iterate_files(|file| {
+            files.push(file_info_creator(mft, file));
+            counter += 1;
+            if counter % 100_000 == 0 {
+                info!("- read {} records", counter);
+            }
+        });
+
+        info!("Read all {} records", counter);
+        Ok(())
+    }
+
+    #[test]
+    fn iterate_files() -> NtfsReaderResult<()> {
         let subscriber = FmtSubscriber::builder()
             .with_max_level(Level::TRACE)
             .finish();
 
         let _ = tracing::subscriber::set_global_default(subscriber);
-    }
-
-    #[test]
-    fn iterate_files() -> NtfsReaderResult<()> {
-        set_global_tracing_subscriber();
 
         let vol = Volume::new("\\\\.\\C:")?;
+        let mft = Mft::new(vol)?;
 
-        info!("Reading MFT...");
-        let mft = Mft::new(vol.clone())?;
+        // Test without cache
+        let start_time = Instant::now();
+        test_iteration("No Cache", &mft, |mft: &Mft, file: &NtfsFile| {
+            FileInfo::new(mft, file)
+        })?;
+        let no_cache_iteration_duration = Instant::now() - start_time;
+        let no_cache_total_duration = no_cache_iteration_duration;
 
-        info!("======== Testing WITHOUT cache ========");
-        {
-            let mut files = Vec::new();
-            files.reserve(mft.max_record as usize);
+        // Test with HashMap cache
+        //let mut hashmap_cache = HashMapCache::default();
+        //let start_time = Instant::now();
+        //test_iteration("HashMap Cache", &mft, |mft: &Mft, file: &NtfsFile| {
+        //    FileInfo::with_cache(mft, file, &mut hashmap_cache)
+        //})?;
+        //let iteration_end_time = Instant::now();
+        //let hashmap_iteration_duration = iteration_end_time - start_time;
+        //
+        //let pre_drop_time = Instant::now();
+        //info!("Dropping cache...");
+        //drop(hashmap_cache);
+        //let hashmap_cache_drop_duration = Instant::now() - pre_drop_time;
+        //let hashmap_cache_total_duration = Instant::now() - start_time;
 
-            info!("Iteration start");
-            let start_time = Instant::now();
-            let mut counter = 0usize;
-            mft.iterate_files(|file| {
-                files.push(FileInfo::new(&mft, &file));
-                counter += 1;
-                if counter % 100_000 == 0 {
-                    info!(
-                        "- read {} records in {:?}",
-                        counter,
-                        Instant::now() - start_time
-                    );
-                }
-            });
+        // Test with Vec cache
+        //let mut vec_cache = VecCache::default();
+        //let start_time = Instant::now();
+        //test_iteration("Vec Cache", &mft, |mft: &Mft, file: &NtfsFile| {
+        //    FileInfo::with_cache(mft, file, &mut vec_cache)
+        //})?;
+        //let iteration_end_time = Instant::now();
+        //let vec_iteration_duration = iteration_end_time - start_time;
+        //
+        //let pre_drop_time = Instant::now();
+        //info!("Dropping cache...");
+        //drop(vec_cache);
+        //let vec_cache_drop_duration = Instant::now() - pre_drop_time;
+        //let vec_cache_total_duration = Instant::now() - start_time;
 
-            info!(
-                "Read all {} records in {:?}",
-                counter,
-                Instant::now() - start_time
-            );
-        }
+        info!("========= Timings Summary =========");
+        info!(
+            "{:<13} {:<10} {:<10} {:<10}",
+            "Type", "Iteration", "Drop", "Total"
+        );
+        info!(
+            "{:<13} {:<10.3?} {:<10} {:<10.3?}",
+            "No Cache", no_cache_iteration_duration, "0", no_cache_total_duration
+        );
 
-        info!("======== Testing WITH cache (HashMap) ========");
-        {
-            let mut files = Vec::new();
-            files.reserve(mft.max_record as usize);
+        //info!(
+        //    "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
+        //    "HashMap Cache",
+        //    hashmap_iteration_duration,
+        //    hashmap_cache_drop_duration,
+        //    hashmap_cache_total_duration
+        //);
 
-            let mut cache = HashMapCache::default();
-            cache.0.reserve(mft.max_record as usize);
-
-            info!("Iteration start");
-            let start_time = Instant::now();
-            let mut counter = 0usize;
-            mft.iterate_files(|file| {
-                files.push(FileInfo::with_cache(&mft, &file, &mut cache));
-                counter += 1;
-                if counter % 100_000 == 0 {
-                    info!(
-                        "- read {} records in {:?}",
-                        counter,
-                        Instant::now() - start_time
-                    );
-                }
-            });
-
-            info!("Dropping cache");
-            drop(cache);
-
-            info!(
-                "Read all {} records in {:?}",
-                counter,
-                Instant::now() - start_time
-            );
-        }
-
-        info!("======== Testing WITH cache (Vec) ========");
-        {
-            let mut files = Vec::new();
-            files.reserve(mft.max_record as usize);
-
-            let mut cache = VecCache::default();
-            cache.0.resize(mft.max_record as usize, PathBuf::new());
-
-            info!("Iteration start");
-            let start_time = Instant::now();
-            let mut counter = 0usize;
-            mft.iterate_files(|file| {
-                files.push(FileInfo::with_cache(&mft, &file, &mut cache));
-                counter += 1;
-                if counter % 100_000 == 0 {
-                    info!(
-                        "- read {} records in {:?}",
-                        counter,
-                        Instant::now() - start_time
-                    );
-                }
-            });
-
-            info!("Dropping cache");
-            drop(cache);
-
-            info!(
-                "Read all {} records in {:?}",
-                counter,
-                Instant::now() - start_time
-            );
-        }
+        //info!(
+        //    "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
+        //    "Vec Cache",
+        //    vec_iteration_duration,
+        //    vec_cache_drop_duration,
+        //    vec_cache_total_duration
+        //);
 
         Ok(())
     }

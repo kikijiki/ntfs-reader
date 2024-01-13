@@ -2,7 +2,7 @@
 // This project is dual licensed under the Apache License 2.0 and the MIT license.
 // See the LICENSE files in the project root for details.
 
-use crate::{api::*, attribute::NtfsAttribute};
+use crate::{api::*, attribute::NtfsAttribute, mft::Mft};
 
 pub struct NtfsFile<'a> {
     pub number: u64,
@@ -91,7 +91,7 @@ impl<'a> NtfsFile<'a> {
         None
     }
 
-    pub fn get_best_file_name(&self) -> Option<&NtfsFileName> {
+    pub fn get_best_file_name(&self, mft: &Mft) -> Option<NtfsFileName> {
         let mut offset = self.header.attributes_offset as usize;
         let mut best = None;
 
@@ -105,17 +105,53 @@ impl<'a> NtfsFile<'a> {
             }
 
             if att.header.type_id == NtfsAttributeType::FileName as u32 {
-                let name = NtfsAttribute::new(&self.data[offset..]).as_name();
+                let name = att.as_name();
 
                 // Ignore junctions
                 if !name.is_reparse_point() {
                     if name.header.namespace == NtfsFileNamespace::Win32 as u8
                         || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
                     {
-                        return Some(name);
+                        return Some(name.clone());
                     } else {
-                        best = Some(name);
+                        best = Some(name.clone());
                     }
+                }
+            }
+
+            if att.header.type_id == NtfsAttributeType::AttributeList as u32 {
+                let header = unsafe {
+                    &*(self.data[offset..].as_ptr() as *const NtfsResidentAttributeHeader)
+                };
+
+                let att_data = &self.data[offset + header.value_offset as usize..];
+
+                let mut att_offset = 0;
+                while att_offset < header.value_length as usize {
+                    let entry = unsafe {
+                        &*(att_data[att_offset..].as_ptr() as *const NtfsAttributeListEntry)
+                    };
+                    if entry.type_id == NtfsAttributeType::FileName as u32 {
+                        let rec = mft.get_record(entry.reference())?;
+                        let att = rec.get_attribute(NtfsAttributeType::FileName)?;
+                        let name = att.as_name();
+
+                        // Ignore junctions
+                        if !name.is_reparse_point() {
+                            if name.header.namespace == NtfsFileNamespace::Win32 as u8
+                                || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
+                            {
+                                return Some(name.clone());
+                            } else {
+                                best = Some(name.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    att_offset += entry.length as usize;
+                    // Make sure the offset is aligned to 8 bytes
+                    att_offset += (8 - (att_offset % 8)) % 8;
                 }
             }
 
