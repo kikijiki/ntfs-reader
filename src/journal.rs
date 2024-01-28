@@ -3,15 +3,18 @@
 // See the LICENSE files in the project root for details.
 
 use std::collections::VecDeque;
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::mem::size_of;
 use std::os::raw::c_void;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
 use windows::core::PCSTR;
-use windows::Win32::Foundation;
-use windows::Win32::Storage::FileSystem::{self, FILE_FLAGS_AND_ATTRIBUTES};
+use windows::Win32::Foundation::{self, ERROR_MORE_DATA};
+use windows::Win32::Storage::FileSystem::{
+    self, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+};
 use windows::Win32::System::Ioctl;
 use windows::Win32::System::IO;
 
@@ -57,12 +60,12 @@ fn get_file_path(
         let file_handle = FileSystem::OpenFileById(
             volume_handle,
             &file_id_desc,
-            FileSystem::FILE_GENERIC_READ.0,
+            0,
             FileSystem::FILE_SHARE_READ
                 | FileSystem::FILE_SHARE_WRITE
                 | FileSystem::FILE_SHARE_DELETE,
             None,
-            FILE_FLAGS_AND_ATTRIBUTES::default(),
+            FILE_FLAG_BACKUP_SEMANTICS,
         )
         .unwrap_or(Foundation::INVALID_HANDLE_VALUE);
 
@@ -70,32 +73,45 @@ fn get_file_path(
             return None;
         }
 
-        let info_buffer_size = size_of::<FileSystem::FILE_NAME_INFO>()
+        let mut info_buffer_size = size_of::<FileSystem::FILE_NAME_INFO>()
             + (Foundation::MAX_PATH as usize) * size_of::<u16>();
         let mut info_buffer = vec![0u8; info_buffer_size];
-        let info_result = FileSystem::GetFileInformationByHandleEx(
-            file_handle,
-            FileSystem::FileNameInfo,
-            &mut *info_buffer as *mut _ as *mut c_void,
-            info_buffer_size as u32,
-        );
+
+        let result = loop {
+            let info_result = FileSystem::GetFileInformationByHandleEx(
+                file_handle,
+                FileSystem::FileNameInfo,
+                info_buffer.as_mut_ptr() as *mut _,
+                info_buffer_size as u32,
+            );
+
+            match info_result {
+                Ok(_) => {
+                    let (_, body, _) = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>();
+                    let info = &body[0];
+                    let name_len = info.FileNameLength as usize / size_of::<u16>();
+                    let name_u16 =
+                        std::slice::from_raw_parts(info.FileName.as_ptr() as *const u16, name_len);
+                    break Some(PathBuf::from(OsString::from_wide(name_u16)));
+                }
+                Err(err) => {
+                    if err.code() == ERROR_MORE_DATA.to_hresult() {
+                        // The buffer was too small, resize it and try again.
+                        let required_size = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>().1
+                            [0]
+                        .FileNameLength as usize;
+
+                        info_buffer_size = size_of::<FileSystem::FILE_NAME_INFO>() + required_size;
+                        info_buffer.resize(info_buffer_size, 0);
+                    } else {
+                        break None;
+                    }
+                }
+            }
+        };
 
         let _ = Foundation::CloseHandle(file_handle);
-
-        match info_result {
-            Ok(_) => {
-                let (_, body, _) = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>();
-                let info = &body[0];
-                let name_len = info.FileNameLength as usize / size_of::<u16>();
-                let name_u16 =
-                    std::slice::from_raw_parts(info.FileName.as_ptr() as *const u16, name_len);
-                let path = PathBuf::from(std::ffi::OsString::from_wide(name_u16));
-                return Some(path);
-            }
-            Err(_) => {
-                return None;
-            }
-        }
+        result
     }
 }
 
@@ -104,11 +120,18 @@ fn get_usn_record_path(
     volume_handle: Foundation::HANDLE,
     record: &Ioctl::USN_RECORD_V3,
 ) -> PathBuf {
-    let parent_path = get_file_path(volume_handle, &record.ParentFileReferenceNumber);
+    if let Some(path) = get_file_path(volume_handle, &record.FileReferenceNumber) {
+        return volume_path.join(path);
+    }
+
     let file_name = get_usn_record_name(&record);
+    let parent_path = get_file_path(volume_handle, &record.ParentFileReferenceNumber);
     match parent_path {
         Some(path) => volume_path.join(path).join(&file_name),
-        None => PathBuf::from(&file_name),
+        None => {
+            warn!("Could not get full path for {}", file_name);
+            PathBuf::from(&file_name)
+        }
     }
 }
 
@@ -431,6 +454,8 @@ mod test {
     use std::fs::File;
     use std::io::Write;
 
+    use tracing::info;
+
     use crate::errors::NtfsReaderResult;
 
     use super::*;
@@ -488,5 +513,35 @@ mod test {
         }
 
         panic!("The file move was not detected");
+    }
+
+    #[test]
+    fn file_delete() -> NtfsReaderResult<()> {
+        let volume = Volume::new("\\\\?\\C:")?;
+        let mut journal = Journal::new(volume, JournalOptions::default())?;
+
+        let parent_path = std::env::temp_dir()
+            .canonicalize()?
+            .join("usn-journal-test-delete-dir");
+        let file_path = parent_path.join("usn-journal-test-delete.txt");
+
+        let _ = std::fs::remove_dir_all(&parent_path);
+
+        std::fs::create_dir_all(&parent_path)?;
+        File::create(&file_path)?.write_all(b"test")?;
+
+        let _ = journal.read()?;
+        std::fs::remove_dir_all(&parent_path)?;
+
+        // Retry a few times in case there is a lot of unrelated activity.
+        for _ in 0..10 {
+            for result in journal.read()? {
+                if result.reason & Ioctl::USN_REASON_FILE_DELETE != 0 && result.path == file_path {
+                    return Ok(());
+                }
+            }
+        }
+
+        panic!("The file deletion was not detected");
     }
 }
