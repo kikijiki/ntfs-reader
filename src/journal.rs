@@ -548,7 +548,8 @@ mod test {
         Ok(Journal::new(volume, options)?)
     }
 
-    fn make_test_dir(name: &str) -> NtfsReaderResult<PathBuf> {
+    fn make_test_dir(name: &str, version: u16) -> NtfsReaderResult<PathBuf> {
+        let name = format!("{}-v{}", name, version);
         let dir = std::env::temp_dir().canonicalize()?.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
@@ -567,7 +568,7 @@ mod test {
         let mut files = Vec::new();
         let mut found = Vec::new();
 
-        let dir = make_test_dir("usn-journal-test-create")?;
+        let dir = make_test_dir("usn-journal-test-create", journal_version)?;
 
         for x in 0..10 {
             let path = dir.join(format!("usn-journal-test-create-{}.txt", x));
@@ -598,7 +599,7 @@ mod test {
         /////////////////////////////////////////////////////////////////
         // PREPARE DATA
 
-        let dir = make_test_dir("usn-journal-test-move")?;
+        let dir = make_test_dir("usn-journal-test-move", journal_version)?;
 
         let path_old = dir.join("usn-journal-test-move.old");
         let path_new = path_old.with_extension("new");
@@ -644,7 +645,7 @@ mod test {
         /////////////////////////////////////////////////////////////////
         // PREPARE DATA
 
-        let dir = make_test_dir("usn-journal-test-delete")?;
+        let dir = make_test_dir("usn-journal-test-delete", journal_version)?;
         let file_path = dir.join("usn-journal-test-delete.txt");
         File::create(&file_path)?.write_all(b"test")?;
 
