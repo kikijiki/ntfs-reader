@@ -240,8 +240,16 @@ mod tests {
     use crate::{
         errors::NtfsReaderResult, file::NtfsFile, file_info::FileInfo, mft::Mft, volume::Volume,
     };
-    use tracing::{info, Level};
+    use tracing::info;
     use tracing_subscriber::FmtSubscriber;
+
+    fn init_tracing() {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 
     fn test_iteration<F>(name: &str, mft: &Mft, mut file_info_creator: F) -> NtfsReaderResult<()>
     where
@@ -267,11 +275,7 @@ mod tests {
 
     #[test]
     fn iterate_files() -> NtfsReaderResult<()> {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::TRACE)
-            .finish();
-
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        init_tracing();
 
         let vol = Volume::new("\\\\.\\C:")?;
         let mft = Mft::new(vol)?;
