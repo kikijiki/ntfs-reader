@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{self, ERROR_MORE_DATA};
+use windows::Win32::Foundation::{self, ERROR_MORE_DATA, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     self, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
 };
 use windows::Win32::System::Ioctl;
-use windows::Win32::System::IO;
+use windows::Win32::System::Threading::INFINITE;
+use windows::Win32::System::IO::{self, GetQueuedCompletionStatus};
 
 use crate::volume::Volume;
 
@@ -249,6 +250,7 @@ impl Default for JournalOptions {
 pub struct Journal {
     volume: Volume,
     volume_handle: Foundation::HANDLE,
+    port: Foundation::HANDLE,
     journal: Ioctl::USN_JOURNAL_DATA_V2,
     next_usn: i64,
     reason_mask: u32, // Ioctl::USN_REASON_FILE_CREATE
@@ -273,7 +275,7 @@ impl Journal {
                     | FileSystem::FILE_SHARE_DELETE,
                 None,
                 FileSystem::OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES::default(),
+                FileSystem::FILE_FLAG_OVERLAPPED,
                 None,
             )?;
         }
@@ -305,9 +307,12 @@ impl Journal {
             HistorySize::Limited(size) => size,
         };
 
+        let port = unsafe { IO::CreateIoCompletionPort(volume_handle, None, 0, 1)? };
+
         Ok(Journal {
             volume,
             volume_handle,
+            port,
             journal,
             next_usn,
             reason_mask: options.reason_mask,
@@ -339,18 +344,32 @@ impl Journal {
 
         let mut buffer = AlignedBuffer::<BUFFER_SIZE>([0u8; BUFFER_SIZE]);
 
-        let mut ioctl_bytes_returned = 0;
+        let mut bytes_returned = 0;
+        let mut overlapped = IO::OVERLAPPED {
+            ..Default::default()
+        };
 
         unsafe {
-            let _ioctl_result = IO::DeviceIoControl(
+            IO::DeviceIoControl(
                 self.volume_handle,
                 Ioctl::FSCTL_READ_USN_JOURNAL,
                 Some(&mut read as *mut _ as *mut c_void),
                 size_of::<Ioctl::READ_USN_JOURNAL_DATA_V1>() as u32,
                 Some(&mut buffer as *mut _ as *mut c_void),
                 BUFFER_SIZE as u32,
-                Some(&mut ioctl_bytes_returned),
-                None,
+                Some(&mut bytes_returned),
+                Some(&mut overlapped),
+            )?;
+
+            // Wait for the operation to complete.
+            let mut key = 0usize;
+            let mut overlapped = 0 as *mut _;
+            GetQueuedCompletionStatus(
+                self.port,
+                &mut bytes_returned,
+                &mut key,
+                &mut overlapped,
+                INFINITE,
             )?;
         }
 
@@ -362,7 +381,7 @@ impl Journal {
         }
 
         let mut offset = 8; // sizeof(USN)
-        while offset < ioctl_bytes_returned {
+        while offset < bytes_returned {
             let (record_len, record) = unsafe {
                 let record_ptr = std::mem::transmute::<*const u8, *const Ioctl::USN_RECORD_UNION>(
                     buffer.0[offset as usize..].as_ptr(),
@@ -514,6 +533,7 @@ impl Drop for Journal {
     fn drop(&mut self) {
         unsafe {
             let _ = Foundation::CloseHandle(self.volume_handle);
+            let _ = Foundation::CloseHandle(self.port);
         }
     }
 }
