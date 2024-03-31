@@ -148,7 +148,7 @@ fn get_usn_record_path(
         }
     }
 
-    warn!("Could not get path: {}", file_name);
+    //warn!("Could not get path: {}", file_name);
     PathBuf::from(&file_name)
 }
 
