@@ -361,6 +361,9 @@ impl Journal {
                 Some(&mut overlapped),
             )?;
 
+            // NOTE: Switched to overlapped IO while investigating a bug,
+            // but it's not needed (we just wait immediately anyway).
+
             // Wait for the operation to complete.
             let mut key = 0usize;
             let mut overlapped = 0 as *mut _;
@@ -675,7 +678,11 @@ mod test {
         let mut journal = make_journal(journal_version, Ioctl::USN_REASON_FILE_DELETE)?;
         while journal.read()?.len() > 0 {}
 
-        std::fs::remove_dir_all(&dir)?;
+        // This will not work well for the files inside because the directory
+        // will be gone by the time the journal is processed.
+        //std::fs::remove_dir_all(&dir)?;
+
+        std::fs::remove_file(&file_path)?;
 
         // Retry a few times in case there is a lot of unrelated activity.
         for _ in 0..10 {
