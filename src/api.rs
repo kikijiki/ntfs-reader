@@ -196,6 +196,10 @@ pub enum NtfsAttributeType {
 }
 
 pub fn ntfs_to_unix_time(src: u64) -> OffsetDateTime {
-    let unix = (src - EPOCH_DIFFERENCE) as i128;
-    OffsetDateTime::from_unix_timestamp_nanos(unix * 100).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    let unix_nanos = if src < EPOCH_DIFFERENCE {
+        0
+    } else {
+        (src - EPOCH_DIFFERENCE) as u128 * 100
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(unix_nanos as i128).unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
