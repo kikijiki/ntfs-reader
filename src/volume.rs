@@ -60,7 +60,7 @@ impl Volume {
 
     fn is_elevated() -> windows::core::Result<bool> {
         unsafe {
-            let mut handle: HANDLE = HANDLE(0);
+            let mut handle: HANDLE = HANDLE::default();
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle)?;
 
             let mut elevation = TOKEN_ELEVATION::default();

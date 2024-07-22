@@ -9,12 +9,9 @@ use std::os::raw::c_void;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{self, ERROR_MORE_DATA, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::{
-    self, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
-};
+use windows::Win32::Foundation::{self, ERROR_MORE_DATA};
+use windows::Win32::Storage::FileSystem::{self, FILE_FLAG_BACKUP_SEMANTICS};
 use windows::Win32::System::Ioctl;
 use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::System::IO::{self, GetQueuedCompletionStatus};
