@@ -8,4 +8,36 @@
 
 - Fast in-memory scan of all records in the $MFT
 - Usn journal reader
-- Undocumented and crappy
+
+## MFT Usage
+
+```rust
+// Open the C volume and its MFT.
+// Must have elevated privileges or it will fail.
+let volume = Volume::new("\\\\.\\C:")?;
+let mft = Mft::new(volume)?;
+
+// Iterate all files
+mft.iterate_files(|file| {
+    // Can also use FileInfo::with_cache().
+    let info = FileInfo::new(mft, file);
+
+    // Available fields: name, path, is_directory, size, timestamps (created, accessed, modified).
+});
+```
+
+## Journal Usage
+
+```rust
+let volume = Volume::new("\\\\?\\C:")?;
+
+// With `JournalOptions` you can customize things like where to start reading from (beginning, end, specific point),
+// the mask to use for the events and more.
+let journal = Journal::new(volume, JournalOptions::default())?;
+
+// Try to read some events.
+// You can call `read_sized` to use a custom buffer size.
+for result in journal.read()? {
+    // Available fields are: usn, timestamp, file_id, parent_id, reason, path.
+}
+```
