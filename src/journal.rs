@@ -45,7 +45,7 @@ fn get_usn_record_name(file_name_length: u16, file_name: *const u16) -> String {
         }
     }
 
-    return String::new();
+    String::new()
 }
 
 fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<PathBuf> {
@@ -100,8 +100,7 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
                     let (_, body, _) = info_buffer.align_to::<FileSystem::FILE_NAME_INFO>();
                     let info = &body[0];
                     let name_len = info.FileNameLength as usize / size_of::<u16>();
-                    let name_u16 =
-                        std::slice::from_raw_parts(info.FileName.as_ptr() as *const u16, name_len);
+                    let name_u16 = std::slice::from_raw_parts(info.FileName.as_ptr(), name_len);
                     break Some(PathBuf::from(OsString::from_wide(name_u16)));
                 }
                 Err(err) => {
@@ -363,7 +362,7 @@ impl Journal {
 
             // Wait for the operation to complete.
             let mut key = 0usize;
-            let mut overlapped = 0 as *mut _;
+            let mut overlapped = std::ptr::null_mut();
             GetQueuedCompletionStatus(
                 self.port,
                 &mut bytes_returned,
@@ -393,8 +392,8 @@ impl Journal {
                 }
 
                 let record = match (*record_ptr).Header.MajorVersion {
-                    2 => Some(UsnRecord::from_v2(&self, &(*record_ptr).V2)),
-                    3 => Some(UsnRecord::from_v3(&self, &(*record_ptr).V3)),
+                    2 => Some(UsnRecord::from_v2(self, &(*record_ptr).V2)),
+                    3 => Some(UsnRecord::from_v3(self, &(*record_ptr).V3)),
                     _ => None,
                 };
 
@@ -428,14 +427,10 @@ impl Journal {
             return None;
         }
 
-        match self
-            .history
+        self.history
             .iter()
             .find(|r| r.file_id == record.file_id && r.usn < record.usn)
-        {
-            Some(r) => Some(r.path.clone()),
-            None => None,
-        }
+            .map(|r| r.path.clone())
     }
 
     pub fn trim_history(&mut self, min_usn: Option<i64>) {
@@ -580,7 +575,7 @@ mod test {
         init_tracing();
 
         let mut journal = make_journal(journal_version, Ioctl::USN_REASON_FILE_CREATE)?;
-        while journal.read()?.len() > 0 {}
+        while !journal.read()?.is_empty() {}
 
         /////////////////////////////////////////////////////////////////
         // PREPARE DATA
@@ -636,7 +631,7 @@ mod test {
             journal_version,
             Ioctl::USN_REASON_RENAME_OLD_NAME | Ioctl::USN_REASON_RENAME_NEW_NAME,
         )?;
-        while journal.read()?.len() > 0 {}
+        while !journal.read()?.is_empty() {}
 
         std::fs::rename(path_old.as_path(), path_new.as_path())?;
 
@@ -673,7 +668,7 @@ mod test {
         // TEST JOURNAL
 
         let mut journal = make_journal(journal_version, Ioctl::USN_REASON_FILE_DELETE)?;
-        while journal.read()?.len() > 0 {}
+        while !journal.read()?.is_empty() {}
 
         // This will not work well for the files inside because the directory
         // will be gone by the time the journal is processed.

@@ -106,7 +106,7 @@ where
 }
 
 pub fn open_volume(path: &Path) -> std::io::Result<BufReader<AlignedReader<File>>> {
-    let file = File::open(&path)?;
+    let file = File::open(path)?;
     let sr = AlignedReader::new(file, 4096u64)?;
     let mut reader = BufReader::new(sr);
 

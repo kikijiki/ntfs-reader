@@ -112,9 +112,9 @@ impl<'a> NtfsFile<'a> {
                     if name.header.namespace == NtfsFileNamespace::Win32 as u8
                         || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
                     {
-                        return Some(name.clone());
+                        return Some(*name);
                     } else {
-                        best = Some(name.clone());
+                        best = Some(*name);
                     }
                 }
             }
@@ -141,9 +141,9 @@ impl<'a> NtfsFile<'a> {
                             if name.header.namespace == NtfsFileNamespace::Win32 as u8
                                 || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
                             {
-                                return Some(name.clone());
+                                return Some(*name);
                             } else {
-                                best = Some(name.clone());
+                                best = Some(*name);
                                 break;
                             }
                         }
@@ -171,10 +171,10 @@ impl<'a> NtfsFile<'a> {
     }
 
     pub fn is_used(&self) -> bool {
-        return self.header.flags & NtfsFileFlags::InUse as u16 != 0;
+        self.header.flags & NtfsFileFlags::InUse as u16 != 0
     }
 
     pub fn is_directory(&self) -> bool {
-        return self.header.flags & NtfsFileFlags::IsDirectory as u16 != 0;
+        self.header.flags & NtfsFileFlags::IsDirectory as u16 != 0
     }
 }

@@ -139,6 +139,14 @@ pub struct NtfsFileName {
     pub data: [u16; 255],
 }
 
+impl std::fmt::Display for NtfsFileName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.data;
+        let string = String::from_utf16_lossy(&data[..self.header.name_length as usize]);
+        write!(f, "{}", string)
+    }
+}
+
 #[repr(C, packed)]
 pub struct NtfsAttributeListEntry {
     pub type_id: u32,
@@ -158,11 +166,6 @@ impl NtfsAttributeListEntry {
 }
 
 impl NtfsFileName {
-    pub fn to_string(&self) -> String {
-        let data = self.data;
-        String::from_utf16_lossy(&data[..self.header.name_length as usize])
-    }
-
     pub fn parent(&self) -> u64 {
         self.header.parent_directory_reference & 0x0000_FFFF_FFFF_FFFF
     }

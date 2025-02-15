@@ -22,10 +22,10 @@ pub trait FileInfoCache<'a> {
 
 #[derive(Default)]
 pub struct HashMapCache(pub HashMap<u64, PathBuf>);
-impl<'a> FileInfoCache<'a> for HashMapCache {
+impl FileInfoCache<'_> for HashMapCache {
     fn get(&self, number: u64) -> Option<&Path> {
         if let Some(p) = self.0.get(&number) {
-            Some(&p)
+            Some(p)
         } else {
             None
         }
@@ -38,11 +38,11 @@ impl<'a> FileInfoCache<'a> for HashMapCache {
 
 #[derive(Default)]
 pub struct VecCache(pub Vec<Option<PathBuf>>);
-impl<'a> FileInfoCache<'a> for VecCache {
+impl FileInfoCache<'_> for VecCache {
     fn get(&self, number: u64) -> Option<&Path> {
         if self.0.len() > number as usize {
             if let Some(p) = &self.0[number as usize] {
-                return Some(&p);
+                return Some(p);
             }
         }
         None

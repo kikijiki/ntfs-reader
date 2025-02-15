@@ -37,8 +37,8 @@ mft.iterate_files(|file| {
 ```rust
 let volume = Volume::new("\\\\?\\C:")?;
 
-// With `JournalOptions` you can customize things like where to start reading from (beginning, end, specific point),
-// the mask to use for the events and more.
+// With `JournalOptions` you can customize things like where to start reading
+// from (beginning, end, specific point), the mask to use for the events and more.
 let journal = Journal::new(volume, JournalOptions::default())?;
 
 // Try to read some events.

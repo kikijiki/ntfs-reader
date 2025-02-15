@@ -53,8 +53,8 @@ impl Mft {
         for number in 0..max_record {
             let start = number as usize * volume.file_record_size as usize;
             let end = start + volume.file_record_size as usize;
-            let mut data = &mut data[start..end];
-            Self::fixup_record(&mut data);
+            let data = &mut data[start..end];
+            Self::fixup_record(data);
         }
 
         Ok(Mft {
@@ -78,12 +78,12 @@ impl Mft {
         }
 
         let bit = self.bitmap[bitmap_idx];
-        return bit & (1 << bitmap_off) != 0;
+        bit & (1 << bitmap_off) != 0
     }
 
     pub fn iterate_files<F>(&self, mut f: F)
     where
-        F: FnMut(&NtfsFile) -> (),
+        F: FnMut(&NtfsFile),
     {
         for number in FIRST_NORMAL_RECORD..self.max_record {
             if self.record_exists(number) {
@@ -105,7 +105,7 @@ impl Mft {
     pub fn get_record(&self, number: u64) -> Option<NtfsFile> {
         let data = self.get_record_data(number);
 
-        if NtfsFile::is_valid(&data) {
+        if NtfsFile::is_valid(data) {
             return Some(NtfsFile::new(number, data));
         }
 
@@ -116,15 +116,15 @@ impl Mft {
     where
         R: Seek + Read,
     {
-        let mut data = vec![0; file_record_size as usize];
+        let mut data = vec![0; file_record_size];
         let _ = fs.seek(SeekFrom::Start(position));
         let _ = fs.read_exact(&mut data);
 
         if NtfsFile::is_valid(&data) {
             Self::fixup_record(&mut data);
-            return data;
+            data
         } else {
-            return Vec::new();
+            Vec::new()
         }
     }
 
@@ -161,7 +161,7 @@ impl Mft {
                     let read_start = Instant::now();
 
                     let mut buffer = Vec::new();
-                    let (size, runs) = att.get_nonresident_data_runs(&volume);
+                    let (size, runs) = att.get_nonresident_data_runs(volume);
                     data.reserve_exact(size);
                     let mut copied = 0usize;
 
