@@ -1,6 +1,6 @@
 [package]
 name = "ntfs-reader"
-version = "0.4.1"
+version = "0.4.2"
 authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -10,13 +10,13 @@ keywords = ["filesystem", "ntfs"]
 categories = ["filesystem"]
 
 [dependencies]
-thiserror = "1.0"
+thiserror = "2.0"
 binread = { version = "2.2", features = ["const_generics"] }
 time = { version = "0.3" }
 tracing = "0.1"
 
 # For the journal
-windows = { version = "0.58", features = [
+windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Time",
     "Win32_System_SystemInformation",
