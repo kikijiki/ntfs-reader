@@ -238,7 +238,11 @@ mod tests {
     use std::time::Instant;
 
     use crate::{
-        errors::NtfsReaderResult, file::NtfsFile, file_info::FileInfo, mft::Mft, volume::Volume,
+        errors::NtfsReaderResult,
+        file::NtfsFile,
+        file_info::{FileInfo, HashMapCache, VecCache},
+        mft::Mft,
+        volume::Volume,
     };
     use tracing::info;
     use tracing_subscriber::FmtSubscriber;
@@ -288,35 +292,36 @@ mod tests {
         let no_cache_iteration_duration = Instant::now() - start_time;
         let no_cache_total_duration = no_cache_iteration_duration;
 
-        // Test with HashMap cache
-        //let mut hashmap_cache = HashMapCache::default();
-        //let start_time = Instant::now();
-        //test_iteration("HashMap Cache", &mft, |mft: &Mft, file: &NtfsFile| {
-        //    FileInfo::with_cache(mft, file, &mut hashmap_cache)
-        //})?;
-        //let iteration_end_time = Instant::now();
-        //let hashmap_iteration_duration = iteration_end_time - start_time;
-        //
-        //let pre_drop_time = Instant::now();
-        //info!("Dropping cache...");
-        //drop(hashmap_cache);
-        //let hashmap_cache_drop_duration = Instant::now() - pre_drop_time;
-        //let hashmap_cache_total_duration = Instant::now() - start_time;
+        //Test with HashMap cache
+        let mut hashmap_cache = HashMapCache::default();
+        let start_time = Instant::now();
+        test_iteration("HashMap Cache", &mft, |mft: &Mft, file: &NtfsFile| {
+            FileInfo::with_cache(mft, file, &mut hashmap_cache)
+        })?;
+        let iteration_end_time = Instant::now();
+        let hashmap_iteration_duration = iteration_end_time - start_time;
 
-        // Test with Vec cache
-        //let mut vec_cache = VecCache::default();
-        //let start_time = Instant::now();
-        //test_iteration("Vec Cache", &mft, |mft: &Mft, file: &NtfsFile| {
-        //    FileInfo::with_cache(mft, file, &mut vec_cache)
-        //})?;
-        //let iteration_end_time = Instant::now();
-        //let vec_iteration_duration = iteration_end_time - start_time;
-        //
-        //let pre_drop_time = Instant::now();
-        //info!("Dropping cache...");
-        //drop(vec_cache);
-        //let vec_cache_drop_duration = Instant::now() - pre_drop_time;
-        //let vec_cache_total_duration = Instant::now() - start_time;
+        let pre_drop_time = Instant::now();
+        info!("Dropping cache...");
+        drop(hashmap_cache);
+        let hashmap_cache_drop_duration = Instant::now() - pre_drop_time;
+        let hashmap_cache_total_duration = Instant::now() - start_time;
+
+        //Test with Vec cache
+        let mut vec_cache = VecCache::default();
+        vec_cache.0.resize(mft.max_record as usize, None);
+        let start_time = Instant::now();
+        test_iteration("Vec Cache", &mft, |mft: &Mft, file: &NtfsFile| {
+            FileInfo::with_cache(mft, file, &mut vec_cache)
+        })?;
+        let iteration_end_time = Instant::now();
+        let vec_iteration_duration = iteration_end_time - start_time;
+
+        let pre_drop_time = Instant::now();
+        info!("Dropping cache...");
+        drop(vec_cache);
+        let vec_cache_drop_duration = Instant::now() - pre_drop_time;
+        let vec_cache_total_duration = Instant::now() - start_time;
 
         info!("========= Timings Summary =========");
         info!(
@@ -328,21 +333,18 @@ mod tests {
             "No Cache", no_cache_iteration_duration, "0", no_cache_total_duration
         );
 
-        //info!(
-        //    "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
-        //    "HashMap Cache",
-        //    hashmap_iteration_duration,
-        //    hashmap_cache_drop_duration,
-        //    hashmap_cache_total_duration
-        //);
+        info!(
+            "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
+            "HashMap Cache",
+            hashmap_iteration_duration,
+            hashmap_cache_drop_duration,
+            hashmap_cache_total_duration
+        );
 
-        //info!(
-        //    "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
-        //    "Vec Cache",
-        //    vec_iteration_duration,
-        //    vec_cache_drop_duration,
-        //    vec_cache_total_duration
-        //);
+        info!(
+            "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
+            "Vec Cache", vec_iteration_duration, vec_cache_drop_duration, vec_cache_total_duration
+        );
 
         Ok(())
     }

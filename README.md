@@ -24,6 +24,12 @@ mft.iterate_files(|file| {
 
     // Available fields: name, path, is_directory, size, timestamps (created, accessed, modified).
 });
+
+// Some perf comparison
+// Type          Iteration  Drop       Total
+// No Cache      12.326s    0          12.326s
+// HashMap Cache 4.981s     323.150ms  5.305s
+// Vec Cache     3.756s     114.670ms  3.871s
 ```
 
 ## Journal Usage
