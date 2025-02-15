@@ -37,21 +37,22 @@ impl<'a> FileInfoCache<'a> for HashMapCache {
 }
 
 #[derive(Default)]
-pub struct VecCache(pub Vec<PathBuf>);
+pub struct VecCache(pub Vec<Option<PathBuf>>);
 impl<'a> FileInfoCache<'a> for VecCache {
     fn get(&self, number: u64) -> Option<&Path> {
         if self.0.len() > number as usize {
-            Some(&self.0[number as usize])
-        } else {
-            None
+            if let Some(p) = &self.0[number as usize] {
+                return Some(&p);
+            }
         }
+        None
     }
 
     fn insert(&mut self, number: u64, path: PathBuf) {
         if self.0.len() <= number as usize {
-            self.0.resize(number as usize + 1, PathBuf::new());
+            self.0.resize(number as usize + 1, None);
         }
-        self.0[number as usize] = path;
+        self.0[number as usize] = Some(path);
     }
 }
 
