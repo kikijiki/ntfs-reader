@@ -269,7 +269,7 @@ mod tests {
             files.push(file_info_creator(mft, file));
             counter += 1;
             if counter % 100_000 == 0 {
-                info!("- read {} records", counter);
+                info!("- Read {} records", counter);
             }
         });
 
