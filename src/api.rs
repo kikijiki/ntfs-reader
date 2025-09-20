@@ -198,6 +198,12 @@ pub enum NtfsAttributeType {
     End = 0xFFFF_FFFF,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum FileId {
+    Normal(u64),
+    Extended(windows::Win32::Storage::FileSystem::FILE_ID_128),
+}
+
 pub fn ntfs_to_unix_time(src: u64) -> OffsetDateTime {
     let unix = src.saturating_sub(EPOCH_DIFFERENCE) as i128;
     OffsetDateTime::from_unix_timestamp_nanos(unix * 100).unwrap_or(OffsetDateTime::UNIX_EPOCH)

@@ -26,6 +26,15 @@ impl<'a> NtfsFile<'a> {
         self.number
     }
 
+    pub fn reference_number(&self) -> u64 {
+        let seq = self.header.sequence_value as u64;
+        (seq << 48) | (self.number & 0x0000_FFFF_FFFF_FFFF)
+    }
+
+    pub fn get_file_id(&self) -> FileId {
+        FileId::Normal(self.reference_number())
+    }
+
     pub fn is_valid(data: &[u8]) -> bool {
         let header = unsafe { &*(data.as_ptr() as *const NtfsFileRecordHeader) };
         if &header.signature != FILE_RECORD_SIGNATURE {
@@ -71,7 +80,7 @@ impl<'a> NtfsFile<'a> {
         }
     }
 
-    pub fn get_attribute(&self, attribute_type: NtfsAttributeType) -> Option<NtfsAttribute> {
+    pub fn get_attribute(&self, attribute_type: NtfsAttributeType) -> Option<NtfsAttribute<'_>> {
         let mut offset = self.header.attributes_offset as usize;
 
         loop {

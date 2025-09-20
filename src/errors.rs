@@ -10,6 +10,8 @@ pub enum NtfsReaderError {
     BinReadError(#[from] binread::error::Error),
     #[error("windows error")]
     WindowsError(#[from] WindowsErrorWrapper),
+    #[error("missing required MFT attribute: {0}")]
+    MissingMftAttribute(String),
     #[error("unknown")]
     Unknown,
 }
@@ -17,8 +19,8 @@ pub enum NtfsReaderError {
 #[derive(Debug)]
 pub struct WindowsErrorWrapper(windows::core::Error);
 impl WindowsErrorWrapper {
-    pub fn from_win32() -> WindowsErrorWrapper {
-        WindowsErrorWrapper(windows::core::Error::from_win32())
+    pub fn from_thread() -> WindowsErrorWrapper {
+        WindowsErrorWrapper(windows::core::Error::from_thread())
     }
 }
 

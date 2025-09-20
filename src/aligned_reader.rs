@@ -79,7 +79,7 @@ where
         let raw_position = match pos {
             SeekFrom::Start(n) => Some(n),
             SeekFrom::End(_) => {
-                return Err(io::Error::new(io::ErrorKind::Other, "unsupported"));
+                return Err(io::Error::other("unsupported"));
             }
             SeekFrom::Current(n) => {
                 if n >= 0 {

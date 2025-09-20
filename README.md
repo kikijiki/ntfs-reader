@@ -9,6 +9,10 @@
 - Fast in-memory scan of all records in the $MFT
 - Usn journal reader
 
+## Examples
+
+See the `examples` directory for complete working examples.
+
 ## MFT Usage
 
 ```rust

@@ -2,16 +2,15 @@
 // This project is dual licensed under the Apache License 2.0 and the MIT license.
 // See the LICENSE files in the project root for details.
 
-use std::{
-    io::{Read, Seek, SeekFrom},
-    time::Instant,
-};
-
-use tracing::info;
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::{
-    aligned_reader::open_volume, api::*, attribute::NtfsAttribute, errors::NtfsReaderResult,
-    file::NtfsFile, volume::Volume,
+    aligned_reader::open_volume,
+    api::*,
+    attribute::NtfsAttribute,
+    errors::{NtfsReaderError, NtfsReaderResult},
+    file::NtfsFile,
+    volume::Volume,
 };
 
 pub struct Mft {
@@ -32,9 +31,11 @@ impl Mft {
         );
 
         let mut data =
-            Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Data);
+            Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Data)
+                .ok_or_else(|| NtfsReaderError::MissingMftAttribute("Data".to_string()))?;
         let bitmap =
-            Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Bitmap);
+            Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Bitmap)
+                .ok_or_else(|| NtfsReaderError::MissingMftAttribute("Bitmap".to_string()))?;
 
         let max_record = (data.len() / volume.file_record_size as usize) as u64;
 
@@ -102,7 +103,10 @@ impl Mft {
         &self.data[start..end]
     }
 
-    pub fn get_record(&self, number: u64) -> Option<NtfsFile> {
+    pub fn get_record(&self, number: u64) -> Option<NtfsFile<'_>> {
+        if number >= self.max_record {
+            return None;
+        }
         let data = self.get_record_data(number);
 
         if NtfsFile::is_valid(data) {
@@ -133,17 +137,14 @@ impl Mft {
         reader: &mut R,
         record: &[u8],
         attribute_type: NtfsAttributeType,
-    ) -> Vec<u8>
+    ) -> Option<Vec<u8>>
     where
         R: Seek + Read,
     {
-        let mut data = Vec::<u8>::new();
-
         let header = unsafe { &*(record.as_ptr() as *const NtfsFileRecordHeader) };
         let mut att_offset = header.attributes_offset as usize;
 
-        info!("Reading DATA attribute");
-
+        // First pass: look for the attribute directly in this record
         loop {
             if att_offset >= header.used_size as usize {
                 break;
@@ -155,50 +156,122 @@ impl Mft {
             }
 
             if att.header.type_id == attribute_type as u32 {
-                if att.header.is_non_resident == 0 {
-                    data.copy_from_slice(att.as_resident_data());
+                return Some(Self::read_attribute_data(reader, &att, volume));
+            }
+
+            att_offset += att.header.length as usize;
+        }
+
+        // Second pass: if not found, check attribute list entries
+        att_offset = header.attributes_offset as usize;
+        loop {
+            if att_offset >= header.used_size as usize {
+                break;
+            }
+
+            let att = NtfsAttribute::new(&record[att_offset..]);
+            if att.header.type_id == NtfsAttributeType::End as u32 {
+                break;
+            }
+
+            if att.header.type_id == NtfsAttributeType::AttributeList as u32 {
+                let att_list_data = if att.header.is_non_resident != 0 {
+                    Self::read_attribute_data(reader, &att, volume)
                 } else {
-                    let read_start = Instant::now();
+                    let header = unsafe {
+                        &*(record[att_offset..].as_ptr() as *const NtfsResidentAttributeHeader)
+                    };
+                    let value_length = header.value_length;
+                    record[att_offset + header.value_offset as usize
+                        ..att_offset + header.value_offset as usize + value_length as usize]
+                        .to_vec()
+                };
 
-                    let mut buffer = Vec::new();
-                    let (size, runs) = att.get_nonresident_data_runs(volume);
-                    data.reserve_exact(size);
-                    let mut copied = 0usize;
+                let mut list_offset = 0;
 
-                    for (run_idx, run) in runs.iter().enumerate() {
-                        if copied >= size {
-                            break;
-                        }
+                while list_offset < att_list_data.len() {
+                    let entry = unsafe {
+                        &*(att_list_data[list_offset..].as_ptr() as *const NtfsAttributeListEntry)
+                    };
 
-                        let run_start = Instant::now();
+                    let type_id = entry.type_id;
+                    let reference = entry.reference();
 
-                        let buf_size = usize::min(run.len(), size - copied);
-                        buffer.resize(buf_size, 0u8);
-
-                        let _ = reader.seek(SeekFrom::Start(run.start as u64));
-                        let _ = reader.read_exact(&mut buffer);
-
-                        data.append(&mut buffer.clone());
-                        copied += buf_size;
-
-                        info!(
-                            "- Run {}/{} (size: {}, took {:?})",
-                            run_idx + 1,
-                            runs.len(),
-                            buf_size,
-                            Instant::now() - run_start
+                    if type_id == attribute_type as u32 {
+                        let record_position =
+                            volume.mft_position + (reference * volume.file_record_size);
+                        let target_record = Self::get_record_fs(
+                            reader,
+                            volume.file_record_size as usize,
+                            record_position,
                         );
+
+                        if !target_record.is_empty() {
+                            // Find the attribute directly in the target record
+                            let header = unsafe {
+                                &*(target_record.as_ptr() as *const NtfsFileRecordHeader)
+                            };
+                            let mut att_offset = header.attributes_offset as usize;
+
+                            loop {
+                                if att_offset >= header.used_size as usize {
+                                    break;
+                                }
+
+                                let att = NtfsAttribute::new(&target_record[att_offset..]);
+                                if att.header.type_id == NtfsAttributeType::End as u32 {
+                                    break;
+                                }
+
+                                if att.header.type_id == attribute_type as u32 {
+                                    return Some(Self::read_attribute_data(reader, &att, volume));
+                                }
+
+                                att_offset += att.header.length as usize;
+                            }
+                        }
                     }
 
-                    info!(
-                        "Loaded DATA of size {} in {:?}",
-                        copied,
-                        Instant::now() - read_start
-                    );
+                    list_offset += entry.length as usize;
+                    // Align to 8 bytes
+                    list_offset += (8 - (list_offset % 8)) % 8;
                 }
             }
 
             att_offset += att.header.length as usize;
+        }
+
+        None
+    }
+
+    fn read_attribute_data<R>(reader: &mut R, att: &NtfsAttribute, volume: &Volume) -> Vec<u8>
+    where
+        R: Seek + Read,
+    {
+        let mut data = Vec::<u8>::new();
+
+        if att.header.is_non_resident == 0 {
+            data.copy_from_slice(att.as_resident_data());
+        } else {
+            let mut buffer = Vec::new();
+            let (size, runs) = att.get_nonresident_data_runs(volume);
+            data.reserve_exact(size);
+            let mut copied = 0usize;
+
+            for run in runs.iter() {
+                if copied >= size {
+                    break;
+                }
+
+                let buf_size = usize::min(run.len(), size - copied);
+                buffer.resize(buf_size, 0u8);
+
+                let _ = reader.seek(SeekFrom::Start(run.start as u64));
+                let _ = reader.read_exact(&mut buffer);
+
+                data.append(&mut buffer.clone());
+                copied += buf_size;
+            }
         }
 
         data
@@ -234,117 +307,64 @@ impl Mft {
 
 #[cfg(test)]
 mod tests {
-
-    use std::time::Instant;
-
     use crate::{
-        errors::NtfsReaderResult,
-        file::NtfsFile,
-        file_info::{FileInfo, HashMapCache, VecCache},
-        mft::Mft,
-        volume::Volume,
+        errors::NtfsReaderResult, mft::Mft, test_utils::TEST_VOLUME_LETTER, volume::Volume,
     };
-    use tracing::info;
-    use tracing_subscriber::FmtSubscriber;
 
-    fn init_tracing() {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .without_time()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    }
+    #[test]
+    fn test_mft_creation() -> NtfsReaderResult<()> {
+        let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+        let mft = Mft::new(vol)?;
 
-    fn test_iteration<F>(name: &str, mft: &Mft, mut file_info_creator: F) -> NtfsReaderResult<()>
-    where
-        F: FnMut(&Mft, &NtfsFile) -> FileInfo,
-    {
-        let mut files = Vec::new();
-        files.reserve(mft.max_record as usize);
+        assert!(mft.max_record > 0);
+        assert!(!mft.data.is_empty());
+        assert!(!mft.bitmap.is_empty());
 
-        info!("======== Testing {} ========", name);
-        let mut counter = 0usize;
-
-        mft.iterate_files(|file| {
-            files.push(file_info_creator(mft, file));
-            counter += 1;
-            if counter % 100_000 == 0 {
-                info!("- read {} records", counter);
-            }
-        });
-
-        info!("Read all {} records", counter);
         Ok(())
     }
 
     #[test]
-    fn iterate_files() -> NtfsReaderResult<()> {
-        init_tracing();
-
-        let vol = Volume::new("\\\\.\\C:")?;
+    fn test_record_exists() -> NtfsReaderResult<()> {
+        let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
         let mft = Mft::new(vol)?;
 
-        // Test without cache
-        let start_time = Instant::now();
-        test_iteration("No Cache", &mft, |mft: &Mft, file: &NtfsFile| {
-            FileInfo::new(mft, file)
-        })?;
-        let no_cache_iteration_duration = Instant::now() - start_time;
-        let no_cache_total_duration = no_cache_iteration_duration;
+        // MFT record (0) should always exist
+        assert!(mft.record_exists(0));
 
-        //Test with HashMap cache
-        let mut hashmap_cache = HashMapCache::default();
-        let start_time = Instant::now();
-        test_iteration("HashMap Cache", &mft, |mft: &Mft, file: &NtfsFile| {
-            FileInfo::with_cache(mft, file, &mut hashmap_cache)
-        })?;
-        let iteration_end_time = Instant::now();
-        let hashmap_iteration_duration = iteration_end_time - start_time;
+        // Test out of bounds
+        assert!(!mft.record_exists(u64::MAX));
+        assert!(!mft.record_exists(mft.max_record + 1));
 
-        let pre_drop_time = Instant::now();
-        info!("Dropping cache...");
-        drop(hashmap_cache);
-        let hashmap_cache_drop_duration = Instant::now() - pre_drop_time;
-        let hashmap_cache_total_duration = Instant::now() - start_time;
+        Ok(())
+    }
 
-        //Test with Vec cache
-        let mut vec_cache = VecCache::default();
-        vec_cache.0.resize(mft.max_record as usize, None);
-        let start_time = Instant::now();
-        test_iteration("Vec Cache", &mft, |mft: &Mft, file: &NtfsFile| {
-            FileInfo::with_cache(mft, file, &mut vec_cache)
-        })?;
-        let iteration_end_time = Instant::now();
-        let vec_iteration_duration = iteration_end_time - start_time;
+    #[test]
+    fn test_get_record() -> NtfsReaderResult<()> {
+        let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+        let mft = Mft::new(vol)?;
 
-        let pre_drop_time = Instant::now();
-        info!("Dropping cache...");
-        drop(vec_cache);
-        let vec_cache_drop_duration = Instant::now() - pre_drop_time;
-        let vec_cache_total_duration = Instant::now() - start_time;
+        // MFT record (0) should be retrievable
+        let record = mft.get_record(0);
+        assert!(record.is_some());
 
-        info!("========= Timings Summary =========");
-        info!(
-            "{:<13} {:<10} {:<10} {:<10}",
-            "Type", "Iteration", "Drop", "Total"
-        );
-        info!(
-            "{:<13} {:<10.3?} {:<10} {:<10.3?}",
-            "No Cache", no_cache_iteration_duration, "0", no_cache_total_duration
-        );
+        // Invalid record number should return None
+        let invalid = mft.get_record(mft.max_record + 1);
+        assert!(invalid.is_none());
 
-        info!(
-            "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
-            "HashMap Cache",
-            hashmap_iteration_duration,
-            hashmap_cache_drop_duration,
-            hashmap_cache_total_duration
-        );
+        Ok(())
+    }
 
-        info!(
-            "{:<13} {:<10.3?} {:<10.3?} {:<10.3?}",
-            "Vec Cache", vec_iteration_duration, vec_cache_drop_duration, vec_cache_total_duration
-        );
+    #[test]
+    fn test_iterate_files() -> NtfsReaderResult<()> {
+        let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+        let mft = Mft::new(vol)?;
+
+        let mut count = 0;
+        mft.iterate_files(|_file| {
+            count += 1;
+        });
+
+        assert!(count > 0, "Should iterate over at least some files");
 
         Ok(())
     }

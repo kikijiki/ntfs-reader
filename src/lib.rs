@@ -11,3 +11,7 @@ pub mod file_info;
 pub mod journal;
 pub mod mft;
 pub mod volume;
+
+pub mod test_utils {
+    pub const TEST_VOLUME_LETTER: &str = "C";
+}

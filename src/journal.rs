@@ -16,13 +16,7 @@ use windows::Win32::System::Ioctl;
 use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::System::IO::{self, GetQueuedCompletionStatus};
 
-use crate::volume::Volume;
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum FileId {
-    Normal(u64),
-    Extended(FileSystem::FILE_ID_128),
-}
+use crate::{api::FileId, volume::Volume};
 
 #[repr(align(64))]
 #[derive(Debug, Clone, Copy)]
@@ -544,6 +538,7 @@ mod test {
     use crate::errors::NtfsReaderResult;
 
     use super::*;
+    use crate::test_utils::TEST_VOLUME_LETTER;
 
     fn init_tracing() {
         let subscriber = FmtSubscriber::builder()
@@ -554,7 +549,7 @@ mod test {
     }
 
     fn make_journal(version: u16, reason_mask: u32) -> NtfsReaderResult<Journal> {
-        let volume = Volume::new("\\\\?\\C:")?;
+        let volume = Volume::new(format!("\\\\?\\{}:", TEST_VOLUME_LETTER))?;
         let options = JournalOptions {
             version_range: (version, version),
             reason_mask,
@@ -565,7 +560,7 @@ mod test {
 
     fn make_test_dir(name: &str, version: u16) -> NtfsReaderResult<PathBuf> {
         let name = format!("{}-v{}", name, version);
-        let dir = std::env::temp_dir().canonicalize()?.join(name);
+        let dir = PathBuf::from(format!("\\\\?\\{}:\\{}", TEST_VOLUME_LETTER, name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
