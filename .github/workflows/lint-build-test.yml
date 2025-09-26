@@ -33,6 +33,12 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      - name: Enable USN journal on runner drive
+        shell: pwsh
+        run: |
+          $drive = ($env:GITHUB_WORKSPACE -split ':')[0]
+          fsutil usn createjournal "${drive}:"
+
       - name: Test
         run: cargo test
         shell: pwsh
