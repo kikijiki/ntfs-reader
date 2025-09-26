@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use ntfs_reader::errors::NtfsReaderResult;
 use ntfs_reader::journal::{Journal, JournalOptions};
-use ntfs_reader::test_utils::{TempDirGuard, TEST_VOLUME_LETTER};
+use ntfs_reader::test_utils::{test_volume_letter, TempDirGuard};
 use ntfs_reader::volume::Volume;
 use tracing_subscriber::FmtSubscriber;
 use windows::Win32::System::Ioctl;
@@ -23,7 +23,7 @@ fn file_create() -> NtfsReaderResult<()> {
         reason_mask: Ioctl::USN_REASON_FILE_CREATE,
         ..JournalOptions::default()
     };
-    let volume = Volume::new(format!("\\\\?\\{}:", TEST_VOLUME_LETTER))?;
+    let volume = Volume::new(format!("\\\\?\\{}:", test_volume_letter()))?;
     let mut journal = Journal::new(volume, options)?;
     while !journal.read()?.is_empty() {}
 
@@ -32,7 +32,8 @@ fn file_create() -> NtfsReaderResult<()> {
 
     let dir = PathBuf::from(format!(
         "\\\\?\\{}:\\{}",
-        TEST_VOLUME_LETTER, "usn-journal-test-create"
+        test_volume_letter(),
+        "usn-journal-test-create"
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
@@ -67,7 +68,8 @@ fn file_move() -> NtfsReaderResult<()> {
 
     let dir = PathBuf::from(format!(
         "\\\\?\\{}:\\{}",
-        TEST_VOLUME_LETTER, "usn-journal-test-move"
+        test_volume_letter(),
+        "usn-journal-test-move"
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
@@ -84,7 +86,7 @@ fn file_move() -> NtfsReaderResult<()> {
         reason_mask: Ioctl::USN_REASON_RENAME_OLD_NAME | Ioctl::USN_REASON_RENAME_NEW_NAME,
         ..JournalOptions::default()
     };
-    let volume = Volume::new(format!("\\\\?\\{}:", TEST_VOLUME_LETTER))?;
+    let volume = Volume::new(format!("\\\\?\\{}:", test_volume_letter()))?;
     let mut journal = Journal::new(volume, options)?;
     while !journal.read()?.is_empty() {}
 
@@ -116,7 +118,8 @@ fn file_delete() -> NtfsReaderResult<()> {
 
     let dir = PathBuf::from(format!(
         "\\\\?\\{}:\\{}",
-        TEST_VOLUME_LETTER, "usn-journal-test-delete"
+        test_volume_letter(),
+        "usn-journal-test-delete"
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
@@ -128,7 +131,7 @@ fn file_delete() -> NtfsReaderResult<()> {
         reason_mask: Ioctl::USN_REASON_FILE_DELETE,
         ..JournalOptions::default()
     };
-    let volume = Volume::new(format!("\\\\?\\{}:", TEST_VOLUME_LETTER))?;
+    let volume = Volume::new(format!("\\\\?\\{}:", test_volume_letter()))?;
     let mut journal = Journal::new(volume, options)?;
     while !journal.read()?.is_empty() {}
 

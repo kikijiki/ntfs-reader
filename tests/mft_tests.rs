@@ -11,7 +11,7 @@ use ntfs_reader::attribute::DataRun;
 use ntfs_reader::errors::NtfsReaderResult;
 use ntfs_reader::file_info::FileInfo;
 use ntfs_reader::mft::Mft;
-use ntfs_reader::test_utils::{TempDirGuard, TEST_VOLUME_LETTER};
+use ntfs_reader::test_utils::{test_volume_letter, TempDirGuard};
 use ntfs_reader::volume::Volume;
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE,
@@ -21,7 +21,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 #[test]
 fn mft_creation() -> NtfsReaderResult<()> {
-    let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+    let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))?;
     let mft = Mft::new(vol)?;
 
     assert!(mft.max_record > 0);
@@ -33,7 +33,7 @@ fn mft_creation() -> NtfsReaderResult<()> {
 
 #[test]
 fn record_exists_boundaries() -> NtfsReaderResult<()> {
-    let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+    let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))?;
     let mft = Mft::new(vol)?;
 
     assert!(mft.record_exists(0));
@@ -45,7 +45,7 @@ fn record_exists_boundaries() -> NtfsReaderResult<()> {
 
 #[test]
 fn get_record_bounds() -> NtfsReaderResult<()> {
-    let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+    let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))?;
     let mft = Mft::new(vol)?;
 
     assert!(mft.get_record(0).is_some());
@@ -57,7 +57,7 @@ fn get_record_bounds() -> NtfsReaderResult<()> {
 #[test]
 fn iterate_files_discovers_temp_artifacts() -> NtfsReaderResult<()> {
     let dir_name = format!("mft-iterate-files-{}", std::process::id());
-    let dir = PathBuf::from(format!("\\\\?\\{}:\\{}", TEST_VOLUME_LETTER, dir_name));
+    let dir = PathBuf::from(format!("\\\\?\\{}:\\{}", test_volume_letter(), dir_name));
 
     let _cleanup = TempDirGuard::new(&dir)?;
 
@@ -101,7 +101,7 @@ fn iterate_files_discovers_temp_artifacts() -> NtfsReaderResult<()> {
     expected.insert(format!("{}\\{}", dir_name, "sparse.bin"));
     let sparse_key = format!("{}\\{}", dir_name, "sparse.bin");
 
-    let vol = Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER))?;
+    let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))?;
     let mft = Mft::new(vol)?;
 
     let to_rel_key = |p: &std::path::Path| -> Option<String> {

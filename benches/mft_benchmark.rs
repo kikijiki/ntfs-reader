@@ -12,7 +12,7 @@ mod tests {
     use ntfs_reader::{
         file_info::{FileInfo, HashMapCache, VecCache},
         mft::Mft,
-        test_utils::TEST_VOLUME_LETTER,
+        test_utils::test_volume_letter,
         volume::Volume,
     };
     use test::{black_box, Bencher};
@@ -24,8 +24,8 @@ mod tests {
             PARTIAL_ITERATION_LIMIT
         );
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -49,8 +49,8 @@ mod tests {
             PARTIAL_ITERATION_LIMIT
         );
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -73,8 +73,8 @@ mod tests {
             PARTIAL_ITERATION_LIMIT
         );
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -95,8 +95,8 @@ mod tests {
     fn bench_full_iteration_no_cache(b: &mut Bencher) {
         println!("Starting bench_full_iteration_no_cache (full iteration)");
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -113,8 +113,8 @@ mod tests {
     fn bench_full_iteration_hashmap_cache(b: &mut Bencher) {
         println!("Starting bench_full_iteration_hashmap_cache (full iteration)");
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -132,8 +132,8 @@ mod tests {
     fn bench_full_iteration_vec_cache(b: &mut Bencher) {
         println!("Starting bench_full_iteration_vec_cache (full iteration)");
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
@@ -155,8 +155,8 @@ mod tests {
             CACHE_DROP_ITERATION_LIMIT
         );
 
-        let vol =
-            Volume::new(format!("\\\\.\\{}:", TEST_VOLUME_LETTER)).expect("Failed to open volume");
+        let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))
+            .expect("Failed to open volume");
         let mft = Mft::new(vol).expect("Failed to create MFT");
 
         b.iter(|| {
