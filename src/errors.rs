@@ -12,6 +12,14 @@ pub enum NtfsReaderError {
     WindowsError(#[from] WindowsErrorWrapper),
     #[error("missing required MFT attribute: {0}")]
     MissingMftAttribute(String),
+    #[error("corrupt MFT record {number}")]
+    CorruptMftRecord { number: u64 },
+    #[error("invalid MFT record at byte position {position}")]
+    InvalidMftRecord { position: u64 },
+    #[error("corrupt MFT record at byte position {position}")]
+    CorruptMft { position: u64 },
+    #[error("invalid NTFS data run: {details}")]
+    InvalidDataRun { details: &'static str },
     #[error("unknown")]
     Unknown,
 }

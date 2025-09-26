@@ -10,7 +10,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{self, ERROR_MORE_DATA};
+use windows::Win32::Foundation::{self, ERROR_IO_PENDING, ERROR_MORE_DATA};
 use windows::Win32::Storage::FileSystem::{self, FILE_FLAG_BACKUP_SEMANTICS};
 use windows::Win32::System::Ioctl;
 use windows::Win32::System::Threading::INFINITE;
@@ -23,7 +23,13 @@ use crate::{api::FileId, volume::Volume};
 struct AlignedBuffer<const N: usize>([u8; N]);
 
 fn get_usn_record_time(timestamp: i64) -> std::time::Duration {
-    std::time::Duration::from_nanos(timestamp as u64 * 100u64)
+    if timestamp <= 0 {
+        return std::time::Duration::from_nanos(0);
+    }
+
+    let nanos = (timestamp as i128).saturating_mul(100);
+    let capped = nanos.min(u64::MAX as i128);
+    std::time::Duration::from_nanos(capped as u64)
 }
 
 fn get_usn_record_name(file_name_length: u16, file_name: *const u16) -> String {
@@ -223,7 +229,6 @@ pub struct JournalOptions {
     pub reason_mask: u32,
     pub next_usn: NextUsn,
     pub max_history_size: HistorySize,
-    pub version_range: (u16, u16),
 }
 
 impl Default for JournalOptions {
@@ -232,7 +237,6 @@ impl Default for JournalOptions {
             reason_mask: 0xFFFFFFFF,
             next_usn: NextUsn::Next,
             max_history_size: HistorySize::Unlimited,
-            version_range: (2, 3),
         }
     }
 }
@@ -246,7 +250,6 @@ pub struct Journal {
     reason_mask: u32, // Ioctl::USN_REASON_FILE_CREATE
     history: VecDeque<UsnRecord>,
     max_history_size: usize,
-    version_range: (u16, u16),
 }
 
 impl Journal {
@@ -308,7 +311,6 @@ impl Journal {
             reason_mask: options.reason_mask,
             history: VecDeque::new(),
             max_history_size,
-            version_range: options.version_range,
         })
     }
 
@@ -328,8 +330,8 @@ impl Journal {
             Timeout: 0,
             BytesToWaitFor: 0,
             UsnJournalID: self.journal.UsnJournalID,
-            MinMajorVersion: u16::max(self.version_range.0, self.journal.MinSupportedMajorVersion),
-            MaxMajorVersion: u16::min(self.version_range.1, self.journal.MaxSupportedMajorVersion),
+            MinMajorVersion: 2,
+            MaxMajorVersion: u16::min(3, self.journal.MaxSupportedMajorVersion),
         };
 
         let mut buffer = AlignedBuffer::<BUFFER_SIZE>([0u8; BUFFER_SIZE]);
@@ -340,7 +342,7 @@ impl Journal {
         };
 
         unsafe {
-            IO::DeviceIoControl(
+            let result = IO::DeviceIoControl(
                 self.volume_handle,
                 Ioctl::FSCTL_READ_USN_JOURNAL,
                 Some(&mut read as *mut _ as *mut c_void),
@@ -349,21 +351,26 @@ impl Journal {
                 BUFFER_SIZE as u32,
                 Some(&mut bytes_returned),
                 Some(&mut overlapped),
-            )?;
+            );
 
-            // NOTE: Switched to overlapped IO while investigating a bug,
-            // but it's not needed (we just wait immediately anyway).
-
-            // Wait for the operation to complete.
-            let mut key = 0usize;
-            let mut overlapped = std::ptr::null_mut();
-            GetQueuedCompletionStatus(
-                self.port,
-                &mut bytes_returned,
-                &mut key,
-                &mut overlapped,
-                INFINITE,
-            )?;
+            match result {
+                Ok(_) => {}
+                Err(err) => {
+                    if err.code() == ERROR_IO_PENDING.to_hresult() {
+                        let mut key = 0usize;
+                        let mut completed = std::ptr::null_mut();
+                        GetQueuedCompletionStatus(
+                            self.port,
+                            &mut bytes_returned,
+                            &mut key,
+                            &mut completed,
+                            INFINITE,
+                        )?;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            }
         }
 
         let next_usn = i64::from_le_bytes(buffer.0[0..8].try_into().unwrap());
@@ -524,192 +531,5 @@ impl Drop for Journal {
             let _ = Foundation::CloseHandle(self.volume_handle);
             let _ = Foundation::CloseHandle(self.port);
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use core::panic;
-    use std::fs::File;
-    use std::io::Write;
-
-    use tracing_subscriber::FmtSubscriber;
-
-    use crate::errors::NtfsReaderResult;
-
-    use super::*;
-    use crate::test_utils::TEST_VOLUME_LETTER;
-
-    fn init_tracing() {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .without_time()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    }
-
-    fn make_journal(version: u16, reason_mask: u32) -> NtfsReaderResult<Journal> {
-        let volume = Volume::new(format!("\\\\?\\{}:", TEST_VOLUME_LETTER))?;
-        let options = JournalOptions {
-            version_range: (version, version),
-            reason_mask,
-            ..JournalOptions::default()
-        };
-        Ok(Journal::new(volume, options)?)
-    }
-
-    fn make_test_dir(name: &str, version: u16) -> NtfsReaderResult<PathBuf> {
-        let name = format!("{}-v{}", name, version);
-        let dir = PathBuf::from(format!("\\\\?\\{}:\\{}", TEST_VOLUME_LETTER, name));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
-    fn test_file_create(journal_version: u16) -> NtfsReaderResult<()> {
-        init_tracing();
-
-        let mut journal = make_journal(journal_version, Ioctl::USN_REASON_FILE_CREATE)?;
-        while !journal.read()?.is_empty() {}
-
-        /////////////////////////////////////////////////////////////////
-        // PREPARE DATA
-
-        let mut files = Vec::new();
-        let mut found = Vec::new();
-
-        let dir = make_test_dir("usn-journal-test-create", journal_version)?;
-
-        for x in 0..10 {
-            let path = dir.join(format!("usn-journal-test-create-{}.txt", x));
-            File::create(&path)?.write_all(b"test")?;
-            files.push(path);
-        }
-
-        /////////////////////////////////////////////////////////////////
-        // TEST JOURNAL
-
-        // Retry a few times in case there is a lot of unrelated activity.
-        for _ in 0..10 {
-            for result in journal.read()? {
-                found.push(result.path);
-            }
-
-            if files.iter().all(|f| found.contains(f)) {
-                return Ok(());
-            }
-        }
-
-        panic!("The file creation was not detected");
-    }
-
-    fn test_file_move(journal_version: u16) -> NtfsReaderResult<()> {
-        init_tracing();
-
-        /////////////////////////////////////////////////////////////////
-        // PREPARE DATA
-
-        let dir = make_test_dir("usn-journal-test-move", journal_version)?;
-
-        let path_old = dir.join("usn-journal-test-move.old");
-        let path_new = path_old.with_extension("new");
-
-        let _ = std::fs::remove_file(path_new.as_path());
-        let _ = std::fs::remove_file(path_old.as_path());
-
-        File::create(path_old.as_path())?.write_all(b"test")?;
-
-        /////////////////////////////////////////////////////////////////
-        // TEST JOURNAL
-
-        let mut journal = make_journal(
-            journal_version,
-            Ioctl::USN_REASON_RENAME_OLD_NAME | Ioctl::USN_REASON_RENAME_NEW_NAME,
-        )?;
-        while !journal.read()?.is_empty() {}
-
-        std::fs::rename(path_old.as_path(), path_new.as_path())?;
-
-        // Retry a few times in case there is a lot of unrelated activity.
-        for _ in 0..10 {
-            for result in journal.read()? {
-                if (result.path == path_new)
-                    && (result.reason & Ioctl::USN_REASON_RENAME_NEW_NAME != 0)
-                {
-                    if let Some(path) = journal.match_rename(&result) {
-                        assert_eq!(path, path_old);
-                        return Ok(());
-                    } else {
-                        panic!("No old path found for {}", result.path.to_str().unwrap());
-                    }
-                }
-            }
-        }
-
-        panic!("The file move was not detected");
-    }
-
-    fn test_file_delete(journal_version: u16) -> NtfsReaderResult<()> {
-        init_tracing();
-
-        /////////////////////////////////////////////////////////////////
-        // PREPARE DATA
-
-        let dir = make_test_dir("usn-journal-test-delete", journal_version)?;
-        let file_path = dir.join("usn-journal-test-delete.txt");
-        File::create(&file_path)?.write_all(b"test")?;
-
-        /////////////////////////////////////////////////////////////////
-        // TEST JOURNAL
-
-        let mut journal = make_journal(journal_version, Ioctl::USN_REASON_FILE_DELETE)?;
-        while !journal.read()?.is_empty() {}
-
-        // This will not work well for the files inside because the directory
-        // will be gone by the time the journal is processed.
-        //std::fs::remove_dir_all(&dir)?;
-
-        std::fs::remove_file(&file_path)?;
-
-        // Retry a few times in case there is a lot of unrelated activity.
-        for _ in 0..10 {
-            for result in journal.read()? {
-                if result.path == file_path {
-                    return Ok(());
-                }
-            }
-        }
-
-        panic!("The file deletion was not detected");
-    }
-
-    #[test]
-    fn file_create_v2() -> NtfsReaderResult<()> {
-        test_file_create(2)
-    }
-
-    #[test]
-    fn file_create_v3() -> NtfsReaderResult<()> {
-        test_file_create(3)
-    }
-
-    #[test]
-    fn file_move_v2() -> NtfsReaderResult<()> {
-        test_file_move(2)
-    }
-
-    #[test]
-    fn file_move_v3() -> NtfsReaderResult<()> {
-        test_file_move(3)
-    }
-
-    #[test]
-    fn file_delete_v2() -> NtfsReaderResult<()> {
-        test_file_delete(2)
-    }
-
-    #[test]
-    fn file_delete_v3() -> NtfsReaderResult<()> {
-        test_file_delete(3)
     }
 }

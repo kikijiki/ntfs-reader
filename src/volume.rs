@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use binread::BinReaderExt;
 
 use windows::Win32::{
-    Foundation::HANDLE,
+    Foundation::{CloseHandle, HANDLE},
     Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -41,7 +41,7 @@ impl Volume {
         let volume_size = boot_sector.total_sectors as u64 * boot_sector.sector_size as u64;
         let file_record_size = {
             if boot_sector.file_record_size_info > 0 {
-                boot_sector.file_record_size_info as u64
+                (boot_sector.file_record_size_info as u64) * cluster_size
             } else {
                 1u64 << (-boot_sector.file_record_size_info) as u64
             }
@@ -63,18 +63,23 @@ impl Volume {
             let mut handle: HANDLE = HANDLE::default();
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle)?;
 
-            let mut elevation = TOKEN_ELEVATION::default();
-            let mut returned_length = 0;
+            let result = (|| -> windows::core::Result<bool> {
+                let mut elevation = TOKEN_ELEVATION::default();
+                let mut returned_length = 0;
 
-            GetTokenInformation(
-                handle,
-                TokenElevation,
-                Some(&mut elevation as *mut _ as *mut _),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut returned_length,
-            )?;
+                GetTokenInformation(
+                    handle,
+                    TokenElevation,
+                    Some(&mut elevation as *mut _ as *mut _),
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut returned_length,
+                )?;
 
-            Ok(elevation.TokenIsElevated != 0)
+                Ok(elevation.TokenIsElevated != 0)
+            })();
+
+            let _ = CloseHandle(handle);
+            result
         }
     }
 }

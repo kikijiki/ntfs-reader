@@ -42,7 +42,11 @@ where
     }
 
     fn round_up(&self, n: u64) -> u64 {
-        self.round_down(n) + self.alignment
+        if n.is_multiple_of(self.alignment) {
+            n
+        } else {
+            self.round_down(n) + self.alignment
+        }
     }
 }
 
@@ -58,6 +62,7 @@ where
         let size = self.round_up(end as u64) as usize;
 
         if aligned_position != self.buffer_pos || size > self.buffer_size {
+            self.inner.seek(SeekFrom::Start(aligned_position))?;
             self.buffer.resize(size, 0u8);
             self.inner.read_exact(&mut self.buffer)?;
             self.buffer_pos = aligned_position;

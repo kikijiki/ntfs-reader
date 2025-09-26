@@ -91,18 +91,20 @@ impl FileInfo {
 
         file.attributes(|att| {
             if att.header.type_id == NtfsAttributeType::StandardInformation as u32 {
-                let stdinfo = att.as_standard_info();
-
-                accessed = Some(ntfs_to_unix_time(stdinfo.access_time));
-                created = Some(ntfs_to_unix_time(stdinfo.creation_time));
-                modified = Some(ntfs_to_unix_time(stdinfo.modification_time));
+                if let Some(stdinfo) = att.as_standard_info() {
+                    accessed = Some(ntfs_to_unix_time(stdinfo.access_time));
+                    created = Some(ntfs_to_unix_time(stdinfo.creation_time));
+                    modified = Some(ntfs_to_unix_time(stdinfo.modification_time));
+                }
             }
 
             if att.header.type_id == NtfsAttributeType::Data as u32 {
                 if att.header.is_non_resident == 0 {
-                    size = att.header_res.value_length as u64;
-                } else {
-                    size = att.header_nonres.data_size;
+                    if let Some(header) = att.resident_header() {
+                        size = header.value_length as u64;
+                    }
+                } else if let Some(header) = att.nonresident_header() {
+                    size = header.data_size;
                 }
             }
         });

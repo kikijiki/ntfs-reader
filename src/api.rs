@@ -119,6 +119,7 @@ pub enum NtfsFileNameFlags {
     ReadOnly = 0x0001,
     Hidden = 0x0002,
     System = 0x0004,
+    IsDirectory = 0x0000_0010,
     Archive = 0x0020,
     Device = 0x0040,
     Normal = 0x0080,
@@ -129,7 +130,6 @@ pub enum NtfsFileNameFlags {
     Offline = 0x1000,
     NotContentIndexed = 0x2000,
     Encrypted = 0x4000,
-    IsDirectory = 0x1000_0000,
 }
 
 #[repr(C, packed)]
