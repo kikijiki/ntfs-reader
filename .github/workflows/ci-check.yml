@@ -1,0 +1,36 @@
+name: ci-check
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  lint-build-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install clippy and rustfmt
+        run: rustup component add clippy rustfmt
+
+      - name: Check
+        run: mise run check
+
+      - name: Build
+        run: mise run build
+
+      - name: Enable USN journal on runner drive
+        shell: pwsh
+        run: |
+          $drive = ($env:GITHUB_WORKSPACE -split ':')[0]
+          fsutil usn createjournal "${drive}:"
+
+      - name: Test
+        run: mise run test

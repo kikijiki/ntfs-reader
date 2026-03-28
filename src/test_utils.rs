@@ -2,9 +2,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // Return the letter of the volume to use for tests.
-// If the CI environment variable is present, prefer the current
-// working directory's drive letter; otherwise fall back to the
-// default ramdisk letter 'R'.
+// Priority:
+// 1. CI: use the current working directory's drive letter.
+// 2. Local: use the R: ramdisk if available.
+// 3. Fallback: use the system drive (typically C:).
 pub fn test_volume_letter() -> String {
     if env::var_os("CI").is_some() {
         if let Ok(cwd) = env::current_dir() {
@@ -17,8 +18,18 @@ pub fn test_volume_letter() -> String {
         }
     }
 
-    // Default ramdisk letter used in local dev machines.
-    "R".to_string()
+    // Prefer the ramdisk letter used in local dev machines.
+    // Fall back to the system drive if R: is unavailable.
+    let ramdisk = Path::new("R:\\");
+    if ramdisk.exists() {
+        return "R".to_string();
+    }
+
+    env::var("SystemDrive")
+        .ok()
+        .and_then(|s| s.chars().next())
+        .unwrap_or('C')
+        .to_string()
 }
 
 pub struct TempDirGuard(pub PathBuf);

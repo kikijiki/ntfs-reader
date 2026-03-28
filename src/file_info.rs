@@ -15,6 +15,8 @@ use crate::{
     mft::Mft,
 };
 
+const MAX_PATH_DEPTH: usize = 1024;
+
 pub trait FileInfoCache<'a> {
     fn get(&self, number: u64) -> Option<&Path>;
     fn insert(&mut self, number: u64, path: PathBuf);
@@ -40,7 +42,7 @@ impl FileInfoCache<'_> for HashMapCache {
 pub struct VecCache(pub Vec<Option<PathBuf>>);
 impl FileInfoCache<'_> for VecCache {
     fn get(&self, number: u64) -> Option<&Path> {
-        if self.0.len() > number as usize {
+        if (self.0.len() as u64) > number {
             if let Some(p) = &self.0[number as usize] {
                 return Some(p);
             }
@@ -49,7 +51,7 @@ impl FileInfoCache<'_> for VecCache {
     }
 
     fn insert(&mut self, number: u64, path: PathBuf) {
-        if self.0.len() <= number as usize {
+        if (self.0.len() as u64) <= number {
             self.0.resize(number as usize + 1, None);
         }
         self.0[number as usize] = Some(path);
@@ -127,21 +129,20 @@ impl FileInfo {
             self.name = name.to_string();
             next_parent = name.parent();
         } else {
-            //warn!("No name for file {}", file.number);
+            tracing::warn!("No name for file {}", file.number);
             return;
         }
 
         let mut components = Vec::new();
-        loop {
+        for _ in 0..MAX_PATH_DEPTH {
             if next_parent == ROOT_RECORD {
                 break;
             }
 
-            let cur_file = mft.get_record(next_parent);
-            if cur_file.is_none() {
-                return;
-            }
-            let cur_file = cur_file.unwrap();
+            let cur_file = match mft.get_record(next_parent) {
+                Some(f) => f,
+                None => return,
+            };
 
             if let Some(cur_name_att) = cur_file.get_best_file_name(mft) {
                 let cur_name = cur_name_att.to_string();
@@ -178,7 +179,7 @@ impl FileInfo {
 
         let mut components = Vec::new();
         let mut cached_path = None;
-        loop {
+        for _ in 0..MAX_PATH_DEPTH {
             if next_parent == ROOT_RECORD {
                 break;
             }
@@ -189,11 +190,10 @@ impl FileInfo {
                 break;
             }
 
-            let cur_file = mft.get_record(next_parent);
-            if cur_file.is_none() {
-                return;
-            }
-            let cur_file = cur_file.unwrap();
+            let cur_file = match mft.get_record(next_parent) {
+                Some(f) => f,
+                None => return,
+            };
 
             if let Some(cur_name_att) = cur_file.get_best_file_name(mft) {
                 let cur_name = cur_name_att.to_string();

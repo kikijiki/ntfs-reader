@@ -8,9 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mft = Mft::new(volume)?;
 
     // Iterate all files
-    mft.iterate_files(|file| {
+    for file in mft.files() {
         // Can also use FileInfo::with_cache() for better performance with repeated lookups
-        let info = FileInfo::new(&mft, file);
+        let info = FileInfo::new(&mft, &file);
 
         // Example: Print information for each file
         // Available fields: name, path, is_directory, size, created, accessed, modified
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info.size,
             info.is_directory
         );
-    });
+    }
 
     Ok(())
 }

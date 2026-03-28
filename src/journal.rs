@@ -16,7 +16,7 @@ use windows::Win32::System::Ioctl;
 use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::System::IO::{self, GetQueuedCompletionStatus};
 
-use crate::{api::FileId, volume::Volume};
+use crate::{api::FileId, errors::NtfsReaderResult, volume::Volume};
 
 #[repr(align(64))]
 #[derive(Debug, Clone, Copy)]
@@ -144,7 +144,7 @@ fn get_usn_record_path(
         }
     }
 
-    //warn!("Could not get path: {}", file_name);
+    tracing::warn!("Could not get path: {}", file_name);
     PathBuf::from(&file_name)
 }
 
@@ -253,7 +253,7 @@ pub struct Journal {
 }
 
 impl Journal {
-    pub fn new(volume: Volume, options: JournalOptions) -> Result<Journal, std::io::Error> {
+    pub fn new(volume: Volume, options: JournalOptions) -> NtfsReaderResult<Journal> {
         let volume_handle: Foundation::HANDLE;
 
         unsafe {
@@ -314,13 +314,11 @@ impl Journal {
         })
     }
 
-    pub fn read(&mut self) -> Result<Vec<UsnRecord>, std::io::Error> {
+    pub fn read(&mut self) -> NtfsReaderResult<Vec<UsnRecord>> {
         self.read_sized::<4096>()
     }
 
-    pub fn read_sized<const BUFFER_SIZE: usize>(
-        &mut self,
-    ) -> Result<Vec<UsnRecord>, std::io::Error> {
+    pub fn read_sized<const BUFFER_SIZE: usize>(&mut self) -> NtfsReaderResult<Vec<UsnRecord>> {
         let mut results = Vec::<UsnRecord>::new();
 
         let mut read = Ioctl::READ_USN_JOURNAL_DATA_V1 {
@@ -382,13 +380,17 @@ impl Journal {
 
         let mut offset = 8; // sizeof(USN)
         while offset < bytes_returned {
+            let remaining = (bytes_returned - offset) as usize;
+            if remaining < size_of::<Ioctl::USN_RECORD_COMMON_HEADER>() {
+                break;
+            }
+
             let (record_len, record) = unsafe {
-                let record_ptr = std::mem::transmute::<*const u8, *const Ioctl::USN_RECORD_UNION>(
-                    buffer.0[offset as usize..].as_ptr(),
-                );
+                let record_ptr =
+                    buffer.0[offset as usize..].as_ptr() as *const Ioctl::USN_RECORD_UNION;
 
                 let record_len = (*record_ptr).Header.RecordLength;
-                if record_len == 0 {
+                if record_len == 0 || record_len as usize > remaining {
                     break;
                 }
 

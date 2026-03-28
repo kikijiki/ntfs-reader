@@ -22,12 +22,12 @@ let volume = Volume::new("\\\\.\\C:")?;
 let mft = Mft::new(volume)?;
 
 // Iterate all files
-mft.iterate_files(|file| {
+for file in mft.files() {
     // Can also use FileInfo::with_cache().
-    let info = FileInfo::new(&mft, file);
+    let info = FileInfo::new(&mft, &file);
 
     // Available fields: name, path, is_directory, size, timestamps (created, accessed, modified).
-});
+}
 
 // Some perf comparison
 // Type          Iteration  Drop       Total
@@ -52,6 +52,22 @@ for result in journal.read()? {
 }
 ```
 
-## Contributing
+## Development
 
-I'm not accepting PRs at the moment, but feel free to report issues or send suggestions.
+You can use plain cargo or install [mise](https://mise.jdx.dev/):
+
+```sh
+curl https://mise.run | sh
+```
+
+Tasks
+
+```sh
+mise fix      # Fix format and fixable linting errors
+mise check    # Check format and linting issues
+mise build    # Build debug
+mise release  # Build release
+mise test     # Run tests
+mise test-32  # Run tests with the `i686-pc-windows-msvc` target, single threaded
+mise bench    # Run benchmarks (slow!)
+```

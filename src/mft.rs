@@ -25,11 +25,8 @@ impl Mft {
     pub fn new(volume: Volume) -> NtfsReaderResult<Self> {
         let mut reader = open_volume(&volume.path)?;
 
-        let mft_record = Self::get_record_fs(
-            &mut reader,
-            volume.file_record_size as usize,
-            volume.mft_position,
-        )?;
+        let mft_record =
+            Self::get_record_fs(&mut reader, volume.file_record_size, volume.mft_position)?;
 
         let mut data =
             Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Data)?
@@ -38,12 +35,13 @@ impl Mft {
             Self::read_data_fs(&volume, &mut reader, &mft_record, NtfsAttributeType::Bitmap)?
                 .ok_or_else(|| NtfsReaderError::MissingMftAttribute("Bitmap".to_string()))?;
 
-        let max_record = (data.len() / volume.file_record_size as usize) as u64;
+        let max_record = data.len() as u64 / volume.file_record_size;
 
         // Fixup all records so we are non mutable from now on.
         for number in 0..max_record {
-            let start = number as usize * volume.file_record_size as usize;
-            let end = start + volume.file_record_size as usize;
+            let start = number * volume.file_record_size;
+            let end = start + volume.file_record_size;
+            let (start, end) = (start as usize, end as usize);
             let data = &mut data[start..end];
             Self::fixup_record(number, data)?;
         }
@@ -61,36 +59,28 @@ impl Mft {
             return false;
         }
 
-        let bitmap_idx = (number / 8) as usize;
+        let bitmap_idx = number / 8;
         let bitmap_off = (number % 8) as u8;
 
-        if bitmap_idx >= self.bitmap.len() {
+        if bitmap_idx >= self.bitmap.len() as u64 {
             return false;
         }
 
-        let bit = self.bitmap[bitmap_idx];
+        let bit = self.bitmap[bitmap_idx as usize];
         (bit & (1u8 << bitmap_off)) != 0
     }
 
-    pub fn iterate_files<F>(&self, mut f: F)
-    where
-        F: FnMut(&NtfsFile),
-    {
-        for number in FIRST_NORMAL_RECORD..self.max_record {
-            if self.record_exists(number) {
-                if let Some(file) = self.get_record(number) {
-                    if file.is_used() {
-                        f(&file);
-                    }
-                }
-            }
-        }
+    pub fn files(&self) -> impl Iterator<Item = NtfsFile<'_>> {
+        (FIRST_NORMAL_RECORD..self.max_record)
+            .filter(|&n| self.record_exists(n))
+            .filter_map(|n| self.get_record(n))
+            .filter(|f| f.is_used())
     }
 
-    pub fn get_record_data(&self, number: u64) -> &[u8] {
-        let start = number as usize * self.volume.file_record_size as usize;
-        let end = start + self.volume.file_record_size as usize;
-        &self.data[start..end]
+    fn get_record_data(&self, number: u64) -> &[u8] {
+        let start = number * self.volume.file_record_size;
+        let end = start + self.volume.file_record_size;
+        &self.data[start as usize..end as usize]
     }
 
     pub fn get_record(&self, number: u64) -> Option<NtfsFile<'_>> {
@@ -108,13 +98,13 @@ impl Mft {
 
     pub fn get_record_fs<R>(
         fs: &mut R,
-        file_record_size: usize,
+        file_record_size: u64,
         position: u64,
     ) -> NtfsReaderResult<Vec<u8>>
     where
         R: Seek + Read,
     {
-        let mut data = vec![0; file_record_size];
+        let mut data = vec![0; file_record_size as usize];
         fs.seek(SeekFrom::Start(position))?;
         fs.read_exact(&mut data)?;
 
@@ -203,11 +193,9 @@ impl Mft {
                     if type_id == attribute_type as u32 {
                         let record_position =
                             volume.mft_position + (reference * volume.file_record_size);
-                        if let Ok(target_record) = Self::get_record_fs(
-                            reader,
-                            volume.file_record_size as usize,
-                            record_position,
-                        ) {
+                        if let Ok(target_record) =
+                            Self::get_record_fs(reader, volume.file_record_size, record_position)
+                        {
                             let target_header = unsafe {
                                 &*(target_record.as_ptr() as *const NtfsFileRecordHeader)
                             };
@@ -292,46 +280,35 @@ impl Mft {
         } else {
             let (size, runs) = att.get_nonresident_data_runs(volume)?;
             let total_size =
-                usize::try_from(size).map_err(|_| NtfsReaderError::InvalidDataRun {
-                    details: "attribute size exceeds addressable memory",
-                })?;
+                usize::try_from(size).map_err(|_| NtfsReaderError::AllocationTooLarge { size })?;
 
-            let mut data = Vec::with_capacity(total_size);
-            let mut buffer = Vec::new();
-            let mut copied = 0usize;
+            let mut data = Vec::new();
+            data.try_reserve(total_size)
+                .map_err(|_| NtfsReaderError::AllocationTooLarge { size })?;
+            let mut copied = 0u64;
 
             for run in runs.iter() {
-                if copied >= total_size {
+                if copied >= size {
                     break;
                 }
 
-                match run {
+                let buf_size = match run {
                     DataRun::Data { lcn, length } => {
-                        let run_len = usize::try_from(*length).map_err(|_| {
-                            NtfsReaderError::InvalidDataRun {
-                                details: "run length exceeds addressable memory",
-                            }
-                        })?;
-                        let buf_size = usize::min(run_len, total_size - copied);
-                        buffer.resize(buf_size, 0u8);
+                        let buf_size = u64::min(*length, size - copied);
+                        let start = data.len();
+                        data.resize(start + buf_size as usize, 0u8);
 
                         reader.seek(SeekFrom::Start(*lcn))?;
-                        reader.read_exact(&mut buffer)?;
-
-                        data.extend_from_slice(&buffer);
-                        copied += buf_size;
+                        reader.read_exact(&mut data[start..])?;
+                        buf_size
                     }
                     DataRun::Sparse { length } => {
-                        let run_len = usize::try_from(*length).map_err(|_| {
-                            NtfsReaderError::InvalidDataRun {
-                                details: "run length exceeds addressable memory",
-                            }
-                        })?;
-                        let buf_size = usize::min(run_len, total_size - copied);
-                        data.resize(data.len() + buf_size, 0);
-                        copied += buf_size;
+                        let buf_size = u64::min(*length, size - copied);
+                        data.resize(data.len() + buf_size as usize, 0);
+                        buf_size
                     }
-                }
+                };
+                copied += buf_size;
             }
 
             Ok(data)
