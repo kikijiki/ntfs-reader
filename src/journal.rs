@@ -144,7 +144,7 @@ fn get_usn_record_path(
         }
     }
 
-    tracing::warn!("Could not get path: {}", file_name);
+    tracing::debug!("Could not get path: {}", file_name);
     PathBuf::from(&file_name)
 }
 

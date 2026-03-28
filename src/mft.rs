@@ -77,7 +77,7 @@ impl Mft {
             .filter(|f| f.is_used())
     }
 
-    #[deprecated(since = "0.3.0", note = "use `files()` iterator instead")]
+    #[deprecated(since = "0.4.5", note = "use `files()` iterator instead")]
     pub fn iterate_files<F>(&self, mut f: F)
     where
         F: FnMut(&NtfsFile),

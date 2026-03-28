@@ -129,7 +129,7 @@ impl FileInfo {
             self.name = name.to_string();
             next_parent = name.parent();
         } else {
-            tracing::warn!("No name for file {}", file.number);
+            tracing::debug!("No name for file {}", file.number);
             return;
         }
 
