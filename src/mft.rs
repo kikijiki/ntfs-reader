@@ -77,6 +77,16 @@ impl Mft {
             .filter(|f| f.is_used())
     }
 
+    #[deprecated(since = "0.3.0", note = "use `files()` iterator instead")]
+    pub fn iterate_files<F>(&self, mut f: F)
+    where
+        F: FnMut(&NtfsFile),
+    {
+        for file in self.files() {
+            f(&file);
+        }
+    }
+
     fn get_record_data(&self, number: u64) -> &[u8] {
         let start = number * self.volume.file_record_size;
         let end = start + self.volume.file_record_size;
