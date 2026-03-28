@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.94.1", targets = "x86_64-pc-windows-msvc,i686-pc-windows-msvc", components = "default" }
+rust = { version = "1.94.1", targets = "x86_64-pc-windows-msvc,i686-pc-windows-msvc", profile = "default" }
 
 [tasks.fix]
 run = ["cargo fmt", "cargo clippy --fix --allow-dirty --allow-staged"]
