@@ -128,9 +128,9 @@ fn iterate_files_discovers_temp_artifacts() -> NtfsReaderResult<()> {
 
     let mut found = HashSet::new();
     let mut sparse_checked = false;
-    mft.iterate_files(|file| {
-        if !file.is_directory() && file.is_used() {
-            let info = FileInfo::new(&mft, file);
+    for file in mft.files() {
+        if !file.is_directory() {
+            let info = FileInfo::new(&mft, &file);
             if let Some(key) = to_rel_key(&info.path) {
                 if key == sparse_key {
                     let data_att = file
@@ -154,7 +154,7 @@ fn iterate_files_discovers_temp_artifacts() -> NtfsReaderResult<()> {
                 found.insert(key);
             }
         }
-    });
+    }
 
     for key in &expected {
         assert!(

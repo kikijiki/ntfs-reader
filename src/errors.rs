@@ -9,7 +9,7 @@ pub enum NtfsReaderError {
     #[error("binread error")]
     BinReadError(#[from] binread::error::Error),
     #[error("windows error")]
-    WindowsError(#[from] WindowsErrorWrapper),
+    WindowsError(#[from] windows::core::Error),
     #[error("missing required MFT attribute: {0}")]
     MissingMftAttribute(String),
     #[error("corrupt MFT record {number}")]
@@ -20,23 +20,10 @@ pub enum NtfsReaderError {
     CorruptMft { position: u64 },
     #[error("invalid NTFS data run: {details}")]
     InvalidDataRun { details: &'static str },
+    #[error("allocation of {size} bytes exceeds platform address space")]
+    AllocationTooLarge { size: u64 },
     #[error("unknown")]
     Unknown,
 }
-
-#[derive(Debug)]
-pub struct WindowsErrorWrapper(windows::core::Error);
-impl WindowsErrorWrapper {
-    pub fn from_thread() -> WindowsErrorWrapper {
-        WindowsErrorWrapper(windows::core::Error::from_thread())
-    }
-}
-
-impl std::fmt::Display for WindowsErrorWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Windows error: {}", self.0)
-    }
-}
-impl std::error::Error for WindowsErrorWrapper {}
 
 pub type NtfsReaderResult<T> = core::result::Result<T, NtfsReaderError>;

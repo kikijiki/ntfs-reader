@@ -1,6 +1,6 @@
 [package]
 name = "ntfs-reader"
-version = "0.4.4"
+version = "0.4.5"
 authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -29,6 +29,11 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+criterion = "0.8"
+
+[[bench]]
+name = "mft_benchmark"
+harness = false
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"

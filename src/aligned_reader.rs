@@ -25,7 +25,12 @@ where
     R: Read + Seek,
 {
     pub fn new(inner: R, alignment: u64) -> io::Result<Self> {
-        assert!(alignment.is_power_of_two());
+        if !alignment.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alignment must be a power of two",
+            ));
+        }
 
         Ok(Self {
             inner,
@@ -57,8 +62,9 @@ where
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let aligned_position = self.round_down(self.position);
 
-        let start = self.position as usize - aligned_position as usize;
-        let end = start + buf.len();
+        let start = (self.position - aligned_position) as usize;
+        let to_read = buf.len().min(self.alignment as usize - start);
+        let end = start + to_read;
         let size = self.round_up(end as u64) as usize;
 
         if aligned_position != self.buffer_pos || size > self.buffer_size {
@@ -69,10 +75,10 @@ where
             self.buffer_size = size;
         }
 
-        buf.copy_from_slice(&self.buffer[start..end]);
+        buf[..to_read].copy_from_slice(&self.buffer[start..end]);
 
-        self.position += buf.len() as u64;
-        Ok(buf.len())
+        self.position += to_read as u64;
+        Ok(to_read)
     }
 }
 

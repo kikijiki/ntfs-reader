@@ -1,0 +1,24 @@
+[tools]
+rust = { version = "1.94.1", targets = "x86_64-pc-windows-msvc,i686-pc-windows-msvc", profile = "default" }
+
+[tasks.fix]
+run = ["cargo fmt", "cargo clippy --fix --allow-dirty --allow-staged"]
+
+[tasks.check]
+run = ["cargo fmt --check", "cargo clippy -- -D warnings"]
+
+[tasks.build]
+run = ["cargo build"]
+
+[tasks.release]
+run = ["cargo build --release"]
+
+[tasks.test]
+run = "cargo test"
+
+[tasks.test-32]
+description = "Build 32-bit version and run one test at a time"
+run = "cargo test --target i686-pc-windows-msvc -- --test-threads=1"
+
+[tasks.bench]
+run = "cargo bench"
