@@ -63,6 +63,8 @@ pub struct FileInfo {
     pub path: PathBuf,
     pub is_directory: bool,
     pub size: u64,
+    /// Raw Windows `FILE_ATTRIBUTE_*` flags from `$STANDARD_INFORMATION`.
+    pub file_attributes: u32,
     pub created: Option<OffsetDateTime>,
     pub accessed: Option<OffsetDateTime>,
     pub modified: Option<OffsetDateTime>,
@@ -70,7 +72,7 @@ pub struct FileInfo {
 
 impl FileInfo {
     pub fn new(mft: &Mft, file: &NtfsFile) -> Self {
-        let mut info = Self::_new(file);
+        let mut info = Self::_new(mft, file);
         info._compute_path(mft, file);
         info
     }
@@ -80,42 +82,58 @@ impl FileInfo {
         file: &NtfsFile,
         cache: &mut C,
     ) -> Self {
-        let mut info = Self::_new(file);
+        let mut info = Self::_new(mft, file);
         info._compute_path_with_cache(mft, file, cache);
         info
     }
 
-    fn _new(file: &NtfsFile) -> Self {
+    fn _new(mft: &Mft, file: &NtfsFile) -> Self {
         let mut accessed = None;
         let mut created = None;
         let mut modified = None;
         let mut size = 0u64;
+        let mut file_attributes = 0u32;
 
-        file.attributes(|att| {
-            if att.header.type_id == NtfsAttributeType::StandardInformation as u32 {
-                if let Some(stdinfo) = att.as_standard_info() {
-                    accessed = Some(ntfs_to_unix_time(stdinfo.access_time));
-                    created = Some(ntfs_to_unix_time(stdinfo.creation_time));
-                    modified = Some(ntfs_to_unix_time(stdinfo.modification_time));
-                }
-            }
-
-            if att.header.type_id == NtfsAttributeType::Data as u32 {
-                if att.header.is_non_resident == 0 {
-                    if let Some(header) = att.resident_header() {
-                        size = header.value_length as u64;
+        for record in mft.file_records(file) {
+            record.attributes(|att| {
+                if att.header.type_id == NtfsAttributeType::StandardInformation as u32 {
+                    if let Some(stdinfo) = att.as_standard_info() {
+                        accessed = Some(ntfs_to_unix_time(stdinfo.access_time));
+                        created = Some(ntfs_to_unix_time(stdinfo.creation_time));
+                        modified = Some(ntfs_to_unix_time(stdinfo.modification_time));
+                        file_attributes = stdinfo.file_attributes;
                     }
-                } else if let Some(header) = att.nonresident_header() {
-                    size = header.data_size;
                 }
-            }
-        });
+
+                // Ignore named alternate data streams. For a split non-resident
+                // stream, only the first extent (lowest VCN 0) carries the file size.
+                if att.header.type_id == NtfsAttributeType::Data as u32
+                    && att.header.name_length == 0
+                {
+                    if att.header.is_non_resident == 0 {
+                        if let Some(header) = att.resident_header() {
+                            size = header.value_length as u64;
+                        }
+                    } else if let Some(header) = att.nonresident_header() {
+                        if header.lowest_vcn == 0 {
+                            size = header.data_size;
+                        }
+                    }
+                }
+            });
+        }
+
+        let base = file
+            .base_record_number()
+            .and_then(|number| mft.get_record(number));
+        let logical_file = base.as_ref().unwrap_or(file);
 
         FileInfo {
             name: String::new(),
             path: PathBuf::new(),
-            is_directory: file.is_directory(),
+            is_directory: logical_file.is_directory(),
             size,
+            file_attributes,
             created,
             accessed,
             modified,
