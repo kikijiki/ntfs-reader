@@ -15,7 +15,7 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
-        rustToolchain = pkgs.rust-bin.stable."1.94.1".default.override {
+        rustToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
           extensions = [ "clippy" "rustfmt" ];
           targets = [
             "x86_64-pc-windows-msvc"
