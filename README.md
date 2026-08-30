@@ -26,7 +26,8 @@ for file in mft.files() {
     // Can also use FileInfo::with_cache().
     let info = FileInfo::new(&mft, &file);
 
-    // Available fields: name, path, is_directory, size, timestamps (created, accessed, modified).
+    // Available fields: name, path, is_directory, size, file_attributes,
+    // and timestamps (created, accessed, modified).
 }
 
 // Some perf comparison
@@ -53,6 +54,20 @@ for result in journal.read()? {
 ```
 
 ## Development
+
+On NixOS/Linux, enter the development shell directly or let direnv load it:
+
+```sh
+nix develop
+# or: direnv allow
+
+cargo xwin build --target x86_64-pc-windows-msvc
+cargo xwin check --target i686-pc-windows-msvc
+```
+
+The flake includes Rust, both Windows MSVC Rust targets, `cargo-xwin`, and the
+LLVM linker tools. Windows is still required to execute tests that access a raw
+NTFS volume.
 
 You can use plain cargo or install [mise](https://mise.jdx.dev/):
 

@@ -35,6 +35,20 @@ impl<'a> NtfsFile<'a> {
         (seq << 48) | (self.number & 0x0000_FFFF_FFFF_FFFF)
     }
 
+    pub fn base_reference_number(&self) -> Option<u64> {
+        let reference = self.header.base_reference;
+        (reference != 0).then_some(reference)
+    }
+
+    pub fn base_record_number(&self) -> Option<u64> {
+        self.base_reference_number()
+            .map(|reference| reference & 0x0000_FFFF_FFFF_FFFF)
+    }
+
+    pub fn is_extension(&self) -> bool {
+        self.base_reference_number().is_some()
+    }
+
     pub fn get_file_id(&self) -> FileId {
         FileId::Normal(self.reference_number())
     }
@@ -135,9 +149,37 @@ impl<'a> NtfsFile<'a> {
     }
 
     pub fn get_best_file_name(&self, mft: &Mft) -> Option<NtfsFileName> {
+        let mut best = None;
+
+        for record in mft.file_records(self) {
+            let mut preferred = None;
+            record.file_names(|name| {
+                if name.is_reparse_point() {
+                    return;
+                }
+                if name.header.namespace == NtfsFileNamespace::Win32 as u8
+                    || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
+                {
+                    preferred = Some(name);
+                } else if best.is_none() {
+                    best = Some(name);
+                }
+            });
+
+            if preferred.is_some() {
+                return preferred;
+            }
+        }
+
+        best
+    }
+
+    fn file_names<F>(&self, mut f: F)
+    where
+        F: FnMut(NtfsFileName),
+    {
         let mut offset = self.header.attributes_offset as usize;
         let used = usize::min(self.header.used_size as usize, self.data.len());
-        let mut best = None;
 
         while offset < used {
             let slice = &self.data[offset..used];
@@ -152,74 +194,7 @@ impl<'a> NtfsFile<'a> {
 
             if attr.header.type_id == NtfsAttributeType::FileName as u32 {
                 if let Some(name) = attr.as_name() {
-                    if !name.is_reparse_point() {
-                        if name.header.namespace == NtfsFileNamespace::Win32 as u8
-                            || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
-                        {
-                            return Some(name);
-                        } else {
-                            best = Some(name);
-                        }
-                    }
-                }
-            }
-
-            if attr.header.type_id == NtfsAttributeType::AttributeList as u32 {
-                if attr.header.is_non_resident != 0 {
-                    // We do not support non-resident attribute lists here.
-                    break;
-                }
-                let header = match attr.resident_header() {
-                    Some(header) => header,
-                    None => break,
-                };
-                let value_offset = header.value_offset as usize;
-                let value_length = header.value_length as usize;
-                let value_end = match value_offset.checked_add(value_length) {
-                    Some(end) if end <= attr.data().len() => end,
-                    _ => break,
-                };
-                let attr_slice = attr.data();
-                let att_data = &attr_slice[value_offset..value_end];
-
-                let mut att_offset = 0usize;
-                while att_offset < att_data.len() {
-                    let entry_slice = &att_data[att_offset..];
-                    let entry = match parse_attribute_list_entry(entry_slice) {
-                        Some(entry) => entry,
-                        None => break,
-                    };
-                    let entry_len = entry.length as usize;
-                    if entry.type_id == NtfsAttributeType::FileName as u32 {
-                        let rec = mft.get_record(entry.reference())?;
-                        let att = rec.get_attribute(NtfsAttributeType::FileName)?;
-
-                        if let Some(name) = att.as_name() {
-                            if !name.is_reparse_point() {
-                                if name.header.namespace == NtfsFileNamespace::Win32 as u8
-                                    || name.header.namespace == NtfsFileNamespace::Win32AndDos as u8
-                                {
-                                    return Some(name);
-                                } else {
-                                    best = Some(name);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if entry_len == 0 {
-                        break;
-                    }
-                    att_offset = match att_offset.checked_add(entry_len) {
-                        Some(next) if next <= att_data.len() => next,
-                        _ => break,
-                    };
-                    let align = (8 - (att_offset % 8)) % 8;
-                    att_offset = match att_offset.checked_add(align) {
-                        Some(next) if next <= att_data.len() => next,
-                        _ => break,
-                    };
+                    f(name);
                 }
             }
 
@@ -232,8 +207,6 @@ impl<'a> NtfsFile<'a> {
                 _ => break,
             };
         }
-
-        best
     }
 
     // This cannot read nonresident data!
@@ -253,16 +226,4 @@ impl<'a> NtfsFile<'a> {
     pub fn is_directory(&self) -> bool {
         self.header.flags & NtfsFileFlags::IsDirectory as u16 != 0
     }
-}
-
-fn parse_attribute_list_entry(data: &[u8]) -> Option<&NtfsAttributeListEntry> {
-    if data.len() < size_of::<NtfsAttributeListEntry>() {
-        return None;
-    }
-    let entry = unsafe { &*(data.as_ptr() as *const NtfsAttributeListEntry) };
-    let length = entry.length as usize;
-    if length < size_of::<NtfsAttributeListEntry>() || length > data.len() {
-        return None;
-    }
-    Some(entry)
 }

@@ -19,6 +19,7 @@ pub struct Mft {
     pub data: Vec<u8>,
     pub bitmap: Vec<u8>,
     pub max_record: u64,
+    extension_records: Vec<(u64, u64)>,
 }
 
 impl Mft {
@@ -46,12 +47,15 @@ impl Mft {
             Self::fixup_record(number, data)?;
         }
 
-        Ok(Mft {
+        let mut mft = Mft {
             volume,
             data,
             bitmap,
             max_record,
-        })
+            extension_records: Vec::new(),
+        };
+        mft.index_extension_records();
+        Ok(mft)
     }
 
     pub fn record_exists(&self, number: u64) -> bool {
@@ -74,7 +78,39 @@ impl Mft {
         (FIRST_NORMAL_RECORD..self.max_record)
             .filter(|&n| self.record_exists(n))
             .filter_map(|n| self.get_record(n))
-            .filter(|f| f.is_used())
+            .filter(|f| f.is_used() && !f.is_extension())
+    }
+
+    /// Returns the base MFT record and all live extension records that belong
+    /// to the same logical file.
+    pub fn file_records<'a>(
+        &'a self,
+        file: &NtfsFile<'_>,
+    ) -> impl Iterator<Item = NtfsFile<'a>> + 'a {
+        let base_number = file.base_record_number().unwrap_or(file.number());
+        let base_reference = self
+            .get_record(base_number)
+            .map(|base| base.reference_number());
+        let start = self
+            .extension_records
+            .partition_point(|(base, _)| *base < base_number);
+        let end = self
+            .extension_records
+            .partition_point(|(base, _)| *base <= base_number);
+
+        std::iter::once(base_number)
+            .chain(
+                self.extension_records[start..end]
+                    .iter()
+                    .map(|(_, extension)| *extension),
+            )
+            .filter(move |number| self.record_exists(*number))
+            .filter_map(move |number| self.get_record(number))
+            .filter(move |record| {
+                record.is_used()
+                    && (record.number() == base_number
+                        || record.base_reference_number() == base_reference)
+            })
     }
 
     #[deprecated(since = "0.4.5", note = "use `files()` iterator instead")]
@@ -104,6 +140,22 @@ impl Mft {
         }
 
         None
+    }
+
+    fn index_extension_records(&mut self) {
+        self.extension_records = (0..self.max_record)
+            .filter(|&number| self.record_exists(number))
+            .filter_map(|number| {
+                let record = self.get_record(number)?;
+                if !record.is_used() {
+                    return None;
+                }
+                record
+                    .base_record_number()
+                    .map(|base| (base, record.number()))
+            })
+            .collect();
+        self.extension_records.sort_unstable();
     }
 
     pub fn get_record_fs<R>(
@@ -386,4 +438,172 @@ fn parse_attribute_list_entry(data: &[u8]) -> Option<&NtfsAttributeListEntry> {
         return None;
     }
     Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::file_info::FileInfo;
+
+    const RECORD_SIZE: usize = 1024;
+    const ATTRIBUTES_OFFSET: usize = 48;
+
+    #[test]
+    fn combines_base_and_extension_records_into_one_file() {
+        let attributes = NtfsFileNameFlags::Hidden as u32
+            | NtfsFileNameFlags::System as u32
+            | NtfsFileNameFlags::Archive as u32
+            | NtfsFileNameFlags::SparseFile as u32;
+        let file_size = 34_359_738_368u64;
+
+        let mut base = new_record(24, 7, 0);
+        let mut offset = ATTRIBUTES_OFFSET;
+        offset = add_standard_information(&mut base, offset, attributes);
+        offset = add_nonresident_data(&mut base, offset, file_size);
+        finish_record(&mut base, offset);
+
+        let base_reference = (7u64 << 48) | 24;
+        let mut extension = new_record(25, 3, base_reference);
+        let offset = add_file_name(
+            &mut extension,
+            ATTRIBUTES_OFFSET,
+            "large-fragmented.rar",
+            attributes,
+        );
+        finish_record(&mut extension, offset);
+
+        let mut data = vec![0u8; 26 * RECORD_SIZE];
+        data[24 * RECORD_SIZE..25 * RECORD_SIZE].copy_from_slice(&base);
+        data[25 * RECORD_SIZE..26 * RECORD_SIZE].copy_from_slice(&extension);
+
+        let boot_sector = unsafe { std::mem::zeroed() };
+        let volume = Volume {
+            path: PathBuf::from(r"\\.\T:"),
+            boot_sector,
+            cluster_size: 4096,
+            volume_size: 0,
+            file_record_size: RECORD_SIZE as u64,
+            mft_position: 0,
+        };
+        let mut mft = Mft {
+            volume,
+            data,
+            bitmap: vec![0, 0, 0, 0b0000_0011],
+            max_record: 26,
+            extension_records: Vec::new(),
+        };
+        mft.index_extension_records();
+
+        let files: Vec<_> = mft.files().collect();
+        assert_eq!(files.len(), 1, "extension record must not be a second file");
+        assert_eq!(files[0].number(), 24);
+        assert_eq!(mft.file_records(&files[0]).count(), 2);
+
+        let info = FileInfo::new(&mft, &files[0]);
+        assert_eq!(info.name, "large-fragmented.rar");
+        assert_eq!(info.size, file_size);
+        assert_eq!(info.file_attributes, attributes);
+    }
+
+    fn new_record(number: u64, sequence: u16, base_reference: u64) -> Vec<u8> {
+        let mut record = vec![0u8; RECORD_SIZE];
+        record[0..4].copy_from_slice(FILE_RECORD_SIGNATURE);
+        write_u16(&mut record, 4, 42);
+        write_u16(&mut record, 6, 1);
+        write_u16(&mut record, 16, sequence);
+        write_u16(&mut record, 18, 1);
+        write_u16(&mut record, 20, ATTRIBUTES_OFFSET as u16);
+        write_u16(&mut record, 22, NtfsFileFlags::InUse as u16);
+        write_u32(&mut record, 28, RECORD_SIZE as u32);
+        write_u64(&mut record, 32, base_reference);
+        write_u16(&mut record, 40, number as u16);
+        record
+    }
+
+    fn add_standard_information(record: &mut [u8], offset: usize, attributes: u32) -> usize {
+        let mut value = vec![0u8; size_of::<NtfsStandardInformation>()];
+        write_u64(&mut value, 0, EPOCH_DIFFERENCE + 10_000_000);
+        write_u64(&mut value, 8, EPOCH_DIFFERENCE + 20_000_000);
+        write_u64(&mut value, 24, EPOCH_DIFFERENCE + 30_000_000);
+        write_u32(&mut value, 32, attributes);
+        add_resident_attribute(
+            record,
+            offset,
+            NtfsAttributeType::StandardInformation,
+            0,
+            &value,
+        )
+    }
+
+    fn add_file_name(record: &mut [u8], offset: usize, name: &str, attributes: u32) -> usize {
+        let encoded: Vec<u16> = name.encode_utf16().collect();
+        let mut value = vec![0u8; size_of::<NtfsFileNameHeader>() + encoded.len() * 2];
+        write_u64(&mut value, 0, ROOT_RECORD);
+        write_u64(&mut value, 40, 34_359_738_368);
+        write_u64(&mut value, 48, 34_359_738_368);
+        write_u32(&mut value, 56, attributes);
+        value[64] = encoded.len() as u8;
+        value[65] = NtfsFileNamespace::Win32 as u8;
+        for (index, character) in encoded.into_iter().enumerate() {
+            write_u16(
+                &mut value,
+                size_of::<NtfsFileNameHeader>() + index * 2,
+                character,
+            );
+        }
+        add_resident_attribute(record, offset, NtfsAttributeType::FileName, 1, &value)
+    }
+
+    fn add_resident_attribute(
+        record: &mut [u8],
+        offset: usize,
+        attribute_type: NtfsAttributeType,
+        id: u16,
+        value: &[u8],
+    ) -> usize {
+        const VALUE_OFFSET: usize = 24;
+        let length = align_to_eight(VALUE_OFFSET + value.len());
+        write_u32(record, offset, attribute_type as u32);
+        write_u32(record, offset + 4, length as u32);
+        write_u16(record, offset + 14, id);
+        write_u32(record, offset + 16, value.len() as u32);
+        write_u16(record, offset + 20, VALUE_OFFSET as u16);
+        record[offset + VALUE_OFFSET..offset + VALUE_OFFSET + value.len()].copy_from_slice(value);
+        offset + length
+    }
+
+    fn add_nonresident_data(record: &mut [u8], offset: usize, size: u64) -> usize {
+        let length = size_of::<NtfsNonResidentAttributeHeader>();
+        write_u32(record, offset, NtfsAttributeType::Data as u32);
+        write_u32(record, offset + 4, length as u32);
+        record[offset + 8] = 1;
+        write_u16(record, offset + 14, 2);
+        write_u64(record, offset + 16, 0);
+        write_u64(record, offset + 40, size);
+        write_u64(record, offset + 48, size);
+        write_u64(record, offset + 56, size);
+        offset + length
+    }
+
+    fn finish_record(record: &mut [u8], used_size: usize) {
+        write_u32(record, 24, used_size as u32);
+    }
+
+    fn align_to_eight(value: usize) -> usize {
+        (value + 7) & !7
+    }
+
+    fn write_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
 }
