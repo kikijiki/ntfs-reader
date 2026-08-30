@@ -77,12 +77,16 @@ curl https://mise.run | sh
 
 Tasks
 
+On Windows these run Cargo natively. On other platforms they enter the Nix
+development shell and cross-compile for Windows MSVC.
+
 ```sh
 mise fix      # Fix format and fixable linting errors
 mise check    # Check format and linting issues
 mise build    # Build debug
 mise release  # Build release
-mise test     # Run tests
-mise test-32  # Run tests with the `i686-pc-windows-msvc` target, single threaded
-mise bench    # Run benchmarks (slow!)
+mise test     # Run tests on Windows; compile them for MSVC elsewhere
+mise test-32  # Run 32-bit tests on Windows; check all targets elsewhere
+mise bench    # Run benchmarks on Windows; compile them elsewhere
+mise publish -n # Verify the crate package without uploading
 ```

@@ -2,23 +2,43 @@
 rust = { version = "1.98.0", targets = "x86_64-pc-windows-msvc,i686-pc-windows-msvc", profile = "default" }
 
 [tasks.fix]
-run = ["cargo fmt", "cargo clippy --fix --allow-dirty --allow-staged"]
+run = [
+    "nix develop -c cargo fmt",
+    "nix develop -c cargo xwin clippy --fix --target x86_64-pc-windows-msvc --allow-dirty --allow-staged",
+]
+run_windows = ["cargo fmt", "cargo clippy --fix --allow-dirty --allow-staged"]
 
 [tasks.check]
-run = ["cargo fmt --check", "cargo clippy -- -D warnings"]
+run = [
+    "nix develop -c cargo fmt --check",
+    "nix develop -c cargo xwin clippy --target x86_64-pc-windows-msvc -- -D warnings",
+]
+run_windows = ["cargo fmt --check", "cargo clippy -- -D warnings"]
 
 [tasks.build]
-run = ["cargo build"]
+run = "nix develop -c cargo xwin build --target x86_64-pc-windows-msvc"
+run_windows = "cargo build"
 
 [tasks.release]
-run = ["cargo build --release"]
+run = "nix develop -c cargo xwin build --release --target x86_64-pc-windows-msvc"
+run_windows = "cargo build --release"
 
 [tasks.test]
-run = "cargo test"
+description = "Run tests on Windows; compile them for MSVC on other platforms"
+run = "nix develop -c cargo xwin test --no-run --target x86_64-pc-windows-msvc"
+run_windows = "cargo test"
 
 [tasks.test-32]
-description = "Build 32-bit version and run one test at a time"
-run = "cargo test --target i686-pc-windows-msvc -- --test-threads=1"
+description = "Run 32-bit tests on Windows; check all targets on other platforms"
+run = "nix develop -c cargo xwin check --all-targets --target i686-pc-windows-msvc"
+run_windows = "cargo test --target i686-pc-windows-msvc -- --test-threads=1"
 
 [tasks.bench]
-run = "cargo bench"
+description = "Run benchmarks on Windows; compile them for MSVC elsewhere"
+run = "nix develop -c cargo xwin bench --no-run --target x86_64-pc-windows-msvc"
+run_windows = "cargo bench"
+
+[tasks.publish]
+description = "Publish the crate after verifying it for Windows MSVC"
+run = "nix develop -c cargo publish --target x86_64-pc-windows-msvc"
+run_windows = "cargo publish"
