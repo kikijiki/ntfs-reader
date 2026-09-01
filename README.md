@@ -69,6 +69,20 @@ The flake includes Rust, both Windows MSVC Rust targets, `cargo-xwin`, and the
 LLVM linker tools. Windows is still required to execute tests that access a raw
 NTFS volume.
 
+On x86_64 Linux, the same development shell includes the project's QEMU Windows
+VM launcher. Its mutable disks and installation media live outside the checkout
+in `$NTFS_READER_VM_DIR` (by default `~/.local/share/windows-vm`):
+
+```sh
+ntfs-windows-vm start
+ntfs-windows-vm status
+ntfs-windows-vm view
+ntfs-windows-vm stop
+```
+
+You can also start it without entering the shell with
+`nix run .#windows-vm -- start`.
+
 You can use plain cargo or install [mise](https://mise.jdx.dev/):
 
 ```sh
