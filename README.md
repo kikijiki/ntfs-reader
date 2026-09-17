@@ -30,6 +30,15 @@ for file in mft.files() {
     // and timestamps (created, accessed, modified).
 }
 
+// FileInfo/get_best_file_name return only one name. List every hard link
+// (and DOS short-name alias) instead:
+for entry in file.all_file_names(&mft) {
+    match entry.kind {
+        NtfsNameKind::Link => println!("{} (parent {})", entry.name, entry.name.parent()),
+        NtfsNameKind::DosAlias => println!("{} (short-name alias)", entry.name),
+    }
+}
+
 // Some perf comparison
 // Type          Iteration  Drop       Total
 // No Cache      12.326s    0          12.326s

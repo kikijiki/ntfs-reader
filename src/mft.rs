@@ -445,6 +445,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::file::NtfsNameKind;
     use crate::file_info::FileInfo;
 
     const RECORD_SIZE: usize = 1024;
@@ -507,6 +508,92 @@ mod tests {
         assert_eq!(info.file_attributes, attributes);
     }
 
+    #[test]
+    fn all_file_names_separates_hard_links_from_dos_aliases() {
+        let attributes = NtfsFileNameFlags::Archive as u32;
+        // Different parent: a second real hard link.
+        let other_parent = (2u64 << 48) | 100;
+
+        let mut base = new_record(24, 1, 0);
+        write_u16(&mut base, 18, 2); // link_count: two real hard links
+        let mut offset = ATTRIBUTES_OFFSET;
+        offset = add_file_name_ex(
+            &mut base,
+            offset,
+            1,
+            ROOT_RECORD,
+            NtfsFileNamespace::Win32,
+            "longfilename.txt",
+            attributes,
+        );
+        offset = add_file_name_ex(
+            &mut base,
+            offset,
+            2,
+            ROOT_RECORD,
+            NtfsFileNamespace::Dos,
+            "LONGFI~1.TXT",
+            attributes,
+        );
+        offset = add_file_name_ex(
+            &mut base,
+            offset,
+            3,
+            other_parent,
+            NtfsFileNamespace::Posix,
+            "secondlink.txt",
+            attributes,
+        );
+        finish_record(&mut base, offset);
+
+        let mut data = vec![0u8; 25 * RECORD_SIZE];
+        data[24 * RECORD_SIZE..25 * RECORD_SIZE].copy_from_slice(&base);
+
+        let boot_sector = unsafe { std::mem::zeroed() };
+        let volume = Volume {
+            path: PathBuf::from(r"\\.\T:"),
+            boot_sector,
+            cluster_size: 4096,
+            volume_size: 0,
+            file_record_size: RECORD_SIZE as u64,
+            mft_position: 0,
+        };
+        let mut mft = Mft {
+            volume,
+            data,
+            bitmap: vec![0, 0, 0, 0b0000_0001],
+            max_record: 25,
+            extension_records: Vec::new(),
+        };
+        mft.index_extension_records();
+
+        let files: Vec<_> = mft.files().collect();
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        let link_count = file.header.link_count;
+
+        let names = file.all_file_names(&mft);
+        assert_eq!(names.len(), 3);
+
+        let links: Vec<_> = names
+            .iter()
+            .filter(|entry| entry.kind == NtfsNameKind::Link)
+            .collect();
+        let aliases: Vec<_> = names
+            .iter()
+            .filter(|entry| entry.kind == NtfsNameKind::DosAlias)
+            .collect();
+
+        assert_eq!(links.len(), link_count as usize);
+        assert_eq!(aliases.len(), 1);
+        assert!(aliases[0].name.is_dos_alias());
+        assert_eq!(aliases[0].name.to_string(), "LONGFI~1.TXT");
+
+        let link_parents: Vec<u64> = links.iter().map(|entry| entry.name.parent()).collect();
+        assert!(link_parents.contains(&ROOT_RECORD));
+        assert!(link_parents.contains(&(other_parent & 0x0000_FFFF_FFFF_FFFF)));
+    }
+
     fn new_record(number: u64, sequence: u16, base_reference: u64) -> Vec<u8> {
         let mut record = vec![0u8; RECORD_SIZE];
         record[0..4].copy_from_slice(FILE_RECORD_SIGNATURE);
@@ -538,14 +625,35 @@ mod tests {
     }
 
     fn add_file_name(record: &mut [u8], offset: usize, name: &str, attributes: u32) -> usize {
+        add_file_name_ex(
+            record,
+            offset,
+            1,
+            ROOT_RECORD,
+            NtfsFileNamespace::Win32,
+            name,
+            attributes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_file_name_ex(
+        record: &mut [u8],
+        offset: usize,
+        id: u16,
+        parent: u64,
+        namespace: NtfsFileNamespace,
+        name: &str,
+        attributes: u32,
+    ) -> usize {
         let encoded: Vec<u16> = name.encode_utf16().collect();
         let mut value = vec![0u8; size_of::<NtfsFileNameHeader>() + encoded.len() * 2];
-        write_u64(&mut value, 0, ROOT_RECORD);
+        write_u64(&mut value, 0, parent);
         write_u64(&mut value, 40, 34_359_738_368);
         write_u64(&mut value, 48, 34_359_738_368);
         write_u32(&mut value, 56, attributes);
         value[64] = encoded.len() as u8;
-        value[65] = NtfsFileNamespace::Win32 as u8;
+        value[65] = namespace as u8;
         for (index, character) in encoded.into_iter().enumerate() {
             write_u16(
                 &mut value,
@@ -553,7 +661,7 @@ mod tests {
                 character,
             );
         }
-        add_resident_attribute(record, offset, NtfsAttributeType::FileName, 1, &value)
+        add_resident_attribute(record, offset, NtfsAttributeType::FileName, id, &value)
     }
 
     fn add_resident_attribute(
