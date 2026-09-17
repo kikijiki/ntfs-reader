@@ -93,12 +93,31 @@ pub struct NtfsStandardInformation {
     pub file_attributes: u32,
 }
 
+/// Namespace of a `$FILE_NAME` attribute. A non-8.3 long name gets a `Win32`
+/// entry plus a separate `Dos` entry for the generated short name;
+/// `Win32AndDos` means one entry covers both. `Posix`/`Win32` otherwise mark
+/// a real hard link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NtfsFileNamespace {
     Posix = 0,
     Win32 = 1,
     Dos = 2,
     Win32AndDos = 3,
+}
+
+impl TryFrom<u8> for NtfsFileNamespace {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Posix),
+            1 => Ok(Self::Win32),
+            2 => Ok(Self::Dos),
+            3 => Ok(Self::Win32AndDos),
+            other => Err(other),
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -184,6 +203,16 @@ impl NtfsFileName {
 
     pub fn is_reparse_point(&self) -> bool {
         self.header.file_attributes & NtfsFileNameFlags::ReparsePoint as u32 != 0
+    }
+
+    /// `None` only for a corrupt namespace byte outside 0-3.
+    pub fn namespace(&self) -> Option<NtfsFileNamespace> {
+        self.header.namespace.try_into().ok()
+    }
+
+    /// True for the DOS 8.3 short-name alias of a sibling `Win32` entry, not a separate hard link.
+    pub fn is_dos_alias(&self) -> bool {
+        self.namespace() == Some(NtfsFileNamespace::Dos)
     }
 }
 

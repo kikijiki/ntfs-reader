@@ -6,6 +6,21 @@ use std::mem::size_of;
 
 use crate::{api::*, attribute::NtfsAttribute, mft::Mft};
 
+/// Classification of one `$FILE_NAME` attribute, from [`NtfsFile::all_file_names`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsNameKind {
+    /// Counts toward `link_count`.
+    Link,
+    /// DOS 8.3 alias of a sibling `Link` entry, not a separate hard link.
+    DosAlias,
+}
+
+#[derive(Clone, Copy)]
+pub struct NtfsFileNameEntry {
+    pub name: NtfsFileName,
+    pub kind: NtfsNameKind,
+}
+
 pub struct NtfsFile<'a> {
     pub number: u64,
     pub header: &'a NtfsFileRecordHeader,
@@ -172,6 +187,27 @@ impl<'a> NtfsFile<'a> {
         }
 
         best
+    }
+
+    /// All `$FILE_NAME` attributes across the base and extension records,
+    /// tagged with [`NtfsNameKind`]. `Link` entries correspond to hard
+    /// links; a raw attribute count doesn't, since a DOS alias adds one
+    /// without adding a link.
+    pub fn all_file_names(&self, mft: &Mft) -> Vec<NtfsFileNameEntry> {
+        let mut names = Vec::new();
+
+        for record in mft.file_records(self) {
+            record.file_names(|name| {
+                let kind = if name.is_dos_alias() {
+                    NtfsNameKind::DosAlias
+                } else {
+                    NtfsNameKind::Link
+                };
+                names.push(NtfsFileNameEntry { name, kind });
+            });
+        }
+
+        names
     }
 
     fn file_names<F>(&self, mut f: F)
