@@ -38,6 +38,7 @@
             monitor_socket="$vm_dir/monitor.sock"
             swtpm_socket="$vm_dir/swtpm.sock"
             swtpm_pid_file="$vm_dir/swtpm.pid"
+            stress_disk="''${NTFS_READER_STRESS_DISK:-$vm_dir/ntfs-stress.qcow2}"
             firmware=${pkgs.qemu_kvm}/share/qemu/edk2-x86_64-secure-code.fd
 
             is_running() {
@@ -62,6 +63,19 @@
               require_file "$vm_dir/windows-11-enterprise-25h2-eval-x64.iso"
               require_file "$vm_dir/uefi-vars.fd"
               require_file "$vm_dir/payload"
+
+              # The stress disk (`S:` in the guest, see tools/vm/stress.ps1 in the dev docs) is thin
+              # and created on first start. `NTFS_READER_STRESS_DISK` moves it (for example onto an
+              # external SSD); a directory that is not there means the drive is not mounted, and the
+              # disk is never created anywhere else. Deleting the file is safe: the next start makes
+              # a new one and the guest rebuilds the fixture on it.
+              if [[ ! -e "$stress_disk" ]]; then
+                if [[ ! -d "$(dirname "$stress_disk")" ]]; then
+                  echo "The stress disk directory does not exist (is the drive mounted?): $(dirname "$stress_disk")" >&2
+                  exit 1
+                fi
+                qemu-img create -f qcow2 "$stress_disk" 2T
+              fi
 
               mkdir -p "$vm_dir/tpm"
               rm -f "$pid_file" "$monitor_socket" "$swtpm_socket" "$swtpm_pid_file"
@@ -93,6 +107,8 @@
                 -device nvme,drive=system,serial=NTFSSYSTEM,bootindex=2 \
                 -drive if=none,id=test,format=qcow2,file="$vm_dir/ntfs-test.qcow2",discard=unmap \
                 -device nvme,drive=test,serial=NTFSTEST \
+                -drive if=none,id=stress,format=qcow2,file="$stress_disk",discard=unmap \
+                -device nvme,drive=stress,serial=NTFSSTRESS \
                 -drive if=none,id=installer,media=cdrom,readonly=on,file="$vm_dir/windows-11-enterprise-25h2-eval-x64.iso" \
                 -device ide-cd,drive=installer,bootindex=1 \
                 -drive if=none,id=payload,format=raw,file=fat:rw:"$vm_dir/payload" \

@@ -1,156 +1,124 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use ntfs_reader::{
-    file_info::{FileInfo, HashMapCache, VecCache},
-    mft::Mft,
-    test_utils::test_volume_letter,
-    volume::Volume,
-};
+//! Timing of `Mft::new` and of `FileInfo` path resolution with and without a `DefaultPathCache`.
+//! Needs an elevated shell; the volume comes from `test_volume_letter()` (the stress volume `S:`
+//! gives the numbers at a million files, see CONTRIBUTING.md).
+//! See `cache_memory` for the memory side.
+//!
+//! Volume-backed, so Windows-only regardless of the `internals` feature
+//! (which only makes the crate's parsing *types* buildable on Linux, not a
+//! real `\\.\C:` device to read): every item below is `#[cfg(windows)]`, and
+//! a `#[cfg(not(windows))]` stub `main` says so instead of trying (and
+//! failing at run time) to open a volume that doesn't exist on this
+//! platform. See `journal_synthetic.rs` for the same pattern.
+
+#[cfg(windows)]
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+#[cfg(windows)]
+use ntfs_reader::{DefaultPathCache, FileInfo, Mft, PathCache, Volume};
+#[cfg(windows)]
 use std::hint::black_box;
 
-// Configuration constants
-const PARTIAL_ITERATION_LIMIT: usize = 1000;
-const CACHE_DROP_ITERATION_LIMIT: usize = 10000;
+#[cfg(windows)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+#[cfg(windows)]
+use common::test_volume_letter;
 
+#[cfg(windows)]
+const LOOKUP_COUNTS: [usize; 3] = [10, 100, 1000];
+
+#[cfg(windows)]
 fn open_mft() -> Mft {
-    let vol =
+    let volume =
         Volume::new(format!("\\\\.\\{}:", test_volume_letter())).expect("Failed to open volume");
-    Mft::new(vol).expect("Failed to create MFT")
+    Mft::new(volume).expect("Failed to create MFT")
 }
 
-fn bench_file_iteration_no_cache(c: &mut Criterion) {
+/// Record numbers of `count` files spread evenly over the volume.
+#[cfg(windows)]
+fn sample(mft: &Mft, count: usize) -> Vec<u64> {
+    let files: Vec<u64> = mft.files().map(|file| file.number()).collect();
+    let step = (files.len() / count).max(1);
+    files.into_iter().step_by(step).take(count).collect()
+}
+
+#[cfg(windows)]
+fn full_scan(mft: &Mft, cache: &mut impl PathCache) {
+    for file in mft.files() {
+        black_box(FileInfo::with_cache(&file, cache));
+    }
+}
+
+#[cfg(windows)]
+fn lookup(mft: &Mft, numbers: &[u64], cache: &mut impl PathCache) {
+    for file in numbers.iter().filter_map(|&number| mft.record(number)) {
+        black_box(FileInfo::with_cache(&file, cache));
+    }
+}
+
+/// Loading the whole `$MFT`: the volume read, the fixups and the extension-record index.
+#[cfg(windows)]
+fn bench_mft_new(c: &mut Criterion) {
+    c.bench_function("mft_new", |b| b.iter(|| black_box(open_mft())));
+}
+
+#[cfg(windows)]
+fn bench_full_scan(c: &mut Criterion) {
     let mft = open_mft();
-    c.bench_function("file_iteration_no_cache", |b| {
-        b.iter(|| {
-            let mut counter = 0;
-            for file in mft.files() {
-                let _info = FileInfo::new(&mft, &file);
-                counter += 1;
-                if counter >= PARTIAL_ITERATION_LIMIT {}
-            }
-            black_box(counter)
+    let mut group = c.benchmark_group("full_scan");
+    group.bench_function("none", |b| b.iter(|| full_scan(&mft, &mut ())));
+    group.bench_function("default_path_cache", |b| {
+        b.iter(|| full_scan(&mft, &mut DefaultPathCache::new()))
+    });
+    group.finish();
+}
+
+/// A fresh cache per iteration: the cost of a cache when only a few files
+/// are resolved, allocation and drop included.
+#[cfg(windows)]
+fn bench_lookup(c: &mut Criterion) {
+    let mft = open_mft();
+    let mut group = c.benchmark_group("lookup");
+    for count in LOOKUP_COUNTS {
+        let numbers = sample(&mft, count);
+        group.bench_with_input(BenchmarkId::new("none", count), &numbers, |b, numbers| {
+            b.iter(|| lookup(&mft, numbers, &mut ()))
         });
+        group.bench_with_input(
+            BenchmarkId::new("default_path_cache", count),
+            &numbers,
+            |b, numbers| b.iter(|| lookup(&mft, numbers, &mut DefaultPathCache::new())),
+        );
+    }
+    group.finish();
+}
+
+/// Dropping a cache filled by a full scan, measured on its own.
+#[cfg(windows)]
+fn bench_cache_drop(c: &mut Criterion) {
+    let mft = open_mft();
+    c.bench_function("cache_drop", |b| {
+        b.iter_batched(
+            || {
+                let mut cache = DefaultPathCache::new();
+                full_scan(&mft, &mut cache);
+                cache
+            },
+            drop,
+            BatchSize::LargeInput,
+        )
     });
 }
 
-fn bench_file_iteration_hashmap_cache(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("file_iteration_hashmap_cache", |b| {
-        b.iter(|| {
-            let mut cache = HashMapCache::default();
-            let mut counter = 0;
-            for file in mft.files() {
-                let _info = FileInfo::with_cache(&mft, &file, &mut cache);
-                counter += 1;
-                if counter >= PARTIAL_ITERATION_LIMIT {}
-            }
-            black_box(counter)
-        });
-    });
-}
-
-fn bench_file_iteration_vec_cache(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("file_iteration_vec_cache", |b| {
-        b.iter(|| {
-            let mut cache = VecCache::default();
-            cache.0.resize(mft.max_record as usize, None);
-            let mut counter = 0;
-            for file in mft.files() {
-                let _info = FileInfo::with_cache(&mft, &file, &mut cache);
-                counter += 1;
-                if counter >= PARTIAL_ITERATION_LIMIT {}
-            }
-            black_box(counter)
-        });
-    });
-}
-
-fn bench_full_iteration_no_cache(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("full_iteration_no_cache", |b| {
-        b.iter(|| {
-            let mut files = Vec::new();
-            for file in mft.files() {
-                files.push(FileInfo::new(&mft, &file));
-            }
-            black_box(files.len())
-        });
-    });
-}
-
-fn bench_full_iteration_hashmap_cache(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("full_iteration_hashmap_cache", |b| {
-        b.iter(|| {
-            let mut cache = HashMapCache::default();
-            let mut files = Vec::new();
-            for file in mft.files() {
-                files.push(FileInfo::with_cache(&mft, &file, &mut cache));
-            }
-            black_box(files.len())
-        });
-    });
-}
-
-fn bench_full_iteration_vec_cache(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("full_iteration_vec_cache", |b| {
-        b.iter(|| {
-            let mut cache = VecCache::default();
-            cache.0.resize(mft.max_record as usize, None);
-            let mut files = Vec::new();
-            for file in mft.files() {
-                files.push(FileInfo::with_cache(&mft, &file, &mut cache));
-            }
-            black_box(files.len())
-        });
-    });
-}
-
-fn bench_cache_drop_hashmap(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("cache_drop_hashmap", |b| {
-        b.iter(|| {
-            let mut cache = HashMapCache::default();
-            let mut counter = 0;
-            for file in mft.files() {
-                let _info = FileInfo::with_cache(&mft, &file, &mut cache);
-                counter += 1;
-                if counter >= CACHE_DROP_ITERATION_LIMIT {}
-            }
-            drop(black_box(cache));
-        });
-    });
-}
-
-fn bench_cache_drop_vec(c: &mut Criterion) {
-    let mft = open_mft();
-    c.bench_function("cache_drop_vec", |b| {
-        b.iter(|| {
-            let mut cache = VecCache::default();
-            cache.0.resize(mft.max_record as usize, None);
-            let mut counter = 0;
-            for file in mft.files() {
-                let _info = FileInfo::with_cache(&mft, &file, &mut cache);
-                counter += 1;
-                if counter >= CACHE_DROP_ITERATION_LIMIT {}
-            }
-            drop(black_box(cache));
-        });
-    });
-}
-
+#[cfg(windows)]
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets =
-    bench_file_iteration_no_cache,
-    bench_file_iteration_hashmap_cache,
-    bench_file_iteration_vec_cache,
-    bench_full_iteration_no_cache,
-    bench_full_iteration_hashmap_cache,
-    bench_full_iteration_vec_cache,
-    bench_cache_drop_hashmap,
-    bench_cache_drop_vec,
+    targets = bench_mft_new, bench_full_scan, bench_lookup, bench_cache_drop
 );
+#[cfg(windows)]
 criterion_main!(benches);
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("mft_benchmark: windows-only (needs a real volume); skipped on this platform");
+}
