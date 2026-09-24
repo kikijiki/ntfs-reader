@@ -11,9 +11,37 @@ run_windows = ["cargo fmt", "cargo clippy --fix --allow-dirty --allow-staged"]
 [tasks.check]
 run = [
     "nix develop -c cargo fmt --check",
-    "nix develop -c cargo xwin clippy --target x86_64-pc-windows-msvc -- -D warnings",
+    "nix develop -c cargo xwin clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings",
 ]
-run_windows = ["cargo fmt --check", "cargo clippy -- -D warnings"]
+run_windows = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
+
+[tasks.check-internals]
+description = "Lint the `internals` feature (all targets, -D warnings) and run the unit tests with it"
+run = [
+    "nix develop -c cargo xwin clippy --all-targets --features internals --target x86_64-pc-windows-msvc -- -D warnings",
+    "nix develop -c cargo test --features internals --lib",
+]
+run_windows = [
+    "cargo clippy --all-targets --features internals -- -D warnings",
+    "cargo test --features internals --lib",
+]
+
+[tasks.check-linux]
+description = "Type-check the `internals` feature natively on Linux with plain cargo (what the Linux CI job runs)"
+run = "cargo check --features internals --all-targets"
+
+[tasks.check-msrv]
+description = "Check all targets, with and without `internals`, on the minimum supported Rust version (rust-version in Cargo.toml)"
+run = [
+    "rustup toolchain install 1.88.0 --profile minimal --target x86_64-pc-windows-msvc",
+    "nix develop -c bash -c 'PATH=$HOME/.cargo/bin:$PATH RUSTUP_TOOLCHAIN=1.88.0 cargo xwin check --all-targets --target x86_64-pc-windows-msvc --target-dir target/msrv'",
+    "nix develop -c bash -c 'PATH=$HOME/.cargo/bin:$PATH RUSTUP_TOOLCHAIN=1.88.0 cargo xwin check --all-targets --features internals --target x86_64-pc-windows-msvc --target-dir target/msrv'",
+]
+run_windows = [
+    "rustup toolchain install 1.88.0 --profile minimal",
+    "cargo +1.88.0 check --all-targets",
+    "cargo +1.88.0 check --all-targets --features internals",
+]
 
 [tasks.build]
 run = "nix develop -c cargo xwin build --target x86_64-pc-windows-msvc"
@@ -24,19 +52,47 @@ run = "nix develop -c cargo xwin build --release --target x86_64-pc-windows-msvc
 run_windows = "cargo build --release"
 
 [tasks.test]
-description = "Run tests on Windows; compile them for MSVC on other platforms"
-run = "nix develop -c cargo xwin test --no-run --target x86_64-pc-windows-msvc"
-run_windows = "cargo test"
+description = "Run tests (with the `internals` feature) on Windows; compile them for MSVC on other platforms. The integration tests need NTFS_READER_TEST_VOLUME (a disposable NTFS drive letter, never the system drive; see tests/common/mod.rs)"
+run = "nix develop -c cargo xwin test --no-run --features internals --target x86_64-pc-windows-msvc"
+run_windows = "cargo test --features internals"
 
 [tasks.test-32]
-description = "Run 32-bit tests on Windows; check all targets on other platforms"
-run = "nix develop -c cargo xwin check --all-targets --target i686-pc-windows-msvc"
-run_windows = "cargo test --target i686-pc-windows-msvc -- --test-threads=1"
+description = "Run 32-bit tests (with the `internals` feature) on Windows; check all targets on other platforms"
+run = "nix develop -c cargo xwin check --all-targets --features internals --target i686-pc-windows-msvc"
+run_windows = "cargo test --features internals --target i686-pc-windows-msvc -- --test-threads=1"
 
 [tasks.bench]
-description = "Run benchmarks on Windows; compile them for MSVC elsewhere"
+description = "Run benchmarks on Windows; compile them for MSVC elsewhere. The volume-backed ones (mft_benchmark, cache_memory) need NTFS_READER_TEST_VOLUME"
 run = "nix develop -c cargo xwin bench --no-run --target x86_64-pc-windows-msvc"
 run_windows = "cargo bench"
+
+[tasks.bench-build]
+description = "Build benchmarks without running them (CI: benches need an elevated shell and a real volume)"
+run = "nix develop -c cargo xwin bench --no-run --target x86_64-pc-windows-msvc"
+run_windows = "cargo bench --no-run"
+
+[tasks.doc]
+description = "Build docs, denying warnings"
+run = "nix develop -c cargo doc --no-deps --target x86_64-pc-windows-msvc"
+run_windows = "cargo doc --no-deps"
+env = { RUSTDOCFLAGS = "-D warnings" }
+
+[tasks.test-linux]
+description = "Run the unit and property tests natively on Linux via the internals feature (no VM, no cross-compile; the property tests search for 2 s each, ARBTEST_BUDGET_MS=60000 for longer, ARBTEST_SEED=0x... to replay a failure)"
+run = "nix develop -c cargo test --features internals --lib"
+
+[tasks.bench-linux]
+description = "Run the synthetic (non-volume) criterion benches natively on Linux via the internals feature; the volume-backed benches are Windows-only and no-op here"
+run = [
+    "nix develop -c cargo bench --features internals --bench mft_load_synthetic",
+    "nix develop -c cargo bench --features internals --bench file_access_synthetic",
+    "nix develop -c cargo bench --features internals --bench journal_synthetic",
+]
+
+[tasks.package]
+description = "Package dry run: build and verify the published crate"
+run = "nix develop -c cargo package --target x86_64-pc-windows-msvc"
+run_windows = "cargo package"
 
 [tasks.publish]
 description = "Publish the crate after verifying it for Windows MSVC"

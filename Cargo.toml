@@ -1,39 +1,92 @@
 [package]
 name = "ntfs-reader"
-version = "0.4.7"
+version = "0.5.0"
 authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
+rust-version = "1.88.0"
+# Resolver 3 picks dependency versions that support `rust-version`.
+resolver = "3"
 description = "Read MFT and USN journal"
 repository = "https://github.com/kikijiki/ntfs-reader"
-keywords = ["filesystem", "ntfs"]
-categories = ["filesystem"]
+readme = "README.md"
+documentation = "https://docs.rs/ntfs-reader"
+keywords = ["filesystem", "ntfs", "mft", "windows", "journal"]
+categories = ["filesystem", "os::windows-apis"]
+include = [
+    "src/**",
+    "benches/**",
+    "examples/**",
+    "tests/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
+
+[features]
+# Internal-only, off by default and `#[doc(hidden)]` everywhere it applies:
+# builds the pure, byte-slice parsing modules (no `windows` crate, no real
+# volume or journal I/O) on any target, so the unit tests run natively on Linux,
+# and exposes the synthetic record-building helpers (`internals::test_records`)
+# and a couple of bench-only entry points (`internals::parse_usn_records_bench`)
+# to `benches/*_synthetic.rs` (criterion, runs on Linux or Windows), which reuse
+# the same code instead of keeping their own copy. Not for library consumers;
+# see docs/operating-notes.md's "Linux-side testing" section.
+internals = []
 
 [dependencies]
 thiserror = "2.0"
-binread = { version = "2.2", features = ["const_generics"] }
-time = "0.3"
+# 0.3.6 added `PrimitiveDateTime::MIN`/`MAX`, which the time conversion needs.
+time = "0.3.6"
 tracing = "0.1"
 
-# For the journal
+# Windows-only so a non-Windows build fails with lib.rs's single
+# compile_error! instead of windows' own confusing errors for a
+# platform it doesn't support.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_System_Time",
-    "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
     "Win32_System_Ioctl",
-    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
 criterion = "0.8"
+# The property tests (`src/mft/structured_tests.rs`, `src/usn/structured_tests.rs`):
+# `arbitrary` derives the description types, `arbtest` drives them from seeded random bytes on stable.
+arbitrary = { version = "1", features = ["derive"] }
+arbtest = "0.3"
+
+# Only the tests use it (`GetProcessHandleCount`, to check `Journal` leaks no handle).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 [[bench]]
 name = "mft_benchmark"
 harness = false
+
+[[bench]]
+name = "cache_memory"
+harness = false
+
+[[bench]]
+name = "mft_load_synthetic"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "file_access_synthetic"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "journal_synthetic"
+harness = false
+required-features = ["internals"]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"

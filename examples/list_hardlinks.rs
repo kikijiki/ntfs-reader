@@ -1,35 +1,22 @@
-use ntfs_reader::file::NtfsNameKind;
-use ntfs_reader::mft::Mft;
-use ntfs_reader::volume::Volume;
+use ntfs_reader::{DefaultPathCache, Mft, Volume};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open the C: volume
     let volume = Volume::new("\\\\.\\C:")?;
     let mft = Mft::new(volume)?;
+    let mut cache = DefaultPathCache::new();
 
     for file in mft.files() {
-        let names = file.all_file_names(&mft);
-        let link_count = names
-            .iter()
-            .filter(|entry| entry.kind == NtfsNameKind::Link)
-            .count();
-
         // Only files with more than one hard link are interesting here.
-        if link_count < 2 {
+        if file.hard_links().nth(1).is_none() {
             continue;
         }
 
-        println!(
-            "File record {} has {} hard links:",
-            file.number(),
-            link_count
-        );
-        for entry in &names {
-            match entry.kind {
-                NtfsNameKind::Link => {
-                    println!("  {} (parent record {})", entry.name, entry.name.parent())
-                }
-                NtfsNameKind::DosAlias => println!("  {} (short-name alias)", entry.name),
+        println!("File record {}:", file.number());
+        for link in file.hard_links() {
+            match mft.resolve_path(&link, &mut cache) {
+                Some(path) => println!("  {}", path.display()),
+                None => println!("  {} (unresolved parent {})", link, link.parent_number()),
             }
         }
     }

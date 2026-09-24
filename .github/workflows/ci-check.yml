@@ -23,14 +23,60 @@ jobs:
       - name: Check
         run: mise run check
 
+      - name: Check (internals feature)
+        run: mise run check-internals
+
       - name: Build
         run: mise run build
 
-      - name: Enable USN journal on runner drive
+      - name: Doc
+        run: mise run doc
+
+      - name: Package dry run
+        run: mise run package
+
+      - name: Build benchmarks
+        run: mise run bench-build
+
+      # The integration tests need an explicit volume and refuse the system drive
+      # (tests/common/mod.rs). The checkout lives on the runner's workspace drive
+      # (D: on windows-latest), which is not the system drive, so the allow flag is
+      # only set if that ever changes; the runner is disposable either way.
+      - name: Select the test volume and enable its USN journal
         shell: pwsh
         run: |
           $drive = ($env:GITHUB_WORKSPACE -split ':')[0]
+          "NTFS_READER_TEST_VOLUME=$drive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($drive -ieq ($env:SystemDrive -split ':')[0]) {
+            "NTFS_READER_ALLOW_SYSTEM_DRIVE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           fsutil usn createjournal "${drive}:"
 
       - name: Test
         run: mise run test
+
+      - name: Test (32-bit)
+        run: mise run test-32
+
+  # Type-checks what the Windows job cannot run: the `internals` feature natively.
+  check-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+
+      - name: Check internals feature
+        run: mise run check-linux
+
+  msrv:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+
+      - name: Check on the minimum supported Rust version
+        run: mise run check-msrv

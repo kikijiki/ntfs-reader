@@ -13,103 +13,140 @@
 
 See the `examples` directory for complete working examples.
 
+## Opening a volume
+
+`Volume::new` takes a Win32 device path such as `\\.\C:` or `\\?\C:`, naming the volume
+itself rather than a file on it. `\\.\` and `\\?\` are both device-path prefixes recognized by
+Win32 (the second also disables the usual `MAX_PATH` and path-parsing rules for regular file
+paths, which doesn't matter for a bare volume like `C:`); the crate passes the string straight
+to `CreateFileW` without rewriting it, so the two forms are interchangeable here. The examples
+below use different ones only to show that.
+
+Opening a raw volume this way needs an elevated (administrator) process; a non-elevated caller
+gets `NtfsReaderError::AccessDenied`.
+
 ## MFT Usage
 
-```rust
-// Open the C volume and its MFT.
-// Must have elevated privileges or it will fail.
+```rust,no_run
+# use ntfs_reader::{DefaultPathCache, FileInfo, Mft, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Open the C volume and its MFT. Needs elevation; see "Opening a volume" above.
 let volume = Volume::new("\\\\.\\C:")?;
 let mft = Mft::new(volume)?;
 
-// Iterate all files
+// Remembers directory paths between lookups; see "Path cache" below.
+let mut cache = DefaultPathCache::new();
+
+// Iterate all files: every in-use file record, except the 24 records NTFS
+// reserves for its own use (so not the root directory either).
 for file in mft.files() {
-    // Can also use FileInfo::with_cache().
-    let info = FileInfo::new(&mft, &file);
+    let _info = FileInfo::with_cache(&file, &mut cache);
 
-    // Available fields: name, path, is_directory, size, file_attributes,
-    // and timestamps (created, accessed, modified).
+    // Available fields: name, path (None if it cannot be resolved),
+    // is_directory, size, file_attributes, and timestamps (created,
+    // accessed, modified).
 }
 
-// FileInfo/get_best_file_name return only one name. List every hard link
-// (and DOS short-name alias) instead:
-for entry in file.all_file_names(&mft) {
-    match entry.kind {
-        NtfsNameKind::Link => println!("{} (parent {})", entry.name, entry.name.parent()),
-        NtfsNameKind::DosAlias => println!("{} (short-name alias)", entry.name),
+// Lower level: every attribute of a file, across base and extension records,
+// plus typed views over them.
+for file in mft.files() {
+    // Each hard link, as a full path (DOS 8.3 aliases are skipped).
+    for link in file.hard_links() {
+        let _path = mft.resolve_path(&link, &mut cache);
     }
+    // Default stream and alternate data streams.
+    for _stream in file.data_streams() {
+        // stream.name is None for the default stream, else the stream name as
+        // an OsString (lossless: `path:stream` built from it opens the stream).
+    }
+    // Also: names, best_name, standard_information (timestamps and attribute
+    // flags), resident_data, attributes.
 }
+# Ok(())
+# }
+```
 
-// Some perf comparison
-// Type          Iteration  Drop       Total
-// No Cache      12.326s    0          12.326s
-// HashMap Cache 4.981s     323.150ms  5.305s
-// Vec Cache     3.756s     114.670ms  3.871s
+## Path cache
+
+The MFT stores only a name and a parent directory for each file, so building
+a full path means walking up the parent chain. `FileInfo::with_cache` and
+`Mft::resolve_path` take a `PathCache` that remembers the path of every
+directory they walk through, so later lookups stop at the first cached
+parent.
+
+- `DefaultPathCache`: the cache to use. It holds one entry per directory
+  visited, so it is cheap for a few lookups and pays off on a full scan.
+- `()`: caches nothing. `FileInfo::new` uses it; fine for a single lookup.
+
+`PathCache` is a trait, so you can plug in your own storage.
+
+Measured on a Windows 11 VM system volume (175k files, 190k MFT records,
+186 MiB MFT in memory), with a fresh cache for each run:
+
+| Files resolved | No cache | `DefaultPathCache` | Cache heap |
+| -------------- | -------- | ------------------ | ---------- |
+| 10             | 23 µs    | 21 µs              | < 0.01 MiB |
+| 100            | 379 µs   | 252 µs             | 0.02 MiB   |
+| 1,000          | 3.2 ms   | 1.5 ms             | 0.18 MiB   |
+| All (175k)     | 483 ms   | 218 ms             | 6.2 MiB    |
+
+Dropping a cache filled by a full scan takes about 4 ms. Numbers depend on
+the volume and machine; to measure your own, run from an elevated shell with
+`NTFS_READER_TEST_VOLUME` set to the drive letter of the volume to read (the
+benchmarks read that volume and fail without it; see CONTRIBUTING.md):
+
+```sh
+set NTFS_READER_TEST_VOLUME=T
+cargo bench --bench mft_benchmark   # time
+cargo bench --bench cache_memory    # heap held by the cache
 ```
 
 ## Journal Usage
 
-```rust
+Like the MFT, opening the volume needs elevation (see "Opening a volume" above). The USN journal
+also has to already be active on the volume: `Journal::new` fails with
+`NtfsReaderError::JournalNotActive` if it isn't. Most real-world Windows system volumes have one
+running by default; on a fresh or test volume, create it first with
+`fsutil usn createjournal m=<max size> a=<allocation delta> <drive>:`.
+
+```rust,no_run
+# use ntfs_reader::{Journal, JournalOptions, Reason, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let volume = Volume::new("\\\\?\\C:")?;
 
-// With `JournalOptions` you can customize things like where to start reading
-// from (beginning, end, specific point), the mask to use for the events and more.
-let mut journal = Journal::new(volume, JournalOptions::default())?;
+// With `JournalOptions` you can customize things like where to start reading from
+// (beginning, end, specific point) and `reason_mask`, which events to get: a bitmask of
+// `Reason` constants (for example `Reason::FILE_CREATE`), OR'd together.
+let options = JournalOptions {
+    reason_mask: Reason::FILE_CREATE | Reason::FILE_DELETE,
+    ..JournalOptions::default()
+};
+let mut journal = Journal::new(volume, options)?;
 
 // Try to read some events.
-// You can call `read_sized` to use a custom buffer size.
-for result in journal.read()? {
-    // Available fields are: usn, timestamp, file_id, parent_id, reason, path.
+// You can call `read_sized(buffer_size)` to use a custom buffer size.
+let result = journal.read()?;
+
+// `result.caught_up` is true once this read reached the journal's current end (even if
+// `result.records` is empty because reason_mask filtered everything in this window).
+for record in &result.records {
+    // Available fields are: usn, timestamp, file_id, parent_id, reason, file_attributes,
+    // name.
+    // `record.reason` is a `Reason` bitmask: `contains` is true when every bit passed to
+    // it is set, `intersects` when at least one is.
+    if record.reason.contains(Reason::FILE_DELETE) {
+        // `record.name` is the file name only, as a lossless OsString (a name that is not
+        // valid UTF-16 is not altered). Resolving a full path is a separate, explicit step
+        // (it costs one or two handle opens), so it's not done for every record. It returns
+        // `None` when the file and its parent are both gone (as here, after a delete).
+        let _path: Option<std::path::PathBuf> = journal.resolve_path(record);
+    }
 }
+# Ok(())
+# }
 ```
 
 ## Development
 
-On NixOS/Linux, enter the development shell directly or let direnv load it:
-
-```sh
-nix develop
-# or: direnv allow
-
-cargo xwin build --target x86_64-pc-windows-msvc
-cargo xwin check --target i686-pc-windows-msvc
-```
-
-The flake includes Rust, both Windows MSVC Rust targets, `cargo-xwin`, and the
-LLVM linker tools. Windows is still required to execute tests that access a raw
-NTFS volume.
-
-On x86_64 Linux, the same development shell includes the project's QEMU Windows
-VM launcher. Its mutable disks and installation media live outside the checkout
-in `$NTFS_READER_VM_DIR` (by default `~/.local/share/windows-vm`):
-
-```sh
-ntfs-windows-vm start
-ntfs-windows-vm status
-ntfs-windows-vm view
-ntfs-windows-vm stop
-```
-
-You can also start it without entering the shell with
-`nix run .#windows-vm -- start`.
-
-You can use plain cargo or install [mise](https://mise.jdx.dev/):
-
-```sh
-curl https://mise.run | sh
-```
-
-Tasks
-
-On Windows these run Cargo natively. On other platforms they enter the Nix
-development shell and cross-compile for Windows MSVC.
-
-```sh
-mise fix      # Fix format and fixable linting errors
-mise check    # Check format and linting issues
-mise build    # Build debug
-mise release  # Build release
-mise test     # Run tests on Windows; compile them for MSVC elsewhere
-mise test-32  # Run 32-bit tests on Windows; check all targets elsewhere
-mise bench    # Run benchmarks on Windows; compile them elsewhere
-mise publish -n # Verify the crate package without uploading
-```
+Building, testing and the development shell are described in
+[CONTRIBUTING.md](https://github.com/kikijiki/ntfs-reader/blob/master/CONTRIBUTING.md).
