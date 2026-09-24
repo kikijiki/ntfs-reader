@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-25
+
+### Fixed
+
+- The volume reader treated a short read from the underlying handle as the end of the volume, so a read could fail
+  with `UnexpectedEof` or come back truncated. Raw volume handles do not return short reads in practice, so this
+  was not seen on real volumes ([#20](https://github.com/kikijiki/ntfs-reader/issues/20)).
+
 ## [0.5.0] - 2026-09-24
 
 ### Compared with 0.4.7
@@ -335,7 +343,8 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
 First tagged release. The crate could already read the `$MFT` into memory and read the USN journal.
 Earlier history (0.1.0 to 0.2.0, 2022) is not tagged and is not covered here.
 
-[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.7...v0.5.0
 [0.4.7]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.5...v0.4.6

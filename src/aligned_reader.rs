@@ -7,6 +7,12 @@ use std::io::{self, BufReader};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Reads from `inner` only at block-aligned offsets, in whole blocks, as a
+/// raw volume handle requires.
+///
+/// That holds as long as `inner` returns whole blocks before EOF, as a volume
+/// handle does. A short read while filling the cache is continued from where
+/// it stopped, which is correct for any `Read` but no longer aligned.
 pub struct AlignedReader<R>
 where
     R: Read + Seek,
@@ -80,9 +86,22 @@ where
         }
 
         if !self.buffer_valid || aligned_position != self.buffer_pos {
+            // Invalidate first: an error part way through the fill leaves the
+            // buffer holding pieces of two blocks.
+            self.buffer_valid = false;
             self.inner.seek(SeekFrom::Start(aligned_position))?;
             self.buffer.resize(self.alignment as usize, 0u8);
-            let filled = self.inner.read(&mut self.buffer)?;
+            // A short read is not EOF (issue #20): keep reading until the
+            // block is full or the inner reader returns 0.
+            let mut filled = 0;
+            while filled < self.buffer.len() {
+                match self.inner.read(&mut self.buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
             self.buffer_pos = aligned_position;
             self.buffer_size = filled;
             self.buffer_valid = true;
@@ -276,5 +295,103 @@ mod tests {
         // Head block, aligned middle span, tail block.
         assert!(stats.reads.get() <= 3, "{} inner reads", stats.reads.get());
         assert_eq!(stats.misaligned.get(), 0, "inner reads must stay aligned");
+    }
+
+    /// Returns at most `chunk` bytes per read, as `Read` allows before EOF
+    /// (issue #20). Optionally fails the read with index `fail_at`.
+    struct Chunked {
+        inner: Cursor<Vec<u8>>,
+        chunk: usize,
+        reads: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let index = self.reads;
+            self.reads += 1;
+            if self.fail_at == Some(index) {
+                return Err(io::Error::other("injected failure"));
+            }
+            let len = buf.len().min(self.chunk);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    impl Seek for Chunked {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn chunked(len: usize, chunk: usize) -> (AlignedReader<Chunked>, Vec<u8>) {
+        let bytes = data(len);
+        let inner = Chunked {
+            inner: Cursor::new(bytes.clone()),
+            chunk,
+            reads: 0,
+            fail_at: None,
+        };
+        let reader = AlignedReader::new(inner, ALIGNMENT).expect("reader");
+        (reader, bytes)
+    }
+
+    #[test]
+    fn short_inner_read_in_the_cache_is_not_eof() {
+        // The scenario from issue #20.
+        let (mut reader, bytes) = chunked(8192, 1024);
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        let mut buf = vec![0u8; 2000];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, bytes[100..2100]);
+    }
+
+    #[test]
+    fn short_direct_read_is_not_followed_by_eof() {
+        // The direct read comes back short and leaves the position
+        // unaligned; the next call goes through the cache.
+        let (mut reader, bytes) = chunked(8192, 1024);
+        let mut buf = vec![0u8; 8192];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, bytes);
+    }
+
+    #[test]
+    fn short_inner_reads_match_source() {
+        for chunk in [1, 1000, 1024, 4095, 5000] {
+            let (mut reader, bytes) = chunked(4 * 4096 + 904, chunk);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            assert_eq!(out, bytes, "read_to_end, chunk {chunk}");
+
+            for (position, len) in [(100usize, 2000usize), (4095, 5000), (12345, 4000)] {
+                reader.seek(SeekFrom::Start(position as u64)).unwrap();
+                let mut buf = vec![0u8; len];
+                reader.read_exact(&mut buf).unwrap();
+                assert_eq!(
+                    buf,
+                    bytes[position..position + len],
+                    "chunk {chunk} at {position}+{len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_cache_fill_does_not_leave_a_stale_block() {
+        let (mut reader, bytes) = chunked(8192, 1024);
+        let mut buf = [0u8; 10];
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+
+        // Fill block 1: the first chunk lands in the cache, the second fails.
+        reader.inner.fail_at = Some(reader.inner.reads + 1);
+        reader.seek(SeekFrom::Start(4096 + 100)).unwrap();
+        assert!(reader.read(&mut buf).is_err());
+
+        // Block 0 must be read again, not served from the half-overwritten cache.
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, bytes[100..110]);
     }
 }
