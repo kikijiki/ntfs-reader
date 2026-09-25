@@ -13,20 +13,68 @@ use std::{
 
 use crate::{
     api::{NtfsFileName, ROOT_RECORD},
-    mft::Mft,
+    mft::{Mft, RECORD_NUMBER_MASK},
 };
 
-/// The longest path [`Mft::resolve_path`] returns, in UTF-16 units: the
-/// Win32 maximum, so nothing Win32 can open is refused and nothing longer is
-/// returned. A limit on the path itself, not on the number of levels, is what
-/// a cache hit can apply exactly as a full walk does: the cached path has a
-/// length.
+/// The longest path [`Mft::resolve_path`] returns, in UTF-16 units: the Win32
+/// maximum. The limit is on path length, not depth, so a cache hit enforces
+/// it the same way a full walk does.
 const MAX_PATH_UNITS: usize = 32767;
 
-/// What a [`PathCache`] knows about a file reference (a record number plus
-/// its sequence number, as returned by
-/// [`NtfsFile::reference`](crate::NtfsFile::reference) /
-/// [`NtfsFileName::parent_reference`]).
+/// The record of `$Extend`, a system record with a fixed number.
+const EXTEND_RECORD: u64 = 11;
+
+/// The name of `$Extend\$Deleted`, where NTFS moves a directory
+/// `remove_dir_all` is about to delete, or a file deleted while open, under a
+/// random name. Its record number is 29 on the volume this was measured on,
+/// but not fixed, so it is recognized by name under [`EXTEND_RECORD`] (ASCII
+/// case insensitive, as NTFS names are): no user can create one there.
+const DELETED_DIRECTORY: &str = "$Deleted";
+
+/// The component [`Mft::resolve_deleted_path`] puts where `$Extend\$Deleted`
+/// would be. An ordinary Win32 name cannot contain `<` or `>`, so no file has
+/// this name (a POSIX namespace name can, hence convention, not proof).
+const DELETED_MARKER: &str = "<deleted>";
+
+/// The component that stands for a path too long to address (see
+/// [`MAX_PATH_UNITS`]).
+const TOO_LONG_MARKER: &str = "<too long>";
+
+/// Counts the records a deleted walk visits, so tests can assert its work
+/// without timing it. [`walk_budget::run`] sets a budget; going over it
+/// panics, stopping a walk that would take minutes.
+#[cfg(test)]
+pub(crate) mod walk_budget {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+        static BUDGET: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    pub(crate) fn step() {
+        let steps = STEPS.get() + 1;
+        STEPS.set(steps);
+        assert!(
+            steps <= BUDGET.get(),
+            "the walk went over its budget of {} steps",
+            BUDGET.get()
+        );
+    }
+
+    /// Runs `f` under a budget of `budget` steps and returns its result and the steps it took.
+    pub(crate) fn run<R>(budget: u64, f: impl FnOnce() -> R) -> (R, u64) {
+        STEPS.set(0);
+        BUDGET.set(budget);
+        let result = f();
+        BUDGET.set(u64::MAX);
+        (result, STEPS.get())
+    }
+}
+
+/// What a [`PathCache`] knows about a file reference (record number plus
+/// sequence, as [`NtfsFile::reference`](crate::NtfsFile::reference) and
+/// [`NtfsFileName::parent_reference`] return it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedPath<'a> {
     /// Not looked up yet.
@@ -35,20 +83,17 @@ pub enum CachedPath<'a> {
     Resolved(&'a Path),
     /// An earlier [`Mft::resolve_path`] call could not resolve this
     /// reference (a missing, freed or stale record, a parent loop, or a path
-    /// too long). Don't walk the same failing chain again.
+    /// too long). Do not walk the same failing chain again.
     Failed,
 }
 
-/// Directory paths keyed by full file reference (record number plus
-/// sequence number, not just the bare record number), reused across
-/// [`Mft::resolve_path`] calls. [`DefaultPathCache`] is the implementation to
-/// use; `()` caches nothing. Keying by the full reference (rather than the
-/// record number alone) is what lets a stale reference and a valid one that
-/// happen to share a record number coexist in the same cache without either
-/// poisoning the other. An instance must not be reused across two different
-/// [`Mft`]s: a reference is only meaningful for the `Mft` it came from, so a
-/// cache warmed on one `Mft` would return stale or wrong entries for
-/// another.
+/// Directory paths keyed by full file reference (record number plus sequence
+/// number, not just the record number), reused across [`Mft::resolve_path`]
+/// calls. [`DefaultPathCache`] is the implementation to use; `()` caches
+/// nothing. Keying by the full reference lets a stale reference and a valid
+/// one sharing a record number coexist without either poisoning the other.
+/// Do not reuse an instance across two [`Mft`]s: a reference is only
+/// meaningful for the `Mft` it came from.
 pub trait PathCache {
     /// What is known about `reference`.
     fn get(&self, reference: u64) -> CachedPath<'_>;
@@ -71,9 +116,9 @@ impl PathCache for () {
 }
 
 /// The full path of every directory resolved so far, and every reference
-/// known not to resolve. Its size grows with the directories visited, not
-/// with the volume, so it suits a few lookups as well as a full scan. Must
-/// not be reused across two different [`Mft`]s (see [`PathCache`]).
+/// known not to resolve. Grows with directories visited, not the volume, so
+/// it suits a few lookups as well as a full scan. Do not reuse across two
+/// [`Mft`]s (see [`PathCache`]).
 #[derive(Default)]
 pub struct DefaultPathCache(HashMap<u64, Option<PathBuf>>);
 
@@ -120,11 +165,124 @@ impl PathCache for DefaultPathCache {
     }
 }
 
-const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// The result of [`Mft::resolve_deleted_path`]: a path, and whether it is
+/// the whole file's path.
+///
+/// An incomplete path ends, below the volume path, in a marker no ordinary
+/// Win32 name can be (`<`/`>` are illegal; a POSIX name can hold them, hence
+/// convention, not proof): `<lost 1234>` for record 1234 (missing, reused,
+/// an earlier incarnation, or a loop, named by its lowest record),
+/// `<deleted>` for `$Extend\$Deleted` (a directory `remove_dir_all` renamed
+/// before deleting it, or a file deleted while open: below keeps the random
+/// name NTFS gave it), and `<too long>` for a path Win32 could not address.
+/// What resolved below the marker is kept: `\\.\C:\<lost 1234>\dir\file.txt`.
+///
+/// NTFS keeps no rename history: a directory shows the name in its record,
+/// current if live, or as of its deletion. The path is where the file was
+/// when its directories were last renamed, not necessarily when deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeletedPath {
+    /// The path, starting with the volume path like [`Mft::resolve_path`]'s.
+    /// It names where the file was, not something openable: the file is
+    /// deleted, and an incomplete path has a marker component.
+    pub path: PathBuf,
+    /// Whether every directory on the way was identified. `false` means the
+    /// path has a marker component (see the type's docs).
+    pub complete: bool,
+}
 
-/// Detects that a walk along parent references came back to a reference it
-/// already visited (Brent's algorithm): exact, since only an equal reference
-/// is reported, and it needs no allocation.
+/// A marker component where the walk of a deleted path stopped: what could
+/// not be identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// A directory that is missing, unnamed, not a directory, reused, or on a
+    /// loop: the loop's lowest record, else the record number the walk
+    /// could not use.
+    Lost(u64),
+    /// `$Extend\$Deleted`.
+    Deleted,
+}
+
+impl Marker {
+    fn text(self) -> String {
+        match self {
+            Marker::Lost(record_number) => lost_marker(record_number),
+            Marker::Deleted => DELETED_MARKER.to_string(),
+        }
+    }
+}
+
+/// What a directory's path is built on: the volume, a marker, or another
+/// directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    Volume,
+    Marker(Marker),
+    /// A directory with a [`DeletedEntry::Dir`] in the cache, by reference.
+    Dir(u64),
+}
+
+/// What a [`DeletedPathCache`] knows about a directory, by reference. Kept as
+/// the link to its parent plus its own name, not a whole path, so the cache
+/// holds one name per directory however deep the tree is; a path is built
+/// only for the file that asks.
+#[derive(Debug)]
+enum DeletedEntry {
+    /// The directory's path is a marker: `$Extend\$Deleted`, or a loop member.
+    Marker(Marker),
+    /// The directory's path is its parent's plus its name.
+    Dir {
+        parent: Parent,
+        name: OsString,
+        /// Length in UTF-16 units of the whole path, at most [`MAX_PATH_UNITS`].
+        units: usize,
+        /// Whether every directory up to the volume was identified.
+        complete: bool,
+    },
+    /// This directory's path, or one above it, exceeds [`MAX_PATH_UNITS`].
+    TooLong,
+}
+
+/// What [`Mft::resolve_deleted_path`] found out about directories, keyed by
+/// full file reference like [`DefaultPathCache`]: its counterpart for the
+/// deleted walk. Share one across a scan of many deleted files and every
+/// directory is walked once, whatever the tree's shape, loops included.
+/// A separate type on purpose: a deleted walk goes through freed
+/// directories and ends at markers, and a live lookup must never see what
+/// it left behind, or vice versa. Do not reuse across two [`Mft`]s (see
+/// [`PathCache`]).
+#[derive(Default)]
+pub struct DeletedPathCache(HashMap<u64, DeletedEntry>);
+
+impl fmt::Debug for DeletedPathCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletedPathCache")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl DeletedPathCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of references cached, resolved or too long.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Detects that a walk along parent references revisits a reference
+/// (Brent's algorithm): exact, since only an equal reference is reported,
+/// and it needs no allocation.
 struct CycleDetector {
     checkpoint: Option<u64>,
     power: usize,
@@ -157,35 +315,37 @@ impl CycleDetector {
 }
 
 impl Mft {
-    /// Full path of `name`, starting with the path of the volume the `Mft`
-    /// was loaded from, for example `\\.\C:\Users\me\file.txt` for a `Mft` of
-    /// the volume `\\.\C:`. Every component is built from
-    /// [`NtfsFileName::to_os_string`], so a name that is not valid UTF-16
-    /// still gives a path that opens the file.
+    /// Full path of `name`, starting with the volume path the `Mft` was
+    /// loaded from, e.g. `\\.\C:\Users\me\file.txt` for `\\.\C:`. Built
+    /// from [`NtfsFileName::to_os_string`], so invalid UTF-16 still gives an
+    /// openable path.
     ///
-    /// The path follows each parent directory's
-    /// [`best_name`](crate::NtfsFile::best_name). Pass a
-    /// [`DefaultPathCache`] to reuse directory paths between calls (`()`
-    /// caches nothing).
+    /// Follows each parent's [`best_name`](crate::NtfsFile::best_name),
+    /// live directories only; use
+    /// [`resolve_deleted_path`](Self::resolve_deleted_path) for a deleted
+    /// file or a path through deleted directories.
     ///
-    /// Returns `None` if the chain of parents cannot be resolved: a parent is
-    /// missing, not in use, unnamed, stale (its record number was freed and
-    /// reused by another file, detected by comparing the full reference,
-    /// sequence number included), or the chain loops; or if the path would
-    /// be longer than Win32 can address: 32767 UTF-16 units, counting the
-    /// volume path and the separators (a name outside the Basic Multilingual
-    /// Plane takes 2 units per character). The result does not depend on the
-    /// cache: a warm cache gives the same answer as none.
+    /// Pass a [`DefaultPathCache`] to reuse directory paths between calls
+    /// (`()` caches nothing); a warm cache answers the same as none.
+    ///
+    /// Returns `None` if a parent is missing, not in use, unnamed, stale
+    /// (freed and reused, caught by comparing the full reference including
+    /// sequence number), or on a loop; or if the path would exceed 32767
+    /// UTF-16 units, the Win32 limit (volume path and separators counted; a
+    /// name outside the Basic Multilingual Plane costs 2 units per
+    /// character).
     pub fn resolve_path(&self, name: &NtfsFileName, cache: &mut impl PathCache) -> Option<PathBuf> {
         let mut components: Vec<(u64, OsString)> = Vec::new();
-        // UTF-16 units the walked component names take: less than the path they
-        // end up in (separators and the base path are not counted), so it only
-        // ever ends a walk that cannot succeed.
+        // UTF-16 units walked so far, components and separators, base path
+        // excluded: exceeding the limit here only ends a walk that could
+        // not succeed anyway. Count the separator even for an empty name.
         let mut walked = 0usize;
         let mut cycle = CycleDetector::new();
         let mut reference = name.parent_reference();
 
         let mut path = loop {
+            #[cfg(test)]
+            walk_budget::step();
             let record_number = reference & RECORD_NUMBER_MASK;
             if record_number == ROOT_RECORD {
                 let is_root = self
@@ -220,9 +380,8 @@ impl Mft {
                 return None;
             }
 
-            // The record itself must be live: `best_name` skips free records
-            // of the file's own, but a free extension record still leads to
-            // its base record's names.
+            // The record must be live: a freed record still holds its names,
+            // and `best_name` returns them to whoever asks.
             let directory = self
                 .record(record_number)
                 .filter(|record| {
@@ -237,26 +396,22 @@ impl Mft {
             };
 
             let component = directory.to_os_string();
-            walked += utf16_len(&component);
+            walked += utf16_len(&component) + 1;
             if walked > MAX_PATH_UNITS {
-                // Whatever is above this point, the path is too long. Nothing
-                // is cached: from where each of these directories stands the
-                // path may well be short enough.
+                // The path is too long. Nothing is cached: from where each of
+                // these directories stands, the path may well be short enough.
                 return None;
             }
             components.push((reference, component));
             reference = directory.parent_reference();
         };
 
-        // Top down. A directory whose own path is too long can never resolve,
-        // whoever asks, so (unlike a merely deep start) it is cached as failed,
-        // and so is everything below it.
+        // Top down. A too-long directory can never resolve, so it is cached
+        // as failed, and so is everything below it.
         //
-        // `path_units` is the running UTF-16 length of `path`, counted once
-        // here (the volume root, or a cached directory's path on a cache
-        // hit) and then updated by one component's worth per level, instead
-        // of recounting the whole path at every level: `join_within_limit`
-        // would make this loop quadratic in the chain's depth.
+        // `path_units` is `path`'s running UTF-16 length, counted once here
+        // then updated per level. Recounting with `join_within_limit` each
+        // time would make this loop quadratic in chain depth.
         let mut path_units = utf16_len(path.as_os_str());
         let mut resolvable = true;
         for (reference, component) in components.into_iter().rev() {
@@ -281,9 +436,9 @@ impl Mft {
         join_within_limit(&path, &name.to_os_string())
     }
 
-    /// Marks every reference visited on a failing chain (plus the reference
-    /// whose lookup actually failed) as unresolvable, so a later resolution
-    /// through any of them short-circuits instead of repeating the walk.
+    /// Marks every reference on a failing chain, plus the reference whose
+    /// lookup failed, as unresolvable, so a later resolution through any of
+    /// them short-circuits instead of repeating the walk.
     fn cache_chain_as_failed(
         cache: &mut impl PathCache,
         components: &[(u64, OsString)],
@@ -296,19 +451,285 @@ impl Mft {
     }
 }
 
-/// The length of `text` in UTF-16 units, which is how Win32 counts a path: a
-/// character outside the Basic Multilingual Plane is 2 units, an unpaired
-/// surrogate (a name NTFS accepts) is 1.
+impl Mft {
+    /// Full path of `name`, a name of a possibly deleted file, with whatever
+    /// cannot be identified marked in the path instead of ending the walk
+    /// (see [`DeletedPath`]). `name` is one of the file's
+    /// [`hard_links`](crate::NtfsFile::hard_links), like
+    /// [`resolve_path`](Self::resolve_path)'s.
+    ///
+    /// A parent reference is followed for a live directory, as in
+    /// [`resolve_path`](Self::resolve_path), or a freed one: not in use,
+    /// not allocated, sequence one above the reference's (see
+    /// [`Mft::record_by_id`]). The name is whatever the record still holds.
+    /// A record reused by another file (in use, higher sequence), any other
+    /// incarnation, a nonexistent or unnamed record ends the walk at
+    /// `<lost N>`; `$Extend\$Deleted` ends it at `<deleted>`.
+    ///
+    /// With all directories live, the result matches
+    /// [`resolve_path`](Self::resolve_path) and is complete, except for a
+    /// delete-pending file (still open, renamed into live
+    /// `$Extend\$Deleted`): `resolve_path` gives
+    /// `\\.\C:\$Extend\$Deleted\<random>`, this walk the incomplete
+    /// `\\.\C:\<deleted>\<random>`, since it always stops at `$Deleted`.
+    /// Deleting with `remove_file`/`remove_dir` one entry at a time keeps
+    /// a complete path regardless of how many directories are gone;
+    /// `remove_dir_all` ends at `<deleted>`, since it renames the
+    /// directories away first and the real names are gone for good.
+    ///
+    /// A parent must be a directory, live or freed, or the walk ends at
+    /// `<lost N>`. A loop collapses to one `<lost N>` (its lowest record)
+    /// regardless of entry point. A path over 32767 UTF-16 units, markers
+    /// included, becomes `<too long>` plus the name alone; neither case is
+    /// ever complete. A warm cache answers the same as none.
+    ///
+    /// Work is bounded by directories, not files: the walk climbs to the
+    /// volume, a marker, a loop, or a cached directory, remembering every
+    /// directory passed, loops and too-long ones included. Share one
+    /// [`DeletedPathCache`] across a scan of many files and each directory
+    /// is walked once regardless of tree shape; a fresh cache per call
+    /// re-walks the whole chain. Never shared with a [`PathCache`]: a live
+    /// lookup never sees what this walk left behind.
+    ///
+    /// A directory shows the name in its record, current if live or as of
+    /// deletion. NTFS keeps no rename history, so the path reflects where
+    /// the file was when its directories were last renamed, not necessarily
+    /// when deleted.
+    ///
+    /// ```no_run
+    /// # use ntfs_reader::{DeletedPathCache, Mft, Volume};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
+    /// let mut cache = DeletedPathCache::new();
+    /// for file in mft.deleted_files() {
+    ///     for name in file.hard_links() {
+    ///         let found = mft.resolve_deleted_path(&name, &mut cache);
+    ///         println!("{} (complete: {})", found.path.display(), found.complete);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn resolve_deleted_path(
+        &self,
+        name: &NtfsFileName,
+        cache: &mut DeletedPathCache,
+    ) -> DeletedPath {
+        let leaf = name.to_os_string();
+        // Directories walked so far, leaf's parent first, with no cache entry.
+        let mut pending: Vec<(u64, OsString)> = Vec::new();
+        let mut cycle = CycleDetector::new();
+        let mut reference = name.parent_reference();
+
+        // What the walk ended at: the volume, a marker, a cached directory to
+        // build on, or a directory already known to be too long.
+        let end = loop {
+            #[cfg(test)]
+            walk_budget::step();
+            let record_number = reference & RECORD_NUMBER_MASK;
+            if record_number == ROOT_RECORD {
+                let is_root = self
+                    .record(ROOT_RECORD)
+                    .is_some_and(|root| root.reference() == reference);
+                break Some(if is_root {
+                    Parent::Volume
+                } else {
+                    Parent::Marker(Marker::Lost(record_number))
+                });
+            }
+            match cache.0.get(&reference) {
+                Some(DeletedEntry::Marker(marker)) => break Some(Parent::Marker(*marker)),
+                Some(DeletedEntry::Dir { .. }) => break Some(Parent::Dir(reference)),
+                Some(DeletedEntry::TooLong) => break None,
+                None => {}
+            }
+            if cycle.revisits(reference) {
+                // Everything walked since the earlier visit to `reference` is
+                // one turn of a loop with no path of its own: one marker,
+                // named by its lowest record whatever member was entered at,
+                // with what leads into the loop kept below it. The walk may
+                // have entered before that first visit, so members are found
+                // by stepping back while it repeats itself. Every member is
+                // cached as the marker: a loop is always `<lost N>`,
+                // regardless of entry point or names.
+                let visit = pending
+                    .iter()
+                    .position(|(visited, _)| *visited == reference)
+                    .unwrap_or(pending.len());
+                let turn = pending.len() - visit;
+                let mut entry = visit;
+                while entry > 0 && pending[entry - 1].0 == pending[entry - 1 + turn].0 {
+                    entry -= 1;
+                }
+                let members = pending.split_off(entry);
+                let lowest = members
+                    .iter()
+                    .map(|(member, _)| member & RECORD_NUMBER_MASK)
+                    .min()
+                    .unwrap_or(record_number);
+                for (member, _) in members {
+                    cache
+                        .0
+                        .insert(member, DeletedEntry::Marker(Marker::Lost(lowest)));
+                }
+                break Some(Parent::Marker(Marker::Lost(lowest)));
+            }
+
+            // A parent is a directory the reference names: live, or freed with
+            // the sequence a delete leaves. A file's record is never one.
+            let directory = self
+                .record(record_number)
+                .filter(|record| {
+                    record.is_directory()
+                        && self.reference_liveness(reference, &record.record).is_some()
+                })
+                .and_then(|record| record.best_name());
+            let Some(directory) = directory else {
+                break Some(Parent::Marker(Marker::Lost(record_number)));
+            };
+
+            let component = directory.to_os_string();
+            if component.eq_ignore_ascii_case(DELETED_DIRECTORY)
+                && directory.parent_reference() & RECORD_NUMBER_MASK == EXTEND_RECORD
+            {
+                cache
+                    .0
+                    .insert(reference, DeletedEntry::Marker(Marker::Deleted));
+                break Some(Parent::Marker(Marker::Deleted));
+            }
+            pending.push((reference, component));
+            reference = directory.parent_reference();
+        };
+
+        let Some(mut parent) = end else {
+            // Everything below a too-long directory is too long.
+            for (reference, _) in pending {
+                cache.0.insert(reference, DeletedEntry::TooLong);
+            }
+            return self.too_long_path(&leaf);
+        };
+
+        // Top down: each directory's path length is its parent's plus its own
+        // name, so a level costs only its name. A directory whose path is
+        // too long is cached as such, and so is everything below it.
+        let (mut units, mut ends_with_separator_now, complete) = match parent {
+            Parent::Volume => {
+                let path = self.volume().path().as_os_str();
+                (utf16_len(path), ends_with_separator(path), true)
+            }
+            Parent::Marker(marker) => {
+                let path = self.marker_path(&marker.text());
+                (
+                    utf16_len(path.as_os_str()),
+                    ends_with_separator(path.as_os_str()),
+                    false,
+                )
+            }
+            Parent::Dir(reference) => match cache.0.get(&reference) {
+                Some(DeletedEntry::Dir {
+                    units,
+                    name,
+                    complete,
+                    ..
+                }) => (*units, ends_with_separator_after(name), *complete),
+                _ => unreachable!("a cached directory was just found"),
+            },
+        };
+        let mut resolvable = true;
+        for (reference, component) in pending.into_iter().rev() {
+            let next = units + usize::from(!ends_with_separator_now) + utf16_len(&component);
+            if resolvable && next <= MAX_PATH_UNITS {
+                (units, ends_with_separator_now) = (next, ends_with_separator_after(&component));
+                cache.0.insert(
+                    reference,
+                    DeletedEntry::Dir {
+                        parent,
+                        name: component,
+                        units,
+                        complete,
+                    },
+                );
+                parent = Parent::Dir(reference);
+            } else {
+                resolvable = false;
+                cache.0.insert(reference, DeletedEntry::TooLong);
+            }
+        }
+        let leaf_units = units + usize::from(!ends_with_separator_now) + utf16_len(&leaf);
+        if !resolvable || leaf_units > MAX_PATH_UNITS {
+            return self.too_long_path(&leaf);
+        }
+        DeletedPath {
+            path: self.assemble(parent, cache, &leaf),
+            complete,
+        }
+    }
+
+    /// The path of the directory `parent`, followed by `leaf`, built once.
+    fn assemble(&self, parent: Parent, cache: &DeletedPathCache, leaf: &OsStr) -> PathBuf {
+        let mut names = Vec::new();
+        let mut current = parent;
+        let base = loop {
+            match current {
+                Parent::Volume => break self.volume().path().to_path_buf(),
+                Parent::Marker(marker) => break self.marker_path(&marker.text()),
+                Parent::Dir(reference) => match cache.0.get(&reference) {
+                    Some(DeletedEntry::Dir { parent, name, .. }) => {
+                        names.push(name.as_os_str());
+                        current = *parent;
+                    }
+                    _ => unreachable!("a directory of a path is in the cache"),
+                },
+            }
+        };
+        let size = base.as_os_str().len()
+            + names.iter().map(|name| name.len() + 1).sum::<usize>()
+            + leaf.len()
+            + 1;
+        let mut path = OsString::with_capacity(size);
+        path.push(base.as_os_str());
+        for component in names.into_iter().rev().chain(std::iter::once(leaf)) {
+            if !ends_with_separator(&path) {
+                path.push(MAIN_SEPARATOR_STR);
+            }
+            path.push(component);
+        }
+        PathBuf::from(path)
+    }
+
+    /// The volume path plus one marker component.
+    fn marker_path(&self, marker: &str) -> PathBuf {
+        join_one(self.volume().path(), OsStr::new(marker))
+    }
+
+    /// What a path too long to address becomes: the marker and the name.
+    fn too_long_path(&self, leaf: &OsStr) -> DeletedPath {
+        DeletedPath {
+            path: join_one(&self.marker_path(TOO_LONG_MARKER), leaf),
+            complete: false,
+        }
+    }
+}
+
+/// The marker for the directory of record `record_number`, which the walk
+/// could not identify.
+fn lost_marker(record_number: u64) -> String {
+    format!("<lost {record_number}>")
+}
+
+/// Length of `text` in UTF-16 units, how Win32 counts a path: a character
+/// outside the Basic Multilingual Plane is 2 units, an unpaired surrogate (a
+/// name NTFS accepts) is 1.
 #[cfg(windows)]
 fn utf16_len(text: &OsStr) -> usize {
     use std::os::windows::ffi::OsStrExt;
     text.encode_wide().count()
 }
 
-/// Only reached off Windows, by the unit tests: there the `OsStr` holds the
-/// WTF-8 that `utf16_to_os_string` writes. Every character starts with one
-/// byte that is not a continuation byte (`10xxxxxx`), and a 4-byte one
-/// (`11110xxx`) is a surrogate pair.
+/// Only reached off Windows, by unit tests: there the `OsStr` holds the
+/// WTF-8 `utf16_to_os_string` writes. Every character starts with a byte
+/// that is not a continuation byte (`10xxxxxx`); a 4-byte start
+/// (`11110xxx`) means a surrogate pair.
 #[cfg(not(windows))]
 fn utf16_len(text: &OsStr) -> usize {
     text.as_encoded_bytes()
@@ -328,11 +749,11 @@ fn join_within_limit(base: &Path, component: &OsStr) -> Option<PathBuf> {
     (units <= MAX_PATH_UNITS).then(|| join_one(base, component))
 }
 
-/// [`join_within_limit`], but taking `base`'s already-known UTF-16 length
-/// (`base_units`) instead of recounting `base`, and returning the joined
-/// path's length along with the path itself. What the top-down loop in
-/// [`Mft::resolve_path`] uses, so joining one more level costs the size of
-/// that level's component, not the whole path built so far.
+/// [`join_within_limit`], but takes `base`'s already-known UTF-16 length
+/// (`base_units`) instead of recounting it, and returns the joined length
+/// along with the path. Used by the top-down loop in [`Mft::resolve_path`],
+/// so joining one more level costs that level's component, not the whole
+/// path built so far.
 fn join_component_within_limit(
     base: &Path,
     base_units: usize,
@@ -345,9 +766,9 @@ fn join_component_within_limit(
 
 /// `base` plus one more path component, in a single allocation sized to the
 /// exact result, unlike `PathBuf::push` on a freshly built buffer (no spare
-/// capacity), which forces a reallocation and a full copy of `base` on every
-/// push. `component` is `&OsStr` rather than `&str` so the lossless name of a
-/// file (`NtfsFileName::to_os_string`) can be passed straight through.
+/// capacity), which forces a reallocation and a full copy on every push.
+/// `component` is `&OsStr`, not `&str`, so a lossless file name
+/// (`NtfsFileName::to_os_string`) passes straight through.
 fn join_one(base: &Path, component: &OsStr) -> PathBuf {
     let base_os = base.as_os_str();
     let needs_separator = !ends_with_separator(base_os);
@@ -366,637 +787,25 @@ fn join_one(base: &Path, component: &OsStr) -> PathBuf {
     PathBuf::from(buf)
 }
 
-/// Whether `s` already ends with a path separator, the same check
+/// Whether `s` already ends with a path separator, the check
 /// `PathBuf::push`/`Path::join` use to decide whether to add one. Checking
 /// the raw encoded bytes (not chars) is enough: separators are ASCII, and in
 /// UTF-8 (or the WTF-8 `OsStr` uses on Windows) an ASCII byte never appears
-/// as part of a multi-byte sequence, so a trailing separator byte is
-/// unambiguous.
+/// inside a multi-byte sequence, so a trailing separator byte is unambiguous.
 fn ends_with_separator(s: &OsStr) -> bool {
     s.as_encoded_bytes()
         .last()
         .is_some_and(|&b| b < 0x80 && std::path::is_separator(b as char))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-
-    use super::*;
-    use crate::api::*;
-    use crate::file_info::FileInfo;
-    use crate::mft::test_records::*;
-
-    /// Wraps [`DefaultPathCache`] and counts `get` calls, to show whether a
-    /// failed chain gets cached.
-    struct CountingCache {
-        inner: DefaultPathCache,
-        gets: Cell<usize>,
-    }
-
-    impl PathCache for CountingCache {
-        fn get(&self, reference: u64) -> CachedPath<'_> {
-            self.gets.set(self.gets.get() + 1);
-            self.inner.get(reference)
-        }
-
-        fn insert(&mut self, reference: u64, path: PathBuf) {
-            self.inner.insert(reference, path);
-        }
-
-        fn insert_failed(&mut self, reference: u64) {
-            self.inner.insert_failed(reference);
-        }
-    }
-
-    fn first_name(mft: &Mft, number: u64) -> NtfsFileName {
-        mft.record(number)
-            .expect("record")
-            .names()
-            .next()
-            .expect("name")
-    }
-
-    /// A directory `number` named `name` under `parent`.
-    fn directory_under(number: u64, parent: u64, name: &str) -> Vec<u8> {
-        let mut record = new_record(number, 1, 0);
-        set_record_flags(&mut record, directory_flags());
-        let offset = add_file_name_ex(
-            &mut record,
-            ATTRIBUTES_OFFSET,
-            1,
-            parent,
-            NtfsFileNamespace::Win32,
-            name,
-            0,
-        );
-        finish_record(&mut record, offset);
-        record
-    }
-
-    fn file_under(number: u64, parent: u64, name: &str) -> Vec<u8> {
-        let mut record = new_record(number, 1, 0);
-        let offset = add_file_name_ex(
-            &mut record,
-            ATTRIBUTES_OFFSET,
-            1,
-            parent,
-            NtfsFileNamespace::Win32,
-            name,
-            0,
-        );
-        finish_record(&mut record, offset);
-        record
-    }
-
-    // Card 014. A parent cycle is found exactly (the same reference twice),
-    // not by running into a depth limit, and remembered: every directory the
-    // walk passed is cached as failed, so a second resolution under the same
-    // cycle costs one lookup.
-    #[test]
-    fn resolve_path_caches_a_failed_chain() {
-        let dir_a = FIRST_NORMAL_RECORD;
-        let dir_b = FIRST_NORMAL_RECORD + 1;
-        let leaf = FIRST_NORMAL_RECORD + 2;
-
-        let mft = mft_with(vec![
-            directory_under(dir_a, reference(1, dir_b), "a"),
-            directory_under(dir_b, reference(1, dir_a), "b"),
-            file_under(leaf, reference(1, dir_a), "leaf.txt"),
-        ]);
-        let name = first_name(&mft, leaf);
-
-        let mut cache = CountingCache {
-            inner: DefaultPathCache::new(),
-            gets: Cell::new(0),
-        };
-
-        assert_eq!(mft.resolve_path(&name, &mut cache), None);
-        let first_lookups = cache.gets.get();
-        assert!(
-            first_lookups < 10,
-            "a loop of two directories is found within a few lookups, not by walking a depth \
-             limit; got {first_lookups}",
-        );
-        for directory in [dir_a, dir_b] {
-            assert_eq!(
-                cache.inner.get(reference(1, directory)),
-                CachedPath::Failed,
-                "directory {directory} is on the loop and must be cached as failed",
-            );
-        }
-
-        cache.gets.set(0);
-        assert_eq!(mft.resolve_path(&name, &mut cache), None);
-        assert_eq!(cache.gets.get(), 1, "the cached failure is one lookup");
-    }
-
-    // A loop entered through a tail, and one much longer than any depth a
-    // limit would allow, are found and cached like a short one. The tail is
-    // on the failing chain too.
-    #[test]
-    fn resolve_path_finds_a_loop_of_any_length() {
-        for (tail, cycle) in [(2usize, 3usize), (0, 1500), (5, 1200)] {
-            let first = FIRST_NORMAL_RECORD;
-            let mut records = Vec::new();
-            // Records `first..first + tail` lead into the cycle, which
-            // occupies the next `cycle` records and closes on its first.
-            for index in 0..tail + cycle {
-                let number = first + index as u64;
-                let parent = if index + 1 == tail + cycle {
-                    first + tail as u64
-                } else {
-                    first + index as u64 + 1
-                };
-                records.push(directory_under(number, reference(1, parent), "d"));
-            }
-            let leaf = first + (tail + cycle) as u64;
-            records.push(file_under(leaf, reference(1, first), "leaf"));
-            let mft = mft_with(records);
-            let name = first_name(&mft, leaf);
-
-            let mut cache = DefaultPathCache::new();
-            assert_eq!(mft.resolve_path(&name, &mut ()), None, "{tail}+{cycle}");
-            assert_eq!(mft.resolve_path(&name, &mut cache), None, "{tail}+{cycle}");
-            for index in 0..tail + cycle {
-                assert_eq!(
-                    cache.get(reference(1, first + index as u64)),
-                    CachedPath::Failed,
-                    "{tail}+{cycle}: directory {index} leads into the loop",
-                );
-            }
-        }
-    }
-
-    /// Record FIRST_NORMAL_RECORD holds a real directory "dir" (sequence 1).
-    /// `stale` references it with sequence 9 (a leftover reference to
-    /// whatever occupied that record before "dir"); `valid` references it
-    /// with the real, current sequence 1.
-    fn stale_and_valid_siblings() -> (Mft, NtfsFileName, NtfsFileName) {
-        let mut dir = new_record(FIRST_NORMAL_RECORD, 1, 0);
-        set_record_flags(&mut dir, directory_flags());
-        let offset = add_file_name(&mut dir, ATTRIBUTES_OFFSET, "dir", 0);
-        finish_record(&mut dir, offset);
-
-        let mut stale_file = new_record(FIRST_NORMAL_RECORD + 1, 1, 0);
-        let offset = add_file_name_ex(
-            &mut stale_file,
-            ATTRIBUTES_OFFSET,
-            1,
-            reference(9, FIRST_NORMAL_RECORD),
-            NtfsFileNamespace::Win32,
-            "stale.txt",
-            0,
-        );
-        finish_record(&mut stale_file, offset);
-
-        let mut valid_file = new_record(FIRST_NORMAL_RECORD + 2, 1, 0);
-        let offset = add_file_name_ex(
-            &mut valid_file,
-            ATTRIBUTES_OFFSET,
-            1,
-            reference(1, FIRST_NORMAL_RECORD),
-            NtfsFileNamespace::Win32,
-            "valid.txt",
-            0,
-        );
-        finish_record(&mut valid_file, offset);
-
-        let mft = mft_with(vec![dir, stale_file, valid_file]);
-        let stale_name = first_name(&mft, FIRST_NORMAL_RECORD + 1);
-        let valid_name = first_name(&mft, FIRST_NORMAL_RECORD + 2);
-        (mft, stale_name, valid_name)
-    }
-
-    // Card 014 (found by review after the first fix). The cache must be
-    // keyed by the full reference (record + sequence), not the bare record
-    // number: a stale reference resolved first must not poison the cache for
-    // a later, valid sibling that references the same record number with the
-    // current sequence.
-    #[test]
-    fn resolve_path_does_not_cache_a_failure_across_a_valid_sibling() {
-        let (mft, stale_name, valid_name) = stale_and_valid_siblings();
-        let mut cache = DefaultPathCache::new();
-
-        assert_eq!(
-            mft.resolve_path(&stale_name, &mut cache),
-            None,
-            "the stale reference must not resolve",
-        );
-        assert_eq!(
-            mft.resolve_path(&valid_name, &mut cache),
-            Some(PathBuf::from(r"\\.\T:").join("dir").join("valid.txt")),
-            "a later, valid sibling must still resolve even though the same record number was \
-             cached as failed for the stale reference",
-        );
-    }
-
-    // Card 014 (found by review after the first fix): the reverse ordering.
-    // A valid reference resolved first must not let a later, stale reference
-    // to the same record number reuse its cached path.
-    #[test]
-    fn resolve_path_does_not_reuse_a_cached_path_for_a_stale_reference() {
-        let (mft, stale_name, valid_name) = stale_and_valid_siblings();
-        let mut cache = DefaultPathCache::new();
-
-        assert_eq!(
-            mft.resolve_path(&valid_name, &mut cache),
-            Some(PathBuf::from(r"\\.\T:").join("dir").join("valid.txt")),
-        );
-        assert_eq!(
-            mft.resolve_path(&stale_name, &mut cache),
-            None,
-            "a stale reference must not reuse the path cached for the valid reference",
-        );
-    }
-
-    // Card 014 (found by review after the first fix). The root special-case
-    // must also check the reference, not just the record number: a parent
-    // reference that masks to ROOT_RECORD but with the wrong sequence must
-    // not be treated as the root.
-    #[test]
-    fn resolve_path_rejects_stale_root_reference() {
-        let mut root = new_record(ROOT_RECORD, 3, 0);
-        set_record_flags(&mut root, directory_flags());
-        let offset = add_end_marker(&mut root, ATTRIBUTES_OFFSET);
-        finish_record(&mut root, offset);
-
-        let mut file = new_record(FIRST_NORMAL_RECORD, 1, 0);
-        let offset = add_file_name_ex(
-            &mut file,
-            ATTRIBUTES_OFFSET,
-            1,
-            reference(9, ROOT_RECORD),
-            NtfsFileNamespace::Win32,
-            "file.txt",
-            0,
-        );
-        finish_record(&mut file, offset);
-
-        let mft = mft_with_at(vec![(ROOT_RECORD, root), (FIRST_NORMAL_RECORD, file)]);
-        let name = first_name(&mft, FIRST_NORMAL_RECORD);
-
-        let mut cache = DefaultPathCache::new();
-        assert_eq!(mft.resolve_path(&name, &mut cache), None);
-    }
-
-    // Card 034. A Windows filename is a raw UTF-16 code unit sequence with
-    // no requirement that it be *valid* UTF-16 - NTFS accepts an unpaired
-    // surrogate (0xD800..=0xDFFF), which `str::encode_utf16` could never
-    // produce but a real file can have. `resolve_path` must build its
-    // result from the lossless conversion, not `Display`/`to_string`
-    // (which substitutes U+FFFD and would point at a path that doesn't
-    // exist).
-    #[test]
-    fn resolve_path_preserves_a_name_with_an_unpaired_surrogate() {
-        let mut file = new_record(FIRST_NORMAL_RECORD, 1, 0);
-        let raw_name: Vec<u16> = "bad"
-            .encode_utf16()
-            .chain([0xD800u16])
-            .chain("name".encode_utf16())
-            .collect();
-        let offset = add_file_name_raw(
-            &mut file,
-            ATTRIBUTES_OFFSET,
-            1,
-            reference(ROOT_SEQUENCE, ROOT_RECORD),
-            NtfsFileNamespace::Win32,
-            &raw_name,
-            0,
-        );
-        finish_record(&mut file, offset);
-
-        let mft = mft_with(vec![file]);
-        let name = first_name(&mft, FIRST_NORMAL_RECORD);
-
-        let mut cache = DefaultPathCache::new();
-        let resolved = mft.resolve_path(&name, &mut cache).expect("resolves");
-
-        // The volume path, a separator, then the name: checked unit for unit
-        // (the lone surrogate included), not by joining with the crate's own
-        // conversion of the name.
-        let separator = MAIN_SEPARATOR_STR;
-        let units: Vec<u16> = VOLUME_PATH
-            .encode_utf16()
-            .chain(separator.encode_utf16())
-            .chain(raw_name.iter().copied())
-            .collect();
-        let mut wtf8 = [VOLUME_PATH.as_bytes(), separator.as_bytes(), b"bad"].concat();
-        wtf8.extend([0xED, 0xA0, 0x80]);
-        wtf8.extend(b"name");
-        assert_os_str_is(resolved.as_os_str(), &units, &wtf8);
-    }
-
-    /// A chain of `depth` directories with the given name, each under the
-    /// previous one (the first under the root), then a file under the
-    /// deepest and one under the directory at `shallow_level`. Returns the mft
-    /// and the two names.
-    fn deep_chain(
-        depth: usize,
-        shallow_level: usize,
-        directory_name: &str,
-    ) -> (Mft, NtfsFileName, NtfsFileName) {
-        let mut records = Vec::new();
-        for level in 0..depth {
-            let number = FIRST_NORMAL_RECORD + level as u64;
-            let parent = if level == 0 {
-                reference(ROOT_SEQUENCE, ROOT_RECORD)
-            } else {
-                reference(1, number - 1)
-            };
-            records.push(directory_under(number, parent, directory_name));
-        }
-        for (index, level) in [depth - 1, shallow_level].into_iter().enumerate() {
-            let number = FIRST_NORMAL_RECORD + (depth + index) as u64;
-            let parent = reference(1, FIRST_NORMAL_RECORD + level as u64);
-            records.push(file_under(number, parent, "f"));
-        }
-        let mft = mft_with(records);
-        let deep = first_name(&mft, FIRST_NORMAL_RECORD + depth as u64);
-        let shallow = first_name(&mft, FIRST_NORMAL_RECORD + depth as u64 + 1);
-        (mft, deep, shallow)
-    }
-
-    /// What a full `FileInfo::with_cache` scan leaves in the cache: every
-    /// directory in record order, so parents come first.
-    fn scan(mft: &Mft) -> DefaultPathCache {
-        let mut cache = DefaultPathCache::new();
-        for file in mft.files() {
-            FileInfo::with_cache(&file, &mut cache);
-        }
-        cache
-    }
-
-    // A chain deeper than the old 1024-level limit is not special. It
-    // resolves, and resolves to the same path with no cache, with a cache
-    // filled by a scan (which visits parents first, so the walk itself is
-    // short), and with a cache holding some of the directories.
-    #[test]
-    fn resolve_path_gives_the_same_answer_for_a_deep_chain_cached_or_not() {
-        let (mft, deep, shallow) = deep_chain(1500, 1200, "d");
-
-        let plain = mft.resolve_path(&deep, &mut ());
-        let plain_shallow = mft.resolve_path(&shallow, &mut ());
-
-        let mut warm = scan(&mft);
-        // Not assert_eq!/expect on the paths: they are thousands of characters long.
-        assert!(
-            mft.resolve_path(&deep, &mut warm) == plain,
-            "a warm cache and no cache disagree"
-        );
-        assert!(
-            mft.resolve_path(&shallow, &mut warm) == plain_shallow,
-            "a warm cache and no cache disagree"
-        );
-
-        let path = plain
-            .as_ref()
-            .expect("a chain of 1500 directories resolves");
-        assert_eq!(
-            path.as_os_str().len(),
-            mft.volume().path().as_os_str().len() + 2 * 1501
-        );
-        assert!(plain_shallow.is_some(), "a name 1200 levels down resolves");
-
-        let mut cold = DefaultPathCache::new();
-        assert!(
-            mft.resolve_path(&shallow, &mut cold) == plain_shallow,
-            "cold cache"
-        );
-        assert!(
-            mft.resolve_path(&deep, &mut cold) == plain,
-            "partly warm cache"
-        );
-    }
-
-    /// UTF-16 units in `path`, counted the platform's own way instead of by the crate.
-    fn native_units(path: &Path) -> usize {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            path.as_os_str().encode_wide().count()
-        }
-        #[cfg(not(windows))]
-        {
-            utf16_len(path.as_os_str())
-        }
-    }
-
-    /// A name of exactly `units` UTF-16 units: `piece` repeated as often as it
-    /// fits whole, then `x` for the rest.
-    fn name_of(piece: &[u16], units: usize) -> Vec<u16> {
-        let mut name: Vec<u16> = piece
-            .iter()
-            .copied()
-            .cycle()
-            .take(units / piece.len() * piece.len())
-            .collect();
-        name.resize(units, u16::from(b'x'));
-        name
-    }
-
-    fn record_named(number: u64, parent: u64, name: &[u16], directory: bool) -> Vec<u8> {
-        let mut record = new_record(number, 1, 0);
-        if directory {
-            set_record_flags(&mut record, directory_flags());
-        }
-        let offset = add_file_name_raw(
-            &mut record,
-            ATTRIBUTES_OFFSET,
-            1,
-            parent,
-            NtfsFileNamespace::Win32,
-            name,
-            0,
-        );
-        finish_record(&mut record, offset);
-        record
-    }
-
-    /// A chain of directories with 254-unit names under the root, ending in a
-    /// directory `end` whose path is exactly `total` UTF-16 units (its own name
-    /// makes up the difference, built from `piece`). Under `end` is a file `f`,
-    /// which is always past the limit, and under the first directory a file `s`,
-    /// which is always well inside it. Returns the mft, the numbers of `end`,
-    /// `f` and `s`.
-    fn chain_ending_at(piece: &[u16], total: usize) -> (Mft, u64, u64, u64) {
-        const LEVEL: usize = 254;
-        // The volume path, then a separator and a name for each level.
-        let name_units = total - VOLUME_PATH.len() - 1;
-        let directories = (name_units - 1) / (LEVEL + 1);
-        let end_units = name_units - directories * (LEVEL + 1);
-        assert!((1..=LEVEL + 1).contains(&end_units) && end_units <= 255);
-
-        let root = reference(ROOT_SEQUENCE, ROOT_RECORD);
-        let mut records = Vec::new();
-        for level in 0..directories {
-            let number = FIRST_NORMAL_RECORD + level as u64;
-            let parent = if level == 0 {
-                root
-            } else {
-                reference(1, number - 1)
-            };
-            records.push(record_named(number, parent, &name_of(piece, LEVEL), true));
-        }
-        let end = FIRST_NORMAL_RECORD + directories as u64;
-        let last = if directories == 0 {
-            root
-        } else {
-            reference(1, end - 1)
-        };
-        records.push(record_named(end, last, &name_of(piece, end_units), true));
-        records.push(record_named(
-            end + 1,
-            reference(1, end),
-            &[u16::from(b'f')],
-            false,
-        ));
-        records.push(record_named(
-            end + 2,
-            reference(1, FIRST_NORMAL_RECORD),
-            &[u16::from(b's')],
-            false,
-        ));
-        (mft_with(records), end, end + 1, end + 2)
-    }
-
-    fn resolve_each(
-        mft: &Mft,
-        names: [&NtfsFileName; 3],
-        cache: &mut impl PathCache,
-    ) -> [Option<PathBuf>; 3] {
-        names.map(|name| mft.resolve_path(name, cache))
-    }
-
-    // Win32 addresses paths of up to 32767 UTF-16 units, and that is exactly
-    // the limit: a path of 32767 units resolves and one of 32768 does not,
-    // whatever the units are made of (a surrogate pair is 2 units, an
-    // unpaired surrogate 1, though it takes 3 bytes) and whatever the cache
-    // holds. Giving up on a path that is too long caches nothing that is wrong
-    // for the directories above it, and a directory whose own path is too long
-    // can never resolve.
-    #[test]
-    fn resolve_path_stops_at_exactly_32767_utf16_units() {
-        let rows: [(&str, &[u16]); 3] = [
-            ("ascii", &[b'x' as u16]),
-            ("surrogate pair", &[0xD83D, 0xDE00]),
-            ("unpaired surrogate", &[0xD800]),
-        ];
-        for (what, piece) in rows {
-            for (total, fits) in [(32767, true), (32768, false)] {
-                let row = format!("{what}, {total} units");
-                let (mft, end, file, shallow) = chain_ending_at(piece, total);
-                let end_name = first_name(&mft, end);
-                let file_name = first_name(&mft, file);
-                let shallow_name = first_name(&mft, shallow);
-
-                let expected = mft.resolve_path(&shallow_name, &mut ());
-                assert!(expected.is_some(), "{row}: the short path resolves");
-                let names = [&end_name, &file_name, &shallow_name];
-                let mut fresh = DefaultPathCache::new();
-                let mut warm = scan(&mft);
-                let runs = [
-                    ("no cache", resolve_each(&mft, names, &mut ())),
-                    ("fresh cache", resolve_each(&mft, names, &mut fresh)),
-                    ("warm cache", resolve_each(&mft, names, &mut warm)),
-                ];
-                for (cache_name, [resolved, under, short]) in runs {
-                    assert_eq!(resolved.is_some(), fits, "{row}, {cache_name}");
-                    if let Some(path) = resolved {
-                        assert_eq!(native_units(&path), total, "{row}, {cache_name}");
-                    }
-                    assert!(
-                        under.is_none(),
-                        "{row}, {cache_name}: a file under the directory is past the limit"
-                    );
-                    assert!(
-                        short == expected,
-                        "{row}, {cache_name}: giving up on the long path changed the short one"
-                    );
-                }
-
-                let end_reference = reference(1, end);
-                let directory = mft.resolve_path(&end_name, &mut ());
-                match (fits, warm.get(end_reference)) {
-                    (true, CachedPath::Resolved(path)) => {
-                        assert_eq!(Some(path), directory.as_deref(), "{row}")
-                    }
-                    (false, CachedPath::Failed) => {}
-                    (_, cached) => panic!("{row}: the directory is cached as {cached:?}"),
-                }
-            }
-        }
-    }
-
-    // A freed directory record still holds its name, sequence number and
-    // parent; a name under it must not resolve. Neither must one under a
-    // record whose bitmap bit is clear, nor under a free extension record of
-    // a live directory, which would otherwise lead to the directory's names,
-    // nor under one that does not exist at all (past the last record, card 016).
-    #[test]
-    fn resolve_path_rejects_a_parent_that_is_not_in_use() {
-        let root = reference(ROOT_SEQUENCE, ROOT_RECORD);
-        let first = FIRST_NORMAL_RECORD;
-        let (freed, unallocated, live, ext_freed, ext_unallocated) =
-            (first, first + 1, first + 2, first + 3, first + 4);
-        let missing = first + 50;
-
-        let mut freed_record = directory_under(freed, root, "freed");
-        set_record_flags(&mut freed_record, NtfsFileFlags::IsDirectory as u16);
-        // In use by its own flag, but its bitmap bit is clear.
-        let unallocated_record = directory_under(unallocated, root, "unallocated");
-        let live_record = directory_under(live, root, "live");
-        let extension = |number, flags| {
-            let mut record = new_record(number, 1, reference(1, live));
-            set_record_flags(&mut record, flags);
-            let offset = add_end_marker(&mut record, ATTRIBUTES_OFFSET);
-            finish_record(&mut record, offset);
-            record
-        };
-        let cases = [
-            (freed, "a freed directory"),
-            (unallocated, "an unallocated directory"),
-            (ext_freed, "a freed extension record"),
-            (ext_unallocated, "an unallocated extension record"),
-            (missing, "a record past the last one"),
-        ];
-        let mut records = vec![
-            freed_record,
-            unallocated_record,
-            live_record,
-            extension(ext_freed, 0),
-            extension(ext_unallocated, directory_flags()),
-        ];
-        for (index, (parent, _)) in cases.iter().enumerate() {
-            records.push(file_under(
-                first + 5 + index as u64,
-                reference(1, *parent),
-                "f",
-            ));
-        }
-        // A control: the same walk through a live directory does resolve.
-        let control = first + 5 + cases.len() as u64;
-        records.push(file_under(control, reference(1, live), "f"));
-
-        let (volume, data, mut bitmap) = raw_parts(records);
-        for number in [unallocated, ext_unallocated] {
-            bitmap[number as usize / 8] &= !(1 << (number % 8));
-        }
-        let mft = build_from_parts(volume, data, bitmap);
-
-        for (index, (_, why)) in cases.iter().enumerate() {
-            let name = first_name(&mft, first + 5 + index as u64);
-            assert_eq!(mft.resolve_path(&name, &mut ()), None, "{why}");
-            assert_eq!(
-                mft.resolve_path(&name, &mut DefaultPathCache::new()),
-                None,
-                "{why}, with a cache"
-            );
-        }
-        assert_eq!(
-            mft.resolve_path(&first_name(&mft, control), &mut ()),
-            Some(PathBuf::from(VOLUME_PATH).join("live").join("f")),
-            "the control resolves"
-        );
-    }
+/// Whether a path ends with a separator once `component` is joined to it. A
+/// separator goes before the component unless the path already ends with
+/// one, so an empty component (a corrupt name) leaves it ending with one,
+/// and any other component only when it ends with one itself.
+fn ends_with_separator_after(component: &OsStr) -> bool {
+    component.is_empty() || ends_with_separator(component)
 }
+
+#[cfg(test)]
+#[path = "tests/path/mod.rs"]
+mod tests;

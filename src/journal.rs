@@ -30,8 +30,8 @@ use crate::{
     volume::Volume,
 };
 
-/// The Win32 error code inside a `windows` error: the low 16 bits of an `HRESULT_FROM_WIN32`
-/// value, or the whole `HRESULT` for any other kind.
+/// The Win32 error code inside a `windows` error: the low 16 bits of an
+/// `HRESULT_FROM_WIN32` value, or the whole `HRESULT` otherwise.
 fn win32_code(err: &windows::core::Error) -> u32 {
     let hresult = err.code().0 as u32;
     if hresult & 0xFFFF_0000 == 0x8007_0000 {
@@ -41,9 +41,9 @@ fn win32_code(err: &windows::core::Error) -> u32 {
     }
 }
 
-/// Map a failed Win32 call to this crate's error: the journal-specific cases get their own
-/// variant, access denied becomes `AccessDenied`, anything else is an `Io` error carrying the OS
-/// error code.
+/// Maps a failed Win32 call to this crate's error: journal-specific cases
+/// get their own variant, access denied becomes `AccessDenied`, anything
+/// else is an `Io` error carrying the OS error code.
 fn map_windows_error(err: windows::core::Error) -> NtfsReaderError {
     let code = win32_code(&err);
     if code == ERROR_JOURNAL_NOT_ACTIVE.0 {
@@ -57,9 +57,9 @@ fn map_windows_error(err: windows::core::Error) -> NtfsReaderError {
     }
 }
 
-/// Decode a `FILE_NAME_INFO` buffer (as filled in by `GetFileInformationByHandleEx(...,
-/// FileNameInfo, ...)`) into a `PathBuf`, or `None` if it is malformed. Bounds-checks the declared
-/// `FileNameLength` against the buffer before slicing the name out of it.
+/// Decodes a `FILE_NAME_INFO` buffer (as `GetFileInformationByHandleEx(...,
+/// FileNameInfo, ...)` fills it) into a `PathBuf`, or `None` if malformed.
+/// Bounds-checks the declared `FileNameLength` before slicing the name out.
 fn parse_file_name_info(buffer: &[u8]) -> Option<PathBuf> {
     let (length, rest) = buffer.split_first_chunk::<4>()?;
     let file_name_length = u32::from_le_bytes(*length) as usize;
@@ -80,21 +80,22 @@ thread_local! {
     static PATH_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times the calling thread has looked a path up through a file handle (the two
-/// `OpenFileById` attempts of a [`Journal::resolve_path`] call). A test reads it before and after
-/// a `read` to check that reading opens no handles.
+/// How many times the calling thread has looked a path up through a file
+/// handle (the two `OpenFileById` attempts in [`Journal::resolve_path`]). A
+/// test reads it around a `read` to check that reading opens no handles.
 #[cfg(feature = "internals")]
 pub fn path_lookups_on_this_thread() -> u64 {
     PATH_LOOKUPS.with(|count| count.get())
 }
 
-/// The volume-relative path of the file `file_id` names (for example `\dir\file.txt`), or `None`
-/// if it cannot be opened: it no longer exists, or the id is not one this volume understands.
+/// The volume-relative path of the file `file_id` names (e.g. `\dir\file.txt`),
+/// or `None` if it cannot be opened: it no longer exists, or the id is not one
+/// this volume understands.
 fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<PathBuf> {
     #[cfg(feature = "internals")]
     PATH_LOOKUPS.with(|count| count.set(count.get() + 1));
 
-    // NTFS ids fit in 64 bits (the file reference); anything wider is opened as an extended id.
+    // NTFS ids fit in 64 bits (the file reference); wider ones open as extended ids.
     let (id, id_type) = match file_id.as_reference() {
         Some(reference) => (
             FileSystem::FILE_ID_DESCRIPTOR_0 {
@@ -118,9 +119,9 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
         Anonymous: id,
     };
 
-    // SAFETY: `file_id_desc` is a fully initialised descriptor that outlives the call, and
-    // `volume_handle` is the open volume handle of the `Journal` calling this. The handle the call
-    // returns is closed below, on every path that reaches it.
+    // SAFETY: `file_id_desc` is fully initialized and outlives the call;
+    // `volume_handle` is the calling `Journal`'s open handle. The returned
+    // handle is closed below on every path that reaches it.
     unsafe {
         let file_handle = FileSystem::OpenFileById(
             volume_handle,
@@ -130,8 +131,9 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
                 | FileSystem::FILE_SHARE_WRITE
                 | FileSystem::FILE_SHARE_DELETE,
             None,
-            // The reparse point itself, not what it points to: a journal record names the
-            // link, and following it would resolve to the target's path.
+            // The reparse point itself, not its target: a journal record
+            // names the link, and following it would resolve the target's
+            // path instead.
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
         .unwrap_or(Foundation::INVALID_HANDLE_VALUE);
@@ -140,16 +142,16 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
             return None;
         }
 
-        // A `Vec<u32>` so the buffer is aligned for `FILE_NAME_INFO`, whose first field is a
-        // `u32`. It is viewed as bytes for parsing.
+        // A `Vec<u32>` so the buffer is aligned for `FILE_NAME_INFO`, whose
+        // first field is a `u32`. Viewed as bytes for parsing.
         let mut info_words = (size_of::<FileSystem::FILE_NAME_INFO>()
             + (Foundation::MAX_PATH as usize) * size_of::<u16>())
         .div_ceil(size_of::<u32>());
         let mut info_buffer = vec![0u32; info_words];
 
-        // GetFileInformationByHandleEx reports the exact size needed on ERROR_MORE_DATA, so this
-        // should never take more than one retry in practice; the cap is defense in depth against
-        // a driver that somehow keeps reporting a size that still doesn't fit.
+        // GetFileInformationByHandleEx reports the exact size needed on
+        // ERROR_MORE_DATA, so one retry should suffice; the cap defends
+        // against a driver that keeps reporting a size that still does not fit.
         const MAX_RETRIES: u32 = 8;
         let mut retries = 0u32;
 
@@ -171,7 +173,7 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
                 Err(err) => {
                     if err.code() == ERROR_MORE_DATA.to_hresult() && retries < MAX_RETRIES {
                         retries += 1;
-                        // The buffer was too small: the driver stored the length it needs.
+                        // The buffer was too small: the driver stored the needed length.
                         let required = info_buffer[0] as usize;
                         info_words = (size_of::<FileSystem::FILE_NAME_INFO>() + required)
                             .div_ceil(size_of::<u32>());
@@ -188,8 +190,9 @@ fn get_file_path(volume_handle: Foundation::HANDLE, file_id: FileId) -> Option<P
     }
 }
 
-/// The full path of a record's file: from its parent directory's path when the parent still
-/// exists, otherwise from the file's own id, otherwise `None`.
+/// The full path of a record's file: from its parent directory's path when
+/// the parent still exists, otherwise from the file's own id, otherwise
+/// `None`.
 fn get_usn_record_path(
     volume_path: &Path,
     volume_handle: Foundation::HANDLE,
@@ -197,15 +200,13 @@ fn get_usn_record_path(
     file_id: FileId,
     parent_id: FileId,
 ) -> Option<PathBuf> {
-    // First try to get the full path from the parent.
-    // We do this because if the file was moved, computing the path from the file id
-    // could return the wrong path.
+    // Prefer the parent's path: computing it from the file id instead could
+    // return a stale path if the file was moved.
     if let Some(parent_path) = get_file_path(volume_handle, parent_id) {
         return Some(volume_path.join(parent_path.join(file_name)));
     }
 
-    // If we can't get the parent path, try to get the path from the file id.
-    // This can happen if the parent was deleted.
+    // The parent may be deleted; fall back to the file's own id.
     if let Some(path) = get_file_path(volume_handle, file_id) {
         return Some(volume_path.join(path));
     }
@@ -214,18 +215,19 @@ fn get_usn_record_path(
     None
 }
 
-/// A response that carries nothing past the leading USN value (`bytes_returned <=
-/// size_of::<i64>()`) means the driver scanned all the way to the journal's current end within
-/// this call and found nothing more; the caller is caught up, even though a non-empty response
-/// can still contain zero *matching* records (reason_mask filtered them, but the driver had to
-/// scan past them to get there).
+/// Nothing past the leading USN value (`bytes_returned <= size_of::<i64>()`)
+/// means the driver scanned to the journal's current end and found nothing
+/// more: the caller is caught up. A non-empty response can still hold zero
+/// *matching* records: `reason_mask` filtered them out after the driver had
+/// already scanned past them.
 fn is_caught_up(bytes_returned: u32) -> bool {
     bytes_returned as usize <= size_of::<i64>()
 }
 
-/// Add `record` to the rename history if it is a `RENAME_OLD_NAME` record, the only kind
-/// [`Journal::match_rename`] looks at. `max_history_size` follows `Journal.max_history_size`:
-/// `None` is unlimited, `Some(0)` keeps nothing, `Some(n)` keeps the `n` most recent entries.
+/// Adds `record` to the rename history if it is a `RENAME_OLD_NAME` record,
+/// the only kind [`Journal::match_rename`] looks at. `max_history_size`
+/// mirrors `Journal.max_history_size`: `None` unlimited, `Some(0)` keeps
+/// nothing, `Some(n)` keeps the `n` most recent.
 fn push_history(
     history: &mut VecDeque<UsnRecord>,
     max_history_size: Option<usize>,
@@ -247,9 +249,10 @@ fn push_history(
     }
 }
 
-/// A journal position: the journal id it was read from plus a USN within it. Used to validate
-/// that a saved `NextUsn::Custom` position still refers to the same journal generation (a journal
-/// can be deleted and recreated, which resets its id and its USN numbering).
+/// A journal position: the journal id it was read from plus a USN within it.
+/// Validates that a saved `NextUsn::Custom` still refers to the same
+/// journal generation (deleting and recreating a journal resets its id and
+/// USN numbering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalPosition {
     /// The id of the journal the position was taken from.
@@ -265,8 +268,8 @@ pub enum NextUsn {
     First,
     /// The journal's current end: only changes made from now on.
     Next,
-    /// A saved position. [`Journal::new`] fails with `JournalIdMismatch` if the journal was
-    /// recreated since.
+    /// A saved position. [`Journal::new`] fails with `JournalIdMismatch` if
+    /// the journal was recreated since.
     Custom(JournalPosition),
 }
 
@@ -283,9 +286,9 @@ pub enum HistorySize {
 /// How a [`Journal`] is opened.
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
-    /// Which reasons to read; records with none of them are skipped by the driver. Include
-    /// [`Reason::RENAME_OLD_NAME`] if you call [`Journal::match_rename`], which needs the
-    /// old-name records in its history. Defaults to [`Reason::ALL`].
+    /// Which reasons to read; records matching none are skipped by the
+    /// driver. Include [`Reason::RENAME_OLD_NAME`] to use
+    /// [`Journal::match_rename`]. Defaults to [`Reason::ALL`].
     pub reason_mask: Reason,
     /// Where to start. Defaults to [`NextUsn::Next`].
     pub next_usn: NextUsn,
@@ -309,10 +312,10 @@ impl Default for JournalOptions {
 pub struct UsnReadResult {
     /// The records this call returned, oldest first.
     pub records: Vec<UsnRecord>,
-    /// `true` when this read reached the journal's current end: there is nothing more to read
-    /// right now, even though `records` can still be empty on a call that did have more to scan
-    /// (for example everything in this window was filtered out by `reason_mask`). Use it, not
-    /// "empty result", to decide when to stop reading.
+    /// `true` when this read reached the journal's current end: nothing more
+    /// to read right now, even though `records` can be empty on a call that
+    /// still had more to scan (`reason_mask` filtered it all out). Use this,
+    /// not "empty result", to decide when to stop.
     pub caught_up: bool,
 }
 
@@ -340,25 +343,26 @@ impl fmt::Debug for Journal {
 }
 
 impl Journal {
-    /// The smallest buffer [`Journal::read_sized`] accepts: room for the leading USN (8 bytes)
-    /// and the largest record a file name can produce (about 600 bytes), rounded up. A smaller
-    /// buffer could hold a record the driver then cannot return, and the read would stall.
+    /// The smallest buffer [`Journal::read_sized`] accepts: room for the
+    /// leading USN (8 bytes) plus the largest record a file name can
+    /// produce (about 600 bytes), rounded up. A smaller buffer could stall
+    /// the read on a record the driver then cannot return.
     pub const MIN_READ_BUFFER_SIZE: usize = 1024;
 
-    /// Open the journal of `volume`.
+    /// Opens the journal of `volume`.
     ///
-    /// Fails with `AccessDenied` without the privileges to open the raw volume,
-    /// `JournalNotActive` if the volume has no journal, and `JournalIdMismatch` if
-    /// `options.next_usn` is a saved position from an older journal.
+    /// Fails with `AccessDenied` without privileges to open the raw volume,
+    /// `JournalNotActive` if the volume has no journal, and
+    /// `JournalIdMismatch` if `options.next_usn` is from an older journal.
     pub fn new(volume: Volume, options: JournalOptions) -> NtfsReaderResult<Journal> {
-        // Wide, not ANSI: encode_wide() round-trips any OsString Windows can produce (including
-        // ill-formed UTF-16) with no panic risk. `Volume::new` rejected a path with an embedded
-        // NUL, which would end the string early, so this is the whole path.
+        // Wide, not ANSI: encode_wide() round-trips any OsString Windows can
+        // produce, ill-formed UTF-16 included. `Volume::new` already
+        // rejected an embedded NUL, so this is the whole path.
         let mut wide_path: Vec<u16> = volume.path().as_os_str().encode_wide().collect();
         wide_path.push(0);
 
-        // Owned from the moment CreateFileW succeeds, so every `?` below closes it automatically
-        // instead of leaking it.
+        // Owned from the moment CreateFileW succeeds, so every `?` below
+        // closes it instead of leaking it.
         let volume_handle: windows::core::Owned<Foundation::HANDLE> = unsafe {
             windows::core::Owned::new(
                 FileSystem::CreateFileW(
@@ -369,9 +373,8 @@ impl Journal {
                         | FileSystem::FILE_SHARE_DELETE,
                     None,
                     FileSystem::OPEN_EXISTING,
-                    // Timeout = 0 / BytesToWaitFor = 0 on every read below means the FSCTL never
-                    // actually waits, so overlapped I/O buys nothing here - open the handle for
-                    // plain synchronous I/O instead.
+                    // Timeout = BytesToWaitFor = 0 on every read below means
+                    // the FSCTL never waits, so open for synchronous I/O.
                     FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
                     None,
                 )
@@ -381,8 +384,8 @@ impl Journal {
 
         let mut journal = Ioctl::USN_JOURNAL_DATA_V2::default();
 
-        // SAFETY: `volume_handle` is open, and the output buffer is a `USN_JOURNAL_DATA_V2` of
-        // exactly the size passed.
+        // SAFETY: `volume_handle` is open, and the output buffer is a
+        // `USN_JOURNAL_DATA_V2` of exactly the size passed.
         unsafe {
             let mut ioctl_bytes_returned = 0;
             IO::DeviceIoControl(
@@ -425,15 +428,17 @@ impl Journal {
         })
     }
 
-    /// Read one page of records (a 4096-byte buffer's worth) from the current position and move
-    /// the position past them. Call it in a loop until `caught_up`.
+    /// Reads one page of records (a 4096-byte buffer's worth) from the
+    /// current position and moves past them. Call it in a loop until
+    /// `caught_up`.
     pub fn read(&mut self) -> NtfsReaderResult<UsnReadResult> {
         self.read_sized(4096)
     }
 
-    /// Like [`Journal::read`] with a buffer of `buffer_size` bytes. A bigger buffer returns more
-    /// records per call. A `buffer_size` under [`Journal::MIN_READ_BUFFER_SIZE`] returns
-    /// `ReadBufferTooSmall` without reading.
+    /// Like [`Journal::read`] with a buffer of `buffer_size` bytes: bigger
+    /// returns more records per call. Under
+    /// [`Journal::MIN_READ_BUFFER_SIZE`] returns `ReadBufferTooSmall`
+    /// without reading.
     pub fn read_sized(&mut self, buffer_size: usize) -> NtfsReaderResult<UsnReadResult> {
         if buffer_size < Self::MIN_READ_BUFFER_SIZE {
             return Err(NtfsReaderError::ReadBufferTooSmall {
@@ -458,11 +463,11 @@ impl Journal {
         let mut buffer = vec![0u8; buffer_size];
         let mut bytes_returned = 0u32;
 
-        // SAFETY: `read` is a `READ_USN_JOURNAL_DATA_V1` of the size passed, `buffer` is
-        // `buffer_size` bytes long, and the handle is open.
+        // SAFETY: `read` is a `READ_USN_JOURNAL_DATA_V1` of the size passed,
+        // `buffer` is `buffer_size` bytes long, and the handle is open.
         unsafe {
-            // The handle is opened for synchronous I/O (see the comment in `new`), so this
-            // blocks until the FSCTL completes and never returns ERROR_IO_PENDING.
+            // Opened for synchronous I/O (see `new`), so this blocks until
+            // the FSCTL completes and never returns ERROR_IO_PENDING.
             IO::DeviceIoControl(
                 *self.volume_handle,
                 Ioctl::FSCTL_READ_USN_JOURNAL,
@@ -476,9 +481,9 @@ impl Journal {
             .map_err(map_windows_error)?;
         }
 
-        // Defense in depth: DeviceIoControl should never report more bytes written than the
-        // buffer it was given, but the parser trusts the slice it is handed as the extent of
-        // valid data, so never hand it more than the buffer holds.
+        // DeviceIoControl should never report more bytes than the buffer it
+        // was given, but the parser trusts the slice length, so clamp
+        // defensively.
         let bytes_returned = bytes_returned.min(buffer.len() as u32);
 
         let caught_up = is_caught_up(bytes_returned);
@@ -496,20 +501,22 @@ impl Journal {
         Ok(UsnReadResult { records, caught_up })
     }
 
-    /// Resolve a record's full path, or `None` if it cannot be resolved (for example the file and
-    /// its parent directory are both gone). A `Some` path is absolute: it starts with the volume
-    /// path the `Volume` was opened with, so it is never relative to the current directory.
+    /// Resolves a record's full path, or `None` if it cannot be resolved
+    /// (e.g. the file and its parent directory are both gone). A `Some`
+    /// path is absolute, starting from the volume path the `Volume` was
+    /// opened with, never relative to the current directory.
     ///
-    /// Separate from `read`/`read_sized`: it costs one or two `OpenFileById` handle opens, so a
-    /// caller reading a large journal and only occasionally needing a path is not charged for it
-    /// on every record.
+    /// Separate from `read`/`read_sized` since it costs one or two
+    /// `OpenFileById` handle opens: a caller only occasionally needing a
+    /// path is not charged for it on every record.
     ///
-    /// The path is the record's parent directory as it is *now* (looked up by the parent's id)
-    /// joined with the name the record carries, so a moved parent gives its new location. For a
-    /// `RENAME_OLD_NAME` record that name is the old one, which no longer exists under that
-    /// directory: the result is where the file used to be, not where it is. If the parent is
-    /// gone, the file's own id is looked up instead, which gives the file's current path (and
-    /// name) if it still exists.
+    /// The path is the record's parent directory as it is *now* (looked up
+    /// by the parent's id) joined with the name the record carries, so a
+    /// moved parent gives its new location. For a `RENAME_OLD_NAME` record
+    /// that name is the old one, no longer existing under that directory:
+    /// the result is where the file used to be, not where it is. If the
+    /// parent is gone, the file's own id is looked up instead, giving its
+    /// current path and name if it still exists.
     pub fn resolve_path(&self, record: &UsnRecord) -> Option<PathBuf> {
         get_usn_record_path(
             self.volume.path(),
@@ -520,21 +527,22 @@ impl Journal {
         )
     }
 
-    /// The old name of the rename that produced `record`'s `RENAME_NEW_NAME`, if one is in
-    /// history. Returns `None` if `record` is not itself a `RENAME_NEW_NAME` record, or if no
-    /// matching `RENAME_OLD_NAME` history entry is found (for example it aged out of a bounded
-    /// history).
+    /// The old name of the rename that produced `record`'s `RENAME_NEW_NAME`,
+    /// if one is in history. `None` if `record` is not itself a
+    /// `RENAME_NEW_NAME` record, or no matching `RENAME_OLD_NAME` entry is
+    /// found (e.g. it aged out of a bounded history).
     ///
-    /// The history holds only `RENAME_OLD_NAME` records, so the journal must have been opened
-    /// with [`Reason::RENAME_OLD_NAME`] in `reason_mask` (and `RENAME_NEW_NAME` for the records
-    /// to pass in), or nothing is ever found.
+    /// The history holds only `RENAME_OLD_NAME` records, so the journal must
+    /// be opened with [`Reason::RENAME_OLD_NAME`] in `reason_mask` (and
+    /// `RENAME_NEW_NAME` for the records passed in), or nothing is found.
     pub fn match_rename(&self, record: &UsnRecord) -> Option<OsString> {
         if !record.reason.contains(Reason::RENAME_NEW_NAME) {
             return None;
         }
 
-        // Search from the most recent entry backward: the first (oldest) match by file_id alone
-        // is not necessarily the immediately preceding rename for a file renamed more than once.
+        // Search backward from the most recent entry: the first match by
+        // file_id alone need not be the immediately preceding rename for a
+        // file renamed more than once.
         self.history
             .iter()
             .rev()
@@ -542,8 +550,8 @@ impl Journal {
             .map(|r| r.name.clone())
     }
 
-    /// Forget rename history. `Some(usn)` keeps the entries at `usn` or later and drops the older
-    /// ones; `None` clears all of it.
+    /// Forgets rename history. `Some(usn)` keeps entries at `usn` or later
+    /// and drops the rest; `None` clears everything.
     pub fn trim_history(&mut self, min_usn: Option<i64>) {
         match min_usn {
             Some(usn) => self.history.retain(|r| r.usn >= usn),
@@ -551,8 +559,9 @@ impl Journal {
         }
     }
 
-    /// The id of the journal this `Journal` was opened against. A journal deletion and
-    /// recreation changes this; a saved `JournalPosition` from a previous id is stale.
+    /// The id of the journal this `Journal` was opened against. Deleting and
+    /// recreating it changes this; a saved `JournalPosition` from a
+    /// previous id is stale.
     pub fn journal_id(&self) -> u64 {
         self.journal.UsnJournalID
     }
@@ -567,8 +576,9 @@ impl Journal {
         self.next_usn
     }
 
-    /// `(journal_id(), next_usn())`, saveable and later passed back as `NextUsn::Custom` to
-    /// resume from here (rejected with `JournalIdMismatch` if the journal was recreated meanwhile).
+    /// `(journal_id(), next_usn())`, saveable and passed back later as
+    /// `NextUsn::Custom` to resume (rejected with `JournalIdMismatch` if
+    /// the journal was recreated meanwhile).
     pub fn position(&self) -> JournalPosition {
         JournalPosition {
             journal_id: self.journal_id(),
@@ -577,340 +587,19 @@ impl Journal {
     }
 }
 
-// SAFETY: the only field that is not `Send` on its own is `volume_handle`'s raw `HANDLE`. A
-// Windows handle can be used from a different thread than the one that created it, as long as it
-// is not used from two threads at once. `Journal` is `Send` but not `Sync` (the raw handle keeps
-// it from being `Sync`), so a `&Journal` cannot be shared across threads either: at most one
-// thread uses a `Journal` at a time, whether through `&mut self` (`read`, `read_sized`,
-// `trim_history`) or `&self` (`resolve_path`, which opens files by id through the handle, and
-// the plain accessors). Moving a `Journal` to another thread and using it only there is sound.
+// SAFETY: the only field not `Send` on its own is `volume_handle`'s raw
+// `HANDLE`. A Windows handle can be used from a different thread than the
+// one that created it, as long as it is never used from two threads at
+// once. `Journal` is `Send` but not `Sync` (the raw handle keeps it from
+// being `Sync`), so a `&Journal` cannot be shared across threads either: at
+// most one thread uses a `Journal` at a time, through `&mut self` (`read`,
+// `read_sized`, `trim_history`) or `&self` (`resolve_path`, which opens
+// files by id through the handle, and the plain accessors). Moving a
+// `Journal` to another thread and using it only there is sound.
 unsafe impl Send for Journal {}
 
 // No manual Drop impl: `volume_handle` is `windows::core::Owned<HANDLE>`, which closes itself.
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
-
-    /// A `Volume` good enough for tests that only look at `Journal::new`'s
-    /// path handling or at pure `Journal` methods that never touch the
-    /// volume handle.
-    fn fake_volume() -> Volume {
-        Volume::synthetic(PathBuf::from("\\\\?\\T:"), 4096, 0, 1024, 0)
-    }
-
-    /// Build a `Journal` for testing pure, in-memory methods (`match_rename`) without opening a
-    /// real volume or journal. The null placeholder handle is safe to drop for real: `Owned`
-    /// only calls `CloseHandle` when the handle is not invalid, and a null `HANDLE` is invalid.
-    fn fake_journal(history: VecDeque<UsnRecord>) -> Journal {
-        Journal {
-            volume: fake_volume(),
-            volume_handle: unsafe {
-                windows::core::Owned::new(Foundation::HANDLE(std::ptr::null_mut()))
-            },
-            journal: Ioctl::USN_JOURNAL_DATA_V2::default(),
-            next_usn: 0,
-            reason_mask: Reason::EMPTY,
-            history,
-            max_history_size: None,
-        }
-    }
-
-    fn usn_record(usn: i64, file_id: FileId, reason: Reason, name: &str) -> UsnRecord {
-        UsnRecord {
-            usn,
-            timestamp: time::OffsetDateTime::UNIX_EPOCH,
-            file_id,
-            parent_id: FileId::from(0u64),
-            reason,
-            file_attributes: 0,
-            name: name.into(),
-        }
-    }
-
-    // --- match_rename returns the most recent old name, not the oldest ---
-
-    #[test]
-    fn match_rename_returns_the_most_recent_old_name_not_the_oldest() {
-        let file_id = FileId::from(42u64);
-        let mut history = VecDeque::new();
-        // A -> B -> C: both renames' old names are in history by the time we
-        // see C's RENAME_NEW_NAME record.
-        history.push_back(usn_record(1, file_id, Reason::RENAME_OLD_NAME, "A"));
-        history.push_back(usn_record(5, file_id, Reason::RENAME_OLD_NAME, "B"));
-
-        let journal = fake_journal(history);
-        let new_name_record = usn_record(10, file_id, Reason::RENAME_NEW_NAME, "C");
-
-        assert_eq!(
-            journal.match_rename(&new_name_record),
-            Some(OsString::from("B")),
-            "match_rename returned the oldest matching history entry (A) instead of the \
-             most recent rename-old-name entry (B) before the second rename"
-        );
-    }
-
-    #[test]
-    fn match_rename_ignores_a_record_that_is_not_a_new_name() {
-        let file_id = FileId::from(7u64);
-        let mut history = VecDeque::new();
-        history.push_back(usn_record(1, file_id, Reason::RENAME_OLD_NAME, "old"));
-        let journal = fake_journal(history);
-
-        let create = usn_record(10, file_id, Reason::FILE_CREATE, "new");
-
-        assert_eq!(journal.match_rename(&create), None);
-    }
-
-    // --- history keeps only what match_rename reads ---
-
-    #[test]
-    fn history_keeps_only_rename_old_name_records() {
-        let mut history = VecDeque::new();
-        let file_id = FileId::from(1u64);
-        let old = usn_record(1, file_id, Reason::RENAME_OLD_NAME, "old");
-        let link = usn_record(2, file_id, Reason::HARD_LINK_CHANGE, "link");
-        let reparse = usn_record(3, file_id, Reason::REPARSE_POINT_CHANGE, "reparse");
-        let new = usn_record(4, file_id, Reason::RENAME_NEW_NAME, "new");
-
-        for record in [&old, &link, &reparse, &new] {
-            push_history(&mut history, None, record);
-        }
-
-        let names: Vec<_> = history.iter().map(|r| r.name.clone()).collect();
-        assert_eq!(names, vec![OsString::from("old")]);
-    }
-
-    #[test]
-    fn a_reparse_point_burst_does_not_push_a_rename_out_of_a_bounded_history() {
-        let mut history = VecDeque::new();
-        let file_id = FileId::from(1u64);
-        push_history(
-            &mut history,
-            Some(4),
-            &usn_record(1, file_id, Reason::RENAME_OLD_NAME, "old"),
-        );
-        for usn in 2..50 {
-            let noise = usn_record(usn, FileId::from(9u64), Reason::REPARSE_POINT_CHANGE, "x");
-            push_history(&mut history, Some(4), &noise);
-        }
-        let journal = fake_journal(history);
-
-        let new = usn_record(100, file_id, Reason::RENAME_NEW_NAME, "new");
-
-        assert_eq!(journal.match_rename(&new), Some(OsString::from("old")));
-    }
-
-    #[test]
-    fn trim_history_some_keeps_the_entry_at_the_usn_and_drops_older_ones() {
-        let file_id = FileId::from(1u64);
-        let mut history = VecDeque::new();
-        for usn in [10, 20, 30] {
-            history.push_back(usn_record(usn, file_id, Reason::RENAME_OLD_NAME, "n"));
-        }
-        let mut journal = fake_journal(history);
-
-        journal.trim_history(Some(20));
-
-        let usns: Vec<_> = journal.history.iter().map(|r| r.usn).collect();
-        assert_eq!(usns, vec![20, 30]);
-    }
-
-    #[test]
-    fn trim_history_none_clears_everything() {
-        let mut history = VecDeque::new();
-        history.push_back(usn_record(
-            10,
-            FileId::from(1u64),
-            Reason::RENAME_OLD_NAME,
-            "n",
-        ));
-        let mut journal = fake_journal(history);
-
-        journal.trim_history(None);
-
-        assert!(journal.history.is_empty());
-    }
-
-    // `Journal::resolve_path` and `get_file_path` copy a `FILE_NAME_INFO` out of a buffer; the
-    // decode is a pure function over bytes (no `align_to`, bounds-checked), testable here
-    // without a real file handle.
-    #[test]
-    fn parse_file_name_info_rejects_a_file_name_length_that_exceeds_the_buffer() {
-        // FileNameLength claims 1000 bytes; the buffer only has 4 bytes of name data after the
-        // 4-byte header. It must be rejected, not read out of bounds.
-        let mut buffer = vec![0u8; 8];
-        buffer[0..4].copy_from_slice(&1000u32.to_le_bytes());
-
-        assert_eq!(parse_file_name_info(&buffer), None);
-    }
-
-    #[test]
-    fn parse_file_name_info_rejects_a_buffer_shorter_than_its_length_field() {
-        assert_eq!(parse_file_name_info(&[1, 0]), None);
-    }
-
-    #[test]
-    fn parse_file_name_info_decodes_a_well_formed_buffer() {
-        let name: Vec<u16> = "child.txt".encode_utf16().collect();
-        let mut buffer = ((name.len() as u32) * 2).to_le_bytes().to_vec();
-        for unit in &name {
-            buffer.extend_from_slice(&unit.to_le_bytes());
-        }
-
-        assert_eq!(
-            parse_file_name_info(&buffer),
-            Some(PathBuf::from("child.txt"))
-        );
-    }
-
-    // --- errors ---
-
-    #[test]
-    fn access_denied_from_a_windows_call_is_access_denied() {
-        let err = windows::core::Error::from(ERROR_ACCESS_DENIED.to_hresult());
-
-        assert!(matches!(
-            map_windows_error(err),
-            NtfsReaderError::AccessDenied
-        ));
-    }
-
-    #[test]
-    fn a_journal_specific_windows_error_gets_its_own_variant() {
-        let not_active = windows::core::Error::from(ERROR_JOURNAL_NOT_ACTIVE.to_hresult());
-        let deleted = windows::core::Error::from(ERROR_JOURNAL_ENTRY_DELETED.to_hresult());
-        let being_deleted =
-            windows::core::Error::from(ERROR_JOURNAL_DELETE_IN_PROGRESS.to_hresult());
-
-        assert!(matches!(
-            map_windows_error(not_active),
-            NtfsReaderError::JournalNotActive
-        ));
-        assert!(matches!(
-            map_windows_error(deleted),
-            NtfsReaderError::JournalEntryDeleted
-        ));
-        assert!(matches!(
-            map_windows_error(being_deleted),
-            NtfsReaderError::JournalDeleteInProgress
-        ));
-    }
-
-    #[test]
-    fn any_other_windows_error_is_io_with_the_os_error_code() {
-        let err = windows::core::Error::from(Foundation::ERROR_FILE_NOT_FOUND.to_hresult());
-
-        match map_windows_error(err) {
-            NtfsReaderError::Io(io) => {
-                assert_eq!(
-                    io.raw_os_error(),
-                    Some(Foundation::ERROR_FILE_NOT_FOUND.0 as i32)
-                )
-            }
-            other => panic!("expected Io, got {other:?}"),
-        }
-    }
-
-    // --- Journal options and history ---
-
-    #[test]
-    fn journal_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<Journal>();
-    }
-
-    #[test]
-    fn default_journal_options_bound_history() {
-        assert!(
-            matches!(
-                JournalOptions::default().max_history_size,
-                HistorySize::Limited(_)
-            ),
-            "JournalOptions::default() should bound history, not be Unlimited"
-        );
-    }
-
-    #[test]
-    fn push_history_limited_zero_keeps_nothing() {
-        let mut history = VecDeque::new();
-        let record = usn_record(1, FileId::from(1u64), Reason::RENAME_OLD_NAME, "a");
-
-        push_history(&mut history, Some(0), &record);
-
-        assert!(
-            history.is_empty(),
-            "HistorySize::Limited(0) should keep no history entries, not be treated as unlimited"
-        );
-    }
-
-    #[test]
-    fn push_history_limited_n_keeps_the_n_most_recent() {
-        let mut history = VecDeque::new();
-        for i in 0..5i64 {
-            let record = usn_record(
-                i,
-                FileId::from(1u64),
-                Reason::RENAME_OLD_NAME,
-                &i.to_string(),
-            );
-            push_history(&mut history, Some(3), &record);
-        }
-
-        let names: Vec<_> = history.iter().map(|r| r.name.clone()).collect();
-        assert_eq!(
-            names,
-            vec![
-                OsString::from("2"),
-                OsString::from("3"),
-                OsString::from("4")
-            ]
-        );
-    }
-
-    #[test]
-    fn push_history_unlimited_keeps_everything() {
-        let mut history = VecDeque::new();
-        for i in 0..50i64 {
-            let record = usn_record(
-                i,
-                FileId::from(1u64),
-                Reason::RENAME_OLD_NAME,
-                &i.to_string(),
-            );
-            push_history(&mut history, None, &record);
-        }
-
-        assert_eq!(history.len(), 50);
-    }
-
-    #[test]
-    fn read_sized_rejects_a_buffer_smaller_than_the_minimum() {
-        // The size check runs before any I/O, so this is safe to call on a fake journal with a
-        // null handle: it never touches volume_handle.
-        let mut journal = fake_journal(VecDeque::new());
-
-        for size in [4, 8, Journal::MIN_READ_BUFFER_SIZE - 1] {
-            let result = journal.read_sized(size);
-
-            assert!(
-                matches!(
-                    result,
-                    Err(NtfsReaderError::ReadBufferTooSmall { size: got, min })
-                        if got == size && min == Journal::MIN_READ_BUFFER_SIZE
-                ),
-                "expected ReadBufferTooSmall for a {size}-byte buffer, got {:?}",
-                result.map(|_| ())
-            );
-        }
-    }
-
-    // The boundary is the leading USN value: 8 bytes or fewer carry no record.
-    #[test]
-    fn caught_up_exactly_when_the_response_carries_no_record_bytes() {
-        assert!(is_caught_up(0), "the driver returned nothing at all");
-        assert!(is_caught_up(8), "exactly the leading USN and nothing else");
-        assert!(!is_caught_up(9), "one byte of an actual record");
-    }
-}
+#[path = "tests/journal.rs"]
+mod tests;

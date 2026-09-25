@@ -12,9 +12,8 @@ use ntfs_reader::{
 mod common;
 use common::{drain, test_volume_letter, TempDirGuard};
 
-/// A `Volume` good enough for tests that only exercise `Journal::new`'s path
-/// handling and never reach real volume I/O (that happens through
-/// `aligned_reader`, not through any field read here).
+/// A `Volume` good enough for tests that exercise only `Journal::new`'s path handling and never
+/// reach real volume I/O (that goes through `aligned_reader`, not any field read here).
 #[cfg(feature = "internals")]
 fn fake_volume(path: impl Into<PathBuf>) -> Volume {
     Volume::synthetic(path, 4096, 0, 1024, 0)
@@ -168,7 +167,7 @@ fn file_delete() -> NtfsReaderResult<()> {
     panic!("The file deletion was not detected");
 }
 
-// --- Card 002: journal handles leak on error, and the path goes through the ANSI API ---
+// --- Journal handles must not leak on error, and the path must not go through the ANSI API ---
 
 // Needs `Volume::synthetic`, which only the `internals` feature builds.
 #[cfg(feature = "internals")]
@@ -176,11 +175,11 @@ fn file_delete() -> NtfsReaderResult<()> {
 fn journal_new_returns_an_error_for_a_non_utf8_path_instead_of_panicking() {
     use std::os::windows::ffi::OsStringExt;
 
-    // A no-panic regression guard, not a test of which error comes back. Fixed (card 002):
-    // Journal::new now encodes the path with OsStrExt::encode_wide(), which round-trips any
-    // OsString Windows can produce (including ill-formed UTF-16), instead of to_str().unwrap()
-    // (which used to panic here). The path isn't a real device, so CreateFileW is expected to
-    // fail; the assertion is only that it fails as an `Err`. A panic fails the test itself.
+    // A no-panic regression guard, not a check of which error comes back. Journal::new encodes
+    // the path with OsStrExt::encode_wide(), which round-trips any OsString Windows can produce
+    // (including ill-formed UTF-16); it used to call to_str().unwrap() here and panic. The path
+    // is not a real device, so CreateFileW is expected to fail; only asserted is that it fails as
+    // an `Err`.
     let wide: Vec<u16> = "\\\\?\\T:"
         .encode_utf16()
         .chain(std::iter::once(0xD800u16))
@@ -196,9 +195,9 @@ fn journal_new_returns_an_error_for_a_non_utf8_path_instead_of_panicking() {
     );
 }
 
-/// Restores the USN journal on `volume_arg` (for example `"T:"`) when dropped, so a
-/// test that deactivates the journal to force `Journal::new` to fail after `CreateFileW`
-/// leaves the volume in the same state it found it, even if an assertion above fails.
+/// Restores the USN journal on `volume_arg` (e.g. `"T:"`) when dropped, so a test that
+/// deactivates the journal to force `Journal::new` to fail after `CreateFileW` still leaves the
+/// volume as it found it, even if an assertion above fails.
 struct JournalRestoreGuard {
     volume_arg: String,
 }
@@ -211,9 +210,9 @@ impl Drop for JournalRestoreGuard {
     }
 }
 
-// Deletes the volume's USN journal (`fsutil usn deletejournal`), which races every other journal
-// test in the default parallel run and breaks indexers and backup tools on a machine that cares
-// about its journal. Run with `--ignored`, alone (`--test-threads=1`), on a scratch volume.
+// Deletes the volume's USN journal (`fsutil usn deletejournal`): races every other journal test
+// in the default parallel run, and breaks indexers and backup tools on a machine that cares about
+// its journal. Run with `--ignored`, alone (`--test-threads=1`), on a scratch volume.
 #[test]
 #[ignore = "deletes and recreates the volume's USN journal; run with --ignored on a scratch volume"]
 fn journal_new_does_not_leak_the_volume_handle_when_it_fails_after_create_file(
@@ -222,9 +221,9 @@ fn journal_new_does_not_leak_the_volume_handle_when_it_fails_after_create_file(
 
     let volume_arg = format!("{}:", test_volume_letter());
 
-    // Deactivate the journal so CreateFileW succeeds but the following
-    // FSCTL_QUERY_USN_JOURNAL fails, exercising the early-return path in
-    // Journal::new that today drops the volume handle without closing it.
+    // Deactivate the journal so CreateFileW succeeds but the following FSCTL_QUERY_USN_JOURNAL
+    // fails: exercises the early-return path in Journal::new that drops the volume handle
+    // without closing it.
     let status = std::process::Command::new("fsutil")
         .args(["usn", "deletejournal", "/D", &volume_arg])
         .status()?;
@@ -264,7 +263,7 @@ fn journal_new_does_not_leak_the_volume_handle_when_it_fails_after_create_file(
     Ok(())
 }
 
-// --- Card 004: match_rename returns the oldest name, not the previous one ---
+// --- match_rename returns the oldest name, not the previous one ---
 
 #[test]
 fn file_double_rename() -> NtfsReaderResult<()> {
@@ -319,7 +318,7 @@ fn file_double_rename() -> NtfsReaderResult<()> {
     panic!("The second rename was not detected");
 }
 
-// --- Card 005: USN journal API redesign ---
+// --- The USN journal API: options, positions and reading ---
 
 // Deletes and recreates the volume's USN journal, see the note on the handle-leak test above.
 #[test]
@@ -383,10 +382,10 @@ fn read_until_seen(
 #[cfg(feature = "internals")]
 #[test]
 fn read_does_not_open_file_handles_to_resolve_paths() -> NtfsReaderResult<()> {
-    // `read` must not resolve paths: doing so costs handle opens per record. The crate counts
-    // the path lookups each thread makes (the `internals` feature these tests build with), so
-    // this asserts on the count instead of timing. NTFS writes several records per file, so it
-    // asserts nothing about how many records a file produces.
+    // `read` must not resolve paths: doing so costs a handle open per record. The crate counts
+    // path lookups per thread (the `internals` feature these tests build with); this asserts on
+    // that count instead of timing. NTFS writes several records per file, so no assertion is
+    // made about how many records one file produces.
     use ntfs_reader::internals::path_lookups_on_this_thread;
 
     let dir = PathBuf::from(format!(
@@ -448,10 +447,10 @@ fn read_does_not_open_file_handles_to_resolve_paths() -> NtfsReaderResult<()> {
 
 // A path that cannot be resolved is `None`, never a bare name: a caller acting on a relative
 // path would touch the current directory. Deleting a whole tree leaves records whose file and
-// parent are both gone. `resolve_path` goes through the parent's current path first, so the
-// tree's top directory, whose parent (the volume root) still exists, resolves to its absolute
-// path even though it is deleted; everything below it has no parent left and is `None`.
-// The records also say what was deleted: a directory's carries `FILE_ATTRIBUTE_DIRECTORY`.
+// parent are both gone. `resolve_path` goes through the parent's current path first: the tree's
+// top directory, whose parent (the volume root) still exists, resolves to its absolute path even
+// though deleted; everything below it has no parent left and is `None`. The records also say what
+// was deleted: a directory's carries `FILE_ATTRIBUTE_DIRECTORY`.
 #[test]
 fn a_deleted_tree_resolves_to_an_absolute_path_or_none() -> NtfsReaderResult<()> {
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;

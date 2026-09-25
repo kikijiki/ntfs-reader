@@ -1,16 +1,19 @@
-// Property test of `parse_usn_records` (card 035, card 041): the input describes a buffer of USN
-// records (version 2 or 3, a name, an optional deliberate fault per record, a possible cut inside
-// the last record), which is laid out in the byte format `usn.rs` parses. A buffer with no fault
-// must parse to exactly the described records; each fault has a known outcome (parse stops
-// cleanly, or fails) that is checked too. See `crate::property` for how to run it for longer and
-// how to replay a failing seed.
+// Copyright (c) 2022, Matteo Bernacchia <dev@kikijiki.com>. All rights reserved.
+// This project is dual licensed under the Apache License 2.0 and the MIT license.
+// See the LICENSE files in the project root for details.
+
+// Property test of `parse_usn_records`: the input describes a buffer of USN records (version 2
+// or 3, a name, an optional fault per record, a possible cut inside the last), laid out in the
+// byte format `usn.rs` parses. A fault-free buffer must parse to exactly the described records;
+// each fault has a known outcome (clean stop or failure), checked too. See `crate::property` for
+// running it longer and replaying a failing seed.
 
 use std::ffi::OsString;
 
 use arbitrary::Arbitrary;
 
-use super::parse_usn_records;
 use crate::property::{list, property, show_on_replay};
+use crate::usn::parse_usn_records;
 
 const MAX_RECORDS: usize = 8;
 const MAX_NAME_UNITS: usize = 12;
@@ -55,9 +58,9 @@ struct RecordSpec {
     fault: Option<Fault>,
 }
 
-/// The record's time as 100ns intervals since 1601. Raw values are mostly far past the year
-/// 9999, so the other kinds put most of the cases near the epoch and the last representable
-/// instant, where the rules are.
+/// The record's time as 100ns intervals since 1601. Raw values are mostly far past year 9999,
+/// so the other variants put most cases near the epoch and the last representable instant,
+/// where the clamping rules apply.
 #[derive(Debug, Arbitrary)]
 enum TimeStamp {
     /// Any value, negative included.
@@ -129,9 +132,8 @@ fn os_string(units: &[u16]) -> OsString {
     OsString::from_wide(units)
 }
 
-/// The name as an `OsString`, encoded here by hand (WTF-8: ordinary UTF-8, and
-/// the three-byte form for an unpaired surrogate) so the check does not share
-/// its conversion with the parser. Card 036: the name is lossless.
+/// The name as an `OsString`, encoded here by hand (WTF-8: ordinary UTF-8 plus the three-byte
+/// form for an unpaired surrogate) so the check shares no conversion with the parser. Lossless.
 #[cfg(not(windows))]
 fn os_string(units: &[u16]) -> OsString {
     let mut bytes = Vec::new();
@@ -256,9 +258,9 @@ fn build(spec: &RecordSpec) -> (Vec<u8>, Option<Expected>) {
         } else {
             spec.parent_id as u128
         },
-        // The exact rule of `ntfs_to_unix_time`: a time before 1970 is the real date, and one
-        // outside `time`'s range is its nearest limit. A negative `TimeStamp` is read as 0, which
-        // is 1601-01-01, not the epoch: the kernel never writes one.
+        // The exact rule of `ntfs_to_unix_time`: a time before 1970 is the real date, one
+        // outside `time`'s range clamps to its nearest limit. A negative `TimeStamp` reads as 0
+        // (1601-01-01, not the epoch); the kernel never writes one.
         unix_nanos: ((spec.time_stamp.ticks().max(0) as i128 - EPOCH_DIFFERENCE) * 100)
             .clamp(MIN_UNIX_NANOS, MAX_UNIX_NANOS),
     });

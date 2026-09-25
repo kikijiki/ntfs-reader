@@ -1,7 +1,7 @@
 //! Timing of the USN record parser on synthetic `FSCTL_READ_USN_JOURNAL` buffers. No real journal
 //! or volume needed: `Journal::read_sized` reaches the parser only after a real `DeviceIoControl`
-//! call, so `parse_usn_records_bench` is the entry point that runs it on its own. The records are
-//! laid out by hand in the `USN_RECORD_V2` format, so this runs on any platform.
+//! call, so `parse_usn_records_bench` runs it standalone. Records are laid out by hand in
+//! `USN_RECORD_V2` format, so this runs on any platform.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use ntfs_reader::internals::parse_usn_records_bench;

@@ -1,14 +1,11 @@
 //! Timing of `Mft::new` and of `FileInfo` path resolution with and without a `DefaultPathCache`.
 //! Needs an elevated shell; the volume comes from `test_volume_letter()` (the stress volume `S:`
-//! gives the numbers at a million files, see CONTRIBUTING.md).
-//! See `cache_memory` for the memory side.
+//! gives numbers at a million files, see CONTRIBUTING.md). See `cache_memory` for the memory side.
 //!
-//! Volume-backed, so Windows-only regardless of the `internals` feature
-//! (which only makes the crate's parsing *types* buildable on Linux, not a
-//! real `\\.\C:` device to read): every item below is `#[cfg(windows)]`, and
-//! a `#[cfg(not(windows))]` stub `main` says so instead of trying (and
-//! failing at run time) to open a volume that doesn't exist on this
-//! platform. See `journal_synthetic.rs` for the same pattern.
+//! Windows-only regardless of the `internals` feature (it only makes the crate's parsing *types*
+//! buildable on Linux, not a real `\\.\C:` device): every item below is `#[cfg(windows)]`, with a
+//! `#[cfg(not(windows))]` stub `main` instead of failing at run time on a volume that does not
+//! exist here. See `journal_synthetic.rs` for the same pattern.
 
 #[cfg(windows)]
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
@@ -72,8 +69,8 @@ fn bench_full_scan(c: &mut Criterion) {
     group.finish();
 }
 
-/// A fresh cache per iteration: the cost of a cache when only a few files
-/// are resolved, allocation and drop included.
+/// A fresh cache per iteration: the cost of a cache when few files are resolved, allocation and
+/// drop included.
 #[cfg(windows)]
 fn bench_lookup(c: &mut Criterion) {
     let mft = open_mft();

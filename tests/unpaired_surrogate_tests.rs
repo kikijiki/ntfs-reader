@@ -1,15 +1,13 @@
 #![cfg(target_os = "windows")]
 
-//! Card 034. NTFS filenames are raw UTF-16 code unit sequences with no
-//! requirement that they be *valid* UTF-16 - Windows accepts an unpaired
-//! surrogate (0xD800..=0xDFFF), which `str::encode_utf16` could never
-//! produce but a real file can have. This creates such a file directly
-//! with `CreateFileW`, then confirms the crate finds it via the MFT and
-//! resolves it to a path that actually reopens - not a lossy, corrupted
-//! one `Display`/`to_string` would have produced.
+//! NTFS filenames are raw UTF-16 code unit sequences, not necessarily valid UTF-16: Windows
+//! accepts an unpaired surrogate (0xD800..=0xDFFF), which `str::encode_utf16` could never
+//! produce but a real file can have. This creates such a file with `CreateFileW`, then confirms
+//! the crate finds it via the MFT and resolves it to a path that reopens, not a lossy, corrupted
+//! one `Display`/`to_string` would produce.
 //!
-//! See `path::tests::resolve_path_preserves_a_name_with_an_unpaired_surrogate`
-//! (`src/path.rs`) for the synthetic, VM-free version of this same check.
+//! See `path::tests::resolve_path_preserves_a_name_with_an_unpaired_surrogate` (`src/path.rs`)
+//! for the synthetic, VM-free version of this check.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -56,7 +54,7 @@ fn finds_and_reopens_a_file_with_an_unpaired_surrogate_name() {
             )
             .expect(
                 "CreateFileW must accept a name with an unpaired surrogate - if this fails, \
-                 Windows itself rejects such names and card 034's premise doesn't hold",
+                 Windows itself rejects such names and the premise of this test doesn't hold",
             ),
         )
     };
@@ -91,8 +89,7 @@ fn finds_and_reopens_a_file_with_an_unpaired_surrogate_name() {
         )
     });
 
-    // The real proof: the resolved path must point at the actual file, not
-    // a lossy, non-existent lookalike.
+    // The resolved path must point at the actual file, not a lossy, non-existent lookalike.
     let path = info.path.expect("the file resolved to a path above");
     std::fs::File::open(&path)
         .unwrap_or_else(|e| panic!("resolved path {path:?} did not reopen: {e}"));

@@ -52,7 +52,7 @@ run = "nix develop -c cargo xwin build --release --target x86_64-pc-windows-msvc
 run_windows = "cargo build --release"
 
 [tasks.test]
-description = "Run tests (with the `internals` feature) on Windows; compile them for MSVC on other platforms. The integration tests need NTFS_READER_TEST_VOLUME (a disposable NTFS drive letter, never the system drive; see tests/common/mod.rs)"
+description = "Run tests (with the `internals` feature) on Windows; compile them for MSVC elsewhere. Needs NTFS_READER_TEST_VOLUME (a disposable NTFS drive letter, never the system drive; see tests/common/mod.rs). Set NTFS_READER_SKIP_LOG=<file> to see what NTFS_READER_ALLOW_FSUTIL, NTFS_READER_PARITY_VOLUME and the VM fixtures skip (CONTRIBUTING.md, \"What the integration tests need from the machine\")"
 run = "nix develop -c cargo xwin test --no-run --features internals --target x86_64-pc-windows-msvc"
 run_windows = "cargo test --features internals"
 
@@ -78,8 +78,13 @@ run_windows = "cargo doc --no-deps"
 env = { RUSTDOCFLAGS = "-D warnings" }
 
 [tasks.test-linux]
-description = "Run the unit and property tests natively on Linux via the internals feature (no VM, no cross-compile; the property tests search for 2 s each, ARBTEST_BUDGET_MS=60000 for longer, ARBTEST_SEED=0x... to replay a failure)"
+description = "Run the unit and property tests natively on Linux via the internals feature (no VM, no cross-compile). Property tests search for 2 s each, the heaviest three for 10 s; ARBTEST_BUDGET_MS=... changes that for all of them, ARBTEST_SEED=0x... replays a failure"
 run = "nix develop -c cargo test --features internals --lib"
+
+[tasks.test-linux-long]
+description = "Property tests on Linux, each searching for a minute (ARBTEST_BUDGET_MS=60000): run before a release or after changing a property test or the deleted-file code. Two real divergences were found only after about 20 s of search"
+run = "nix develop -c cargo test --features internals --lib"
+env = { ARBTEST_BUDGET_MS = "60000" }
 
 [tasks.bench-linux]
 description = "Run the synthetic (non-volume) criterion benches natively on Linux via the internals feature; the volume-backed benches are Windows-only and no-op here"
@@ -87,6 +92,7 @@ run = [
     "nix develop -c cargo bench --features internals --bench mft_load_synthetic",
     "nix develop -c cargo bench --features internals --bench file_access_synthetic",
     "nix develop -c cargo bench --features internals --bench journal_synthetic",
+    "nix develop -c cargo bench --features internals --bench deleted_synthetic",
 ]
 
 [tasks.package]

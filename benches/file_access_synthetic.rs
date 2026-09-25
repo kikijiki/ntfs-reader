@@ -1,14 +1,11 @@
-//! Timing of the per-file accessors on a synthetic MFT: `record_attributes`,
-//! `attributes` (the whole logical file, extension records included),
-//! `names`/`best_name`, `data_streams`, `resolve_path` with and without a
-//! cache, `FileInfo`, and data run decoding. Synthetic input, so
-//! these run without a volume. See `mft_benchmark` for end-to-end,
-//! volume-backed numbers.
+//! Timing of the per-file accessors on a synthetic MFT: `record_attributes`, `attributes` (the
+//! whole logical file, extension records included), `names`/`best_name`, `data_streams`,
+//! `resolve_path` with and without a cache, `FileInfo`, and data run decoding. Synthetic input
+//! runs without a volume; see `mft_benchmark` for end-to-end, volume-backed numbers.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-#[path = "support/mod.rs"]
 mod support;
 use support::{build_dataset, fragmented_data_run_record};
 
@@ -40,9 +37,8 @@ fn bench_record_attributes(c: &mut Criterion) {
     });
 }
 
-/// Unlike `record_attributes`, this walks every extension record too (one
-/// file in five here), so it also pays for `NtfsFile::records`'s lookup in
-/// the sorted extension-record index.
+/// Unlike `record_attributes`, this also walks extension records (one file in five here), paying
+/// for `NtfsFile::records`'s lookup in the sorted extension-record index.
 fn bench_attributes(c: &mut Criterion) {
     let mft = dataset();
     c.bench_function("attributes/full_scan", |b| {
@@ -103,10 +99,9 @@ fn bench_file_info(c: &mut Criterion) {
     });
 }
 
-/// `DIR_DEPTH` nesting levels means every uncached lookup walks that many
-/// parent hops; a full scan with a fresh cache resolves each directory once
-/// and reuses it for every sibling file, the way `FileInfo::with_cache` does
-/// in a real scan.
+/// `DIR_DEPTH` levels means every uncached lookup walks that many parent hops; a full scan with
+/// a fresh cache resolves each directory once and reuses it for every sibling, as
+/// `FileInfo::with_cache` does in a real scan.
 fn bench_resolve_path(c: &mut Criterion) {
     let mft = dataset();
     let mut group = c.benchmark_group("resolve_path");
@@ -132,9 +127,8 @@ fn bench_resolve_path(c: &mut Criterion) {
     group.finish();
 }
 
-/// `NtfsAttribute::nonresident_data_runs`, in isolation, over an
-/// increasingly fragmented single attribute (no `Mft` needed: it only reads
-/// the attribute's own bytes plus the volume's cluster size).
+/// `NtfsAttribute::nonresident_data_runs` alone, over an increasingly fragmented attribute (no
+/// `Mft` needed: it only reads the attribute's own bytes and the volume's cluster size).
 fn bench_data_run_decoding(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_run_decoding");
     for &run_count in &RUN_COUNTS {

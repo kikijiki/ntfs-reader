@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-25
+
+Deleted files work again, and this release adds the tools to use them: reading their data, resolving their
+paths, and checking whether the data survived.
+
+### Added
+
+- `Mft::deleted_files()` lists deleted files: freed base records that still hold a name or times.
+- `Mft::record_by_id(FileId)` returns a record by id, live or deleted; finds the file behind a journal
+  `FILE_DELETE` record, as long as its record has not been reused.
+- `NtfsFile::is_deleted()` and `FileInfo::is_deleted` report whether a file is deleted. A file that is
+  delete-pending (deleted while still open) is not deleted yet, and neither is a record whose in-use flag
+  disagrees with its `$BITMAP` bit.
+- Lost-data reporting: `StreamReader::data_lost()`, `NtfsDataStream::data_lost`, `FileInfo::data_lost` and
+  `NtfsFile::stream_data_lost()` say when a deleted file's stream data was zeroed by NTFS; resident streams
+  are unaffected. `FileInfo::data_lost` is also `true` when the default stream cannot be found at all, so a
+  size of 0 is never mistaken for an empty file. See `docs/deleted-files.md`.
+- `NtfsFileName::parent_id()` returns the parent directory as a `FileId`.
+- `Mft::resolve_deleted_path()` resolves the path of a deleted file through freed directories, returning a
+  `DeletedPath` with a `complete` flag. `DeletedPathCache` (`new`, `len`, `is_empty`) is separate from
+  `DefaultPathCache`, so live and deleted walks cannot share results; `FileInfo::with_caches` takes both. See
+  `docs/deleted-files.md`.
+- `NtfsFile::open_stream()` returns a `StreamReader` (`Read + Seek`) that reads a file's data, live or
+  deleted, resident or not, even from a file Windows has open. New `NtfsReaderError` variants:
+  `StreamNotFound` (no stream of that name), `CompressedStream` and `EncryptedStream` (compressed or encrypted
+  streams are refused; the crate does not decompress or decrypt), `WofCompressedStream` (a WOF-compressed
+  default stream is refused), `StreamExtentMissing` (part of a deleted file's extent record is gone).
+  `StreamReader::extents`, `size`, `initialized_size` and `cluster_size` describe the stream. See
+  `docs/reading-data.md`.
+- `ClusterBitmap::new(&Mft)` reads the volume's `$Bitmap`; `StreamReader::allocation(&ClusterBitmap)` reports
+  whether a stream's data sits in free or allocated clusters (`StreamAllocation`, `AllocationState`). This
+  reports allocation, not recoverability: a free cluster may still hold the old bytes. New errors:
+  `InvalidClusterBitmap` (bitmap missing, too short, or does not match the volume or cluster size) and
+  `AllocationTooLarge` (bitmap over 4 GiB; NTFS on Windows tops out at 512 MiB). `ClusterBitmap` has
+  `cluster_size`, `cluster_count` and `is_allocated`; `StreamAllocation` has an accessor per part. See
+  `docs/deleted-files.md`.
+- `ROOT_RECORD` and `FIRST_NORMAL_RECORD` are exported again from the crate root (0.5.0 made them private).
+- `NtfsFileName::is_in_root()`.
+- Examples `list_deleted` and `recover_file`. `recover_file` refuses a destination on the source volume, exits
+  with 2 for a partial copy, and reports "data lost" when a deleted file's default stream cannot be found.
+- Journal examples `monitor_journal` (prints one line per operation, `--all` prints every record,
+  `--from-start` and `--snapshot` for a deleted file whose directory was also deleted) and `watch_deletes`;
+  `read_journal` is removed in favor of `monitor_journal --from-start`.
+- Guides under `docs/`, also on docs.rs as `ntfs_reader::guide` modules.
+
+### Changed
+
+- The accessors of `NtfsFile` and `FileInfo` now answer for a deleted file (see Fixed); test `is_deleted`
+  instead of an empty result. `Mft::files()` still yields live files only.
+- `NtfsFile::file_id()` of a freed record is the id it had while live, matching its journal records.
+  `NtfsFile::reference()` is still the raw header value.
+- `Volume::new` rejects a boot sector with `total_sectors == 0` (`InvalidBootSector`).
+- `FileInfo::path` of a deleted file is now its complete deleted path instead of `None`. `FileInfo::new` and
+  `with_cache` walk the whole chain per deleted file; use `FileInfo::with_caches` for a scan.
+- `FileInfo` gains `is_deleted` and `data_lost` fields; `NtfsReaderError` gains the new variants above. Both
+  are `#[non_exhaustive]`, so this is not a breaking change. `FileInfo::size` of a deleted file is what its
+  record still says, 0 when `data_lost` is `true`.
+- `NtfsFile::records()` of an extension record is stricter about matching its base, so a stale or
+  misattributed extension record now belongs to no file instead of another file's records.
+- `Mft::size_in_memory()` now also counts the `$MFT` bitmap and the two extension record indexes, not only the
+  records.
+
+### Fixed
+
+- The accessors of `NtfsFile` and `FileInfo` (`names`, `hard_links`, `best_name`, `standard_information`,
+  `data_streams`, `resident_data`, `attributes`, `records`) returned nothing for a deleted file from 0.4.6 to
+  0.5.1, a regression introduced while fixing extension record handling; they work again. A deleted file
+  reports what its record still holds: NTFS keeps the times, names and resident data, but a name removed while
+  the file lived is gone, a file with several hard links keeps only its last one, and there is no deletion
+  time.
+- Loading the `Mft` no longer requests more than 64 MiB in one read, which could fail on a volume whose `$MFT`
+  has a large run.
+
 ## [0.5.1] - 2026-09-25
 
 ### Fixed
@@ -19,19 +92,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compared with 0.4.7
 
-Measured on a Windows 11 VM against Win32 as the reference, on the VM's system drive (380k records), a 1.09M-file
-stress volume and a volume whose `$MFT` is fragmented. 0.5.0 was not wrong anywhere 0.4.7 was right.
+Measured on a Windows 11 VM against Win32, on the VM's system drive (380k records), a 1.09M-file stress
+volume, and a volume with a fragmented `$MFT`. 0.5.0 was never wrong where 0.4.7 was right.
 
 Where 0.4.7 is wrong:
 
-- It cannot load a volume whose `$MFT` data is fragmented through an attribute list (`InvalidDataRun: data runs
-  shorter than declared size`); 0.5.0 reads all 401k files of such a volume correctly.
-- It returns no path and no name for files whose names all carry the reparse point flag: 2,429 files on the system
-  drive (Edge, WebView and similar).
-- It gets paths and hard links wrong below 1024 directory levels, turns names with an unpaired UTF-16 surrogate into
-  paths that do not exist, and reports dates before 1970 or after 9999 wrongly.
-- Journal: after a tree is deleted, after a double rename (A to B to C gives A as C's old name instead of B), for names
-  with an unpaired surrogate, and with a small read buffer (it returned 2 of 122 records) its results are wrong.
+- Cannot load a volume whose `$MFT` data is fragmented through an attribute list (`InvalidDataRun: data
+  runs shorter than declared size`); 0.5.0 reads all 401k files of one correctly.
+- Returns no path or name for files whose names all carry the reparse point flag: 2,429 files on the
+  system drive (Edge, WebView and similar).
+- Gets paths and hard links wrong below 1024 directory levels, turns names with an unpaired UTF-16
+  surrogate into paths that do not exist, and reports dates before 1970 or after 9999 wrongly.
+- Journal: wrong results after a tree is deleted, after a double rename (A to B to C gives A as C's old
+  name instead of B), for names with an unpaired surrogate, and with a small read buffer (returned 2 of
+  122 records).
 
 Speed (hyperfine, x64, every operation includes loading the `$MFT`):
 
@@ -40,9 +114,10 @@ Speed (hyperfine, x64, every operation includes loading the `$MFT`):
 | System drive, 380k records | 6.4 s to 0.11 s (57x) | 5.9 s to 0.40 s (15x) | 5.5 s to 0.12 s (46x) |
 | Stress volume, 1.09M records | 15.5 s to 0.28 s (56x) | 16.3 s to 0.95 s (17x) | 15.7 s to 0.30 s (52x) |
 
-A full scan without a cache is 4 to 9 times faster. Peak memory while loading is the same (the `$MFT` dominates); a
-scan with a cache uses 8 to 14% less, because only directories are cached. Reading the journal costs the same when every
-record's path is resolved; 0.5.0 resolves paths only on request, and without them a read is 6 times faster.
+A full scan without a cache is 4 to 9 times faster. Peak memory while loading is the same (the `$MFT`
+dominates); a cache scan uses 8 to 14% less, since only directories are cached. Journal reads cost the
+same when every record's path is resolved; 0.5.0 resolves paths only on request, so without them a read
+is 6 times faster.
 
 ### Added
 
@@ -105,26 +180,26 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
 - `NtfsAttribute::standard_information` and `NtfsFile::standard_information` return the
   `NtfsStandardInformation` by value (it is `Copy`) instead of a reference.
 - `Volume::new` rejects a path with a NUL character with `InvalidVolumePath`, before opening anything.
-- **Breaking:** the `Journal` API was reshaped. `read` and `read_sized` return `UsnReadResult` instead of a
+- **Breaking:** the `Journal` API is reshaped. `read` and `read_sized` return `UsnReadResult` instead of a
   `Vec`. `UsnRecord::timestamp` is an `OffsetDateTime`, `UsnRecord::reason` is a `Reason`, and
-  `UsnRecord::path` is replaced by `UsnRecord::name` (file name only); call `Journal::resolve_path` when a
-  full path is needed. It returns `Option<PathBuf>`: `None` when the file and its parent are gone, and a
-  returned path is always absolute. `read_sized` takes the buffer size as an argument instead of a const
-  generic and rejects buffers smaller than `Journal::MIN_READ_BUFFER_SIZE` (1024 bytes). `get_next_usn` is now
-  `next_usn`, and `match_rename` returns the old name as an `OsString`. A saved `NextUsn::Custom` position
-  now carries the journal id and is checked against the volume's current journal.
+  `UsnRecord::path` is replaced by `UsnRecord::name` (file name only); call `Journal::resolve_path` for a
+  full path. It returns `Option<PathBuf>`: `None` when the file and its parent are gone, otherwise
+  always absolute. `read_sized` takes the buffer size as an argument instead of a const generic and
+  rejects buffers smaller than `Journal::MIN_READ_BUFFER_SIZE` (1024 bytes). `get_next_usn` is now
+  `next_usn`, and `match_rename` returns the old name as an `OsString`. A saved `NextUsn::Custom`
+  position now carries the journal id and is checked against the volume's current journal.
   `JournalOptions::max_history_size` now defaults to 4096 records instead of unlimited.
 - **Breaking:** `JournalOptions::reason_mask` is a `Reason` instead of a `u32`.
 - **Breaking:** `FileId` is a `u128` newtype (`Copy`, `Eq`, `Hash`, `Ord`) instead of the `Normal`/`Extended`
-  enum, with no `windows` type inside. The same file compares equal whether its id came from the MFT or from
-  a V2 or V3 journal record, and it can key a map. `NtfsFile::get_file_id` is now `NtfsFile::file_id`.
+  enum, with no `windows` type inside. The same file compares equal whether its id came from the MFT or a
+  V2 or V3 journal record, and it can key a map. `NtfsFile::get_file_id` is now `NtfsFile::file_id`.
 - **Breaking:** names read from disk are lossless `OsString`s: `NtfsDataStream.name` is `Option<OsString>`,
   `UsnRecord.name` is `OsString`, and `NtfsAttribute::name()` returns `Option<OsString>`. A name with an
-  unpaired UTF-16 surrogate is no longer changed to U+FFFD, so it can open `path:stream` or be matched
-  against names from the MFT. `FileInfo.name` stays a `String` label; use `NtfsFileName::to_os_string` or
-  `FileInfo.path` for the exact name.
-- **Breaking:** `FileInfo.path` is an `Option<PathBuf>`: `None` when the file has no name or its parent chain
-  cannot be resolved (it was an empty `PathBuf`), like `Mft::resolve_path`.
+  unpaired UTF-16 surrogate is no longer changed to U+FFFD, so it can open `path:stream` or match names
+  from the MFT. `FileInfo.name` stays a `String` label; use `NtfsFileName::to_os_string` or `FileInfo.path`
+  for the exact name.
+- **Breaking:** `FileInfo.path` is an `Option<PathBuf>`: `None` when the file has no name or its parent
+  chain cannot be resolved (it was an empty `PathBuf`), like `Mft::resolve_path`.
 - **Breaking:** `NtfsReaderError` is `#[non_exhaustive]` and holds no `windows` type. `IOError` is now `Io`,
   and Windows failures are `Io` carrying the OS error code (`raw_os_error()`) instead of `WindowsError`.
   Access denied is `AccessDenied` from `Volume::new`, `Mft::new` and `Journal::new` alike; `Volume::new` no
@@ -134,11 +209,11 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
   added.
 - **Breaking:** `NtfsFile::attributes` is now an iterator over the whole logical file instead of taking a
   callback. Use `record_attributes()` for a single record.
-- **Breaking:** an `NtfsFile` holds the `Mft` it came from, so the accessors that returned data of the
-  whole file no longer take a `&Mft`: `attributes`, `names`, `hard_links`, `best_name`,
-  `standard_information`, `data_streams` and `resident_data`. What they return still borrows from the `Mft`,
-  not from the `NtfsFile`. `Mft::file_records(&file)` is `NtfsFile::records()`. `FileInfo::new` and
-  `FileInfo::with_cache` take the file only. `Mft::resolve_path` is unchanged.
+- **Breaking:** an `NtfsFile` holds the `Mft` it came from, so accessors returning whole-file data no
+  longer take a `&Mft`: `attributes`, `names`, `hard_links`, `best_name`, `standard_information`,
+  `data_streams` and `resident_data`. What they return still borrows from the `Mft`, not the `NtfsFile`.
+  `Mft::file_records(&file)` is `NtfsFile::records()`. `FileInfo::new` and `FileInfo::with_cache` take the
+  file only. `Mft::resolve_path` is unchanged.
 - **Breaking:** the fields of `Mft`, `NtfsFile`, `NtfsAttribute`, `NtfsFileName`, `NtfsStandardInformation`
   and `Volume` are private. Use the accessors, for example `Mft::volume()`, `NtfsFile::number()`,
   `Volume::cluster_size()` and `NtfsStandardInformation::created()`.
@@ -147,14 +222,14 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
   `resident_data`.
 - **Breaking:** the crate fails to build on non-Windows targets with a single `compile_error!`. It never
   worked there.
-- `Mft::new` skips records that fail fixup verification instead of failing the whole load, and joins the
-  `$MFT` data and bitmap when they span extension records. Records whose update sequence array does not
-  cover every sector are rejected, as Windows does, and counted in `corrupt_records()`.
-- `Mft::resolve_path` limits paths to the Win32 maximum, counted exactly (32767 UTF-16 units, the volume path
-  and the separators included, so about 16k levels) instead of 1024 levels, applies the limit the same with
-  and without a cache, and detects parent loops exactly.
-- `Journal::match_rename` needs `Reason::RENAME_OLD_NAME` in the `reason_mask`. The history keeps only those
-  records, so hard link and reparse point changes no longer push renames out of it.
+- `Mft::new` skips records that fail fixup verification instead of failing the whole load, and joins
+  the `$MFT` data and bitmap when they span extension records. Records whose update sequence array
+  does not cover every sector are rejected, as Windows does, and counted in `corrupt_records()`.
+- `Mft::resolve_path` limits paths to the Win32 maximum, counted exactly (32767 UTF-16 units including
+  the volume path and separators, so about 16k levels) instead of 1024 levels, applies the limit the same
+  with and without a cache, and detects parent loops exactly.
+- `Journal::match_rename` needs `Reason::RENAME_OLD_NAME` in the `reason_mask`. The history keeps only
+  those records, so hard link and reparse point changes no longer push renames out of it.
 - `Journal` opens files by id with `FILE_FLAG_OPEN_REPARSE_POINT`, so a reparse point resolves to its own
   path instead of its target's.
 - Performance: loading the `$MFT`, full scans and path lookups are much faster; see "Compared with 0.4.7" below.
@@ -202,11 +277,10 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
 - An extension record that refers to itself no longer produces duplicate or looping results.
 - Files whose `$FILE_NAME` carries the reparse point flag now get a name and path (2,154 more files on the
   test system volume), and so do all their descendants.
-- A parent reference to a freed and reused record, or to a record that is not in use, no longer resolves
-  through the wrong directory, and a parent cycle no longer costs a full walk for every file below it.
-- `FileInfo::path` and `Mft::resolve_path` no longer replace an unpaired UTF-16 surrogate in a name with
-  U+FFFD, which produced a path that does not exist. The same applies to stream names, USN record names and
-  `match_rename`.
+- A parent reference to a freed, reused record, or one not in use, no longer resolves through the wrong
+  directory, and a parent cycle no longer costs a full walk for every file below it.
+- `FileInfo::path` and `Mft::resolve_path` no longer replace an unpaired UTF-16 surrogate with U+FFFD,
+  which produced a nonexistent path; same for stream names, USN record names and `match_rename`.
 - Timestamps before 1970 were reported as 1970-01-01; they are the real date now. A value beyond what
   `OffsetDateTime` can hold is its latest time instead of the epoch.
 - A `$DATA` attribute whose name cannot be read is no longer reported as the default stream.
@@ -343,7 +417,8 @@ record's path is resolved; 0.5.0 resolves paths only on request, and without the
 First tagged release. The crate could already read the `$MFT` into memory and read the USN journal.
 Earlier history (0.1.0 to 0.2.0, 2022) is not tagged and is not covered here.
 
-[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.7...v0.5.0
 [0.4.7]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.6...v0.4.7
