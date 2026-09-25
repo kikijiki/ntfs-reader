@@ -39,10 +39,9 @@ impl fmt::Debug for NtfsAttribute<'_> {
 }
 
 impl<'a> NtfsAttribute<'a> {
-    /// The attribute at the start of `data`, or `None` if `data` is too short
-    /// for a header or the declared length is not a plausible one: shorter
-    /// than the common header, not a multiple of 8 (NTFS pads every attribute
-    /// to 8 bytes), or longer than `data`.
+    /// The attribute at the start of `data`, or `None` if `data` is too short for a header, or
+    /// the declared length is implausible: shorter than the common header, not a multiple of 8
+    /// (NTFS pads every attribute to 8 bytes), or longer than `data`.
     pub(crate) fn new(data: &'a [u8]) -> Option<Self> {
         if data.len() < size_of::<NtfsAttributeHeader>() {
             return None;
@@ -73,7 +72,7 @@ impl<'a> NtfsAttribute<'a> {
         &self.data[..self.length]
     }
 
-    /// `None` for a type this crate doesn't know.
+    /// `None` for a type this crate does not know.
     pub fn attribute_type(&self) -> Option<NtfsAttributeType> {
         self.header.type_id.try_into().ok()
     }
@@ -84,12 +83,11 @@ impl<'a> NtfsAttribute<'a> {
         self.header.is_non_resident == 0
     }
 
-    /// The attribute's own name, e.g. the stream name of a named `$DATA`
-    /// attribute. `None` when unnamed or when the name lies outside the attribute.
+    /// The attribute's own name, e.g. the stream name of a named `$DATA` attribute. `None` when
+    /// unnamed or when the name lies outside the attribute.
     ///
-    /// Lossless, like [`NtfsFileName::to_os_string`]: the name is UTF-16 with
-    /// no guarantee of being valid, so it is an `OsString` and can be used to
-    /// open `path:stream` again.
+    /// Lossless, like [`NtfsFileName::to_os_string`]: the name is UTF-16 with no validity
+    /// guarantee, so it is an `OsString`, usable to open `path:stream` again.
     pub fn name(&self) -> Option<OsString> {
         let length = self.header.name_length as usize;
         if length == 0 {
@@ -107,9 +105,9 @@ impl<'a> NtfsAttribute<'a> {
         Some(utf16_to_os_string(&units))
     }
 
-    /// Logical size of the attribute's value: the resident length, or the
-    /// `data_size` of a non-resident one. `None` for the later extents of a
-    /// value split across records, which don't carry the size.
+    /// Logical size of the attribute's value: the resident length, or the `data_size` of a
+    /// non-resident one. `None` for the later extents of a value split across records, which do
+    /// not carry the size.
     pub fn value_size(&self) -> Option<u64> {
         match self.nonresident_header() {
             Some(header) => (header.lowest_vcn == 0).then_some(header.data_size),
@@ -216,12 +214,11 @@ impl<'a> NtfsAttribute<'a> {
         self.resident()
     }
 
-    /// Decodes one non-resident extent's data runs, without checking them
-    /// against `data_size`: a later extent of a value split across
-    /// extension records carries `data_size == 0` on disk, so only the
-    /// VCN-0 extent's `data_size` means anything. Callers reading a single,
-    /// self-contained attribute should use [`Self::nonresident_data_runs`]
-    /// instead, which does that check.
+    /// Decodes one non-resident extent's data runs without checking them against `data_size`: a
+    /// later extent of a value split across extension records carries `data_size == 0` on disk,
+    /// so only the VCN-0 extent's `data_size` means anything. Callers reading a single,
+    /// self-contained attribute should use [`Self::nonresident_data_runs`] instead, which does
+    /// that check.
     pub(crate) fn nonresident_extent_runs(
         &self,
         volume: &Volume,
@@ -359,11 +356,10 @@ impl<'a> NtfsAttribute<'a> {
         Ok(out)
     }
 
-    /// Decodes a single, self-contained non-resident attribute's data runs
-    /// and checks them against its own `data_size`. A value split across
-    /// extension records needs the crate's own internal extension-record
-    /// walk instead, which concatenates every extent before checking the
-    /// total.
+    /// Decodes a single, self-contained non-resident attribute's data runs and checks them
+    /// against its own `data_size`. A value split across extension records needs the crate's
+    /// internal extension-record walk instead, which concatenates every extent before checking
+    /// the total.
     pub(crate) fn nonresident_data_runs(
         &self,
         volume: &Volume,
@@ -408,43 +404,5 @@ impl<'a> NtfsAttribute<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 64 bytes holding a `$DATA` attribute header that claims `length`.
-    fn attribute_claiming(length: u32) -> Vec<u8> {
-        let mut bytes = vec![0u8; 64];
-        bytes[0..4].copy_from_slice(&(NtfsAttributeType::Data as u32).to_le_bytes());
-        bytes[4..8].copy_from_slice(&length.to_le_bytes());
-        bytes
-    }
-
-    // NTFS pads every attribute to 8 bytes and the common header alone is 16.
-    // A length outside that (or past the bytes given) is corrupt, not an
-    // attribute to step over a few bytes at a time.
-    #[test]
-    fn an_attribute_needs_a_plausible_length() {
-        let cases = [
-            (0, false),
-            (1, false),
-            (4, false),
-            (8, false),
-            (12, false),
-            (16, true),
-            (20, false),
-            (24, true),
-            (64, true),
-            (72, false),
-            (u32::MAX, false),
-        ];
-        for (length, plausible) in cases {
-            let bytes = attribute_claiming(length);
-            assert_eq!(
-                NtfsAttribute::new(&bytes).is_some(),
-                plausible,
-                "length {length}"
-            );
-        }
-        assert!(NtfsAttribute::new(&attribute_claiming(16)[..15]).is_none());
-    }
-}
+#[path = "tests/attribute.rs"]
+mod tests;

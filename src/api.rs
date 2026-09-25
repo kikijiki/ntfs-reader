@@ -3,8 +3,8 @@
 // See the LICENSE files in the project root for details.
 
 //! NTFS types the crate hands out: names, attribute types, the standard
-//! information attribute, and file ids. The raw on-disk layouts stay
-//! private to the crate.
+//! information attribute, and file ids. Raw on-disk layouts stay private to
+//! the crate.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -12,8 +12,14 @@ use std::fmt;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 pub(crate) const SECTOR_SIZE: usize = 512;
-pub(crate) const ROOT_RECORD: u64 = 5;
-pub(crate) const FIRST_NORMAL_RECORD: u64 = 24;
+/// The record number of the root directory. Fixed by the NTFS format, so
+/// [`NtfsFileName::parent_number`] equal to it means the file is in the root.
+pub const ROOT_RECORD: u64 = 5;
+/// The first record number NTFS hands to ordinary files and directories.
+/// Records below it (0 to 23) are the reserved metadata files (`$MFT`,
+/// `$LogFile`, `$Volume`, the root directory, ...); [`crate::Mft::files`]
+/// starts here.
+pub const FIRST_NORMAL_RECORD: u64 = 24;
 pub(crate) const FILE_RECORD_SIGNATURE: &[u8; 4] = b"FILE";
 pub(crate) const EPOCH_DIFFERENCE: u64 = 116_444_736_000_000_000;
 
@@ -90,14 +96,14 @@ pub(crate) struct NtfsNonResidentAttributeHeader {
 }
 
 /// The `$STANDARD_INFORMATION` attribute of a file: its four timestamps and
-/// its Win32 attribute flags. Get one from
+/// Win32 attribute flags. Get one from
 /// [`NtfsFile::standard_information`](crate::NtfsFile::standard_information).
 ///
 /// The timestamps are Windows FILETIMEs on disk (100 ns ticks since
-/// 1601-01-01 UTC). The accessors convert them to [`OffsetDateTime`] exactly:
-/// a time before 1970 is a real, earlier date, and a value beyond the latest
-/// time `OffsetDateTime` can represent (the year 9999 unless the `time` crate's
-/// `large-dates` feature is enabled) is clamped to that latest time.
+/// 1601-01-01 UTC), converted exactly: a time before 1970 is a real,
+/// earlier date; one beyond the latest `OffsetDateTime` can represent
+/// (year 9999, unless `time`'s `large-dates` feature is enabled) is clamped
+/// to that latest time.
 #[repr(C, packed)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NtfsStandardInformation {
@@ -119,22 +125,23 @@ impl NtfsStandardInformation {
         ntfs_to_unix_time(self.modification_time)
     }
 
-    /// When the file's MFT record was last changed (attributes, names and so
-    /// on, not only the data).
+    /// When the file's MFT record was last changed (attributes, names, not
+    /// only data).
     pub fn mft_modified(&self) -> OffsetDateTime {
         ntfs_to_unix_time(self.mft_record_modification_time)
     }
 
     /// When the file was last read. NTFS can update this lazily, and Windows
-    /// can turn the update off altogether.
+    /// can turn the update off entirely.
     pub fn accessed(&self) -> OffsetDateTime {
         ntfs_to_unix_time(self.access_time)
     }
 
-    /// The raw Windows `FILE_ATTRIBUTE_*` flags, as stored on disk in `$STANDARD_INFORMATION`.
-    /// For a file behind a filter driver they can differ from what Win32 reports: the WOF
-    /// (Windows Overlay Filter) hides `SPARSE_FILE` and `REPARSE_POINT` on a file it compressed,
-    /// while the record still carries both.
+    /// The raw Windows `FILE_ATTRIBUTE_*` flags, as stored on disk. Can
+    /// differ from what Win32 reports for a file behind a filter driver:
+    /// the WOF (Windows Overlay Filter) hides `SPARSE_FILE` and
+    /// `REPARSE_POINT` on a file it compressed, while the record still
+    /// carries both.
     pub fn file_attributes(&self) -> u32 {
         self.file_attributes
     }
@@ -156,9 +163,8 @@ impl fmt::Debug for NtfsStandardInformation {
 }
 
 /// Namespace of a `$FILE_NAME` attribute. A non-8.3 long name gets a `Win32`
-/// entry plus a separate `Dos` entry for the generated short name;
-/// `Win32AndDos` means one entry covers both. `Posix`/`Win32` otherwise mark
-/// a real hard link.
+/// entry plus a separate `Dos` entry for its short name; `Win32AndDos` means
+/// one entry covers both. `Posix`/`Win32` otherwise mark a real hard link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NtfsFileNamespace {
@@ -213,15 +219,14 @@ pub(crate) enum NtfsFileNameFlags {
     ReparsePoint = 0x0400,
 }
 
-/// One `$FILE_NAME` attribute: a name of a file in a directory, plus a copy of
-/// some of the file's metadata as it was when the name was last updated. A
-/// file has one per hard link, plus one for a DOS 8.3 short name if it has
-/// one.
+/// One `$FILE_NAME` attribute: a name of a file in a directory, plus a copy
+/// of some of the file's metadata as of the last update to the name. A file
+/// has one per hard link, plus one for a DOS 8.3 short name if it has one.
 ///
 /// Get them from [`NtfsFile::names`](crate::NtfsFile::names) or
-/// [`NtfsFile::hard_links`](crate::NtfsFile::hard_links). The name
-/// itself is [`Self::to_os_string`] (lossless) or [`Display`](fmt::Display)
-/// (best effort).
+/// [`NtfsFile::hard_links`](crate::NtfsFile::hard_links). The name itself is
+/// [`Self::to_os_string`] (lossless) or [`Display`](fmt::Display) (best
+/// effort).
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct NtfsFileName {
@@ -230,10 +235,10 @@ pub struct NtfsFileName {
 }
 
 /// The name as a `String`, best effort only. A Windows file name is a raw
-/// UTF-16 code unit sequence with no requirement that it be valid UTF-16 (the
-/// filesystem accepts an unpaired surrogate), and a `str` cannot hold one, so
-/// each such unit becomes U+FFFD. Use [`NtfsFileName::to_os_string`] for
-/// anything that has to name the actual file again.
+/// UTF-16 code unit sequence with no requirement that it be valid UTF-16
+/// (the filesystem accepts an unpaired surrogate), and a `str` cannot hold
+/// one, so each such unit becomes U+FFFD. Use [`NtfsFileName::to_os_string`]
+/// to name the actual file again.
 impl fmt::Display for NtfsFileName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let data = self.data;
@@ -243,7 +248,7 @@ impl fmt::Display for NtfsFileName {
 }
 
 /// Lossless `[u16] -> OsString`, unlike `String::from_utf16_lossy` (which
-/// cannot represent an unpaired surrogate at all and substitutes U+FFFD).
+/// cannot represent an unpaired surrogate and substitutes U+FFFD instead).
 #[cfg(windows)]
 pub(crate) fn utf16_to_os_string(units: &[u16]) -> OsString {
     use std::os::windows::ffi::OsStringExt;
@@ -251,12 +256,12 @@ pub(crate) fn utf16_to_os_string(units: &[u16]) -> OsString {
 }
 
 /// Only reachable off Windows, where the `internals` feature builds this
-/// module for Unix-side unit tests (synthetic input, never a real file). There is no portable "arbitrary UTF-16 to `OsString`"
-/// constructor, so this encodes WTF-8, the encoding a Windows `OsString` uses
-/// internally: ordinary UTF-8 for every scalar value, and the 3-byte form of
-/// the code point for an unpaired surrogate (which UTF-8 forbids). A Unix
-/// `OsString` may hold any bytes, so the result is a valid `OsString` there.
-/// The unit tests check the exact bytes.
+/// module for Unix-side unit tests (synthetic input, never a real file). No
+/// portable "arbitrary UTF-16 to `OsString`" constructor exists, so this
+/// encodes WTF-8, what a Windows `OsString` uses internally: ordinary UTF-8
+/// per scalar value, and the 3-byte form of the code point for an unpaired
+/// surrogate (which UTF-8 forbids). A Unix `OsString` can hold any bytes, so
+/// the result is valid there; unit tests check the exact bytes.
 #[cfg(unix)]
 pub(crate) fn utf16_to_os_string(units: &[u16]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
@@ -279,8 +284,8 @@ pub(crate) fn utf16_to_os_string(units: &[u16]) -> OsString {
     OsString::from_vec(bytes)
 }
 
-/// Neither Windows nor Unix: not a target the crate is used on. Lossy, so it
-/// compiles.
+/// Neither Windows nor Unix: not a target the crate is used on. Lossy, only
+/// to compile.
 #[cfg(not(any(windows, unix)))]
 pub(crate) fn utf16_to_os_string(units: &[u16]) -> OsString {
     String::from_utf16_lossy(units).into()
@@ -315,20 +320,42 @@ impl NtfsFileName {
     }
 
     /// The parent directory's record number, without its sequence number.
-    /// A record number alone is not enough to tell whether the parent
-    /// record has since been freed and reused; use
-    /// [`Self::parent_reference`] to check that.
+    /// A record number alone cannot tell whether the parent was since freed
+    /// and reused; use [`Self::parent_reference`] to check that.
     pub fn parent_number(&self) -> u64 {
         self.header.parent_directory_reference & 0x0000_FFFF_FFFF_FFFF
     }
 
-    /// The parent directory reference as stored, including its sequence
-    /// number. Compare against a live record's
-    /// [`reference`](crate::NtfsFile::reference) to
-    /// detect a stale reference (the record number reused by an unrelated
-    /// file after the original parent was freed).
+    /// The parent directory as the id it has while live, the one a journal
+    /// record carries and [`NtfsFile::file_id`](crate::NtfsFile::file_id)
+    /// gives, live or deleted: `name.parent_id() == directory.file_id()`
+    /// finds the names in a directory whatever its state. Same value as
+    /// [`Self::parent_reference`], typed as an id.
+    pub fn parent_id(&self) -> FileId {
+        FileId::from(self.parent_reference())
+    }
+
+    /// The parent directory reference as stored, sequence number included,
+    /// the sequence the directory had while live. Equals a live directory's
+    /// [`reference`](crate::NtfsFile::reference) (how to detect a stale
+    /// reference: the record number reused by an unrelated file after the
+    /// parent was freed), but **not** the `reference()` of a freed
+    /// directory, whose sequence is one higher. Compare [`Self::parent_id`]
+    /// with [`NtfsFile::file_id`](crate::NtfsFile::file_id) instead, which
+    /// holds for both.
     pub fn parent_reference(&self) -> u64 {
         self.header.parent_directory_reference
+    }
+
+    /// Whether this name is directly in the volume's root directory: its
+    /// parent is record [`ROOT_RECORD`]. A name is one hard link, so a file
+    /// with several links can be in the root under only one. The root is
+    /// never freed, so this also holds for a deleted file's names. Only the
+    /// record number is compared, not the sequence in
+    /// [`Self::parent_reference`]; [`crate::Mft::resolve_path`] checks that
+    /// too.
+    pub fn is_in_root(&self) -> bool {
+        self.parent_number() == ROOT_RECORD
     }
 
     /// Whether the read-only flag was set when this name was last updated.
@@ -346,8 +373,8 @@ impl NtfsFileName {
         self.header.file_attributes & NtfsFileNameFlags::System as u32 != 0
     }
 
-    /// Whether the reparse point flag was set when this name was last updated
-    /// (a junction, a symbolic link, a cloud placeholder and so on).
+    /// Whether the reparse point flag was set when this name was last
+    /// updated (a junction, a symbolic link, a cloud placeholder, etc.).
     pub fn is_reparse_point(&self) -> bool {
         self.header.file_attributes & NtfsFileNameFlags::ReparsePoint as u32 != 0
     }
@@ -389,7 +416,8 @@ pub enum NtfsAttributeType {
     FileName = 0x30,
     /// `$OBJECT_ID`: the file's object id.
     ObjectId = 0x40,
-    /// `$SECURITY_DESCRIPTOR`: the file's security descriptor (old volumes; newer ones use `$Secure`).
+    /// `$SECURITY_DESCRIPTOR`: the file's security descriptor (old volumes;
+    /// newer ones use `$Secure`).
     SecurityDescriptor = 0x50,
     /// `$VOLUME_NAME`: the volume label (`$Volume` only).
     VolumeName = 0x60,
@@ -441,14 +469,16 @@ impl TryFrom<u32> for NtfsAttributeType {
     }
 }
 
-/// The identity of a file on a volume, as the MFT and the USN journal report it.
+/// The identity of a file on a volume, as the MFT and the USN journal
+/// report it.
 ///
-/// It is 128 bits wide so one type covers every form. On NTFS the id is the 64-bit *file
-/// reference* (the record number in the low 48 bits, the record's sequence number in the 16 above
-/// them, so a reused record number gets a different id) zero-extended to 128 bits. A V2 journal
-/// record carries the 64-bit reference, a V3 record carries the 128-bit form, and
-/// [`NtfsFile::file_id`](crate::NtfsFile::file_id) builds it from the MFT, so the same file
-/// compares equal whichever way it was read.
+/// 128 bits wide so one type covers every form. On NTFS the id is the
+/// 64-bit *file reference* (record number in the low 48 bits, sequence
+/// number in the 16 above, so a reused record number gets a different id)
+/// zero-extended to 128 bits. A V2 journal record carries the 64-bit form,
+/// a V3 record the 128-bit form, and
+/// [`NtfsFile::file_id`](crate::NtfsFile::file_id) builds it from the MFT,
+/// so the same file compares equal however read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(u128);
 
@@ -458,14 +488,14 @@ impl FileId {
         self.0
     }
 
-    /// The 64-bit file reference (`sequence << 48 | record number`), or `None` if the id does not
-    /// fit in 64 bits, which is never the case for an NTFS file.
+    /// The 64-bit file reference (`sequence << 48 | record number`), or
+    /// `None` if it does not fit in 64 bits, never the case for NTFS.
     pub fn as_reference(self) -> Option<u64> {
         u64::try_from(self.0).ok()
     }
 
-    /// From the `FILE_ID_128` bytes of a V3 journal record. Windows lays the 128-bit value out
-    /// little-endian.
+    /// From the `FILE_ID_128` bytes of a V3 journal record. Windows lays the
+    /// 128-bit value out little-endian.
     pub(crate) fn from_le_bytes(bytes: [u8; 16]) -> Self {
         FileId(u128::from_le_bytes(bytes))
     }
@@ -484,12 +514,12 @@ impl From<u128> for FileId {
     }
 }
 
-/// Converts a FILETIME (100 ns ticks since 1601-01-01 UTC) to a UTC date and
-/// time, exactly: a time before 1970 is the real, earlier date. A value
-/// outside what `OffsetDateTime` can represent is clamped to its latest (or
-/// earliest) time. The latest is the year 9999 unless the `time` crate's
-/// `large-dates` feature is enabled, so `u64::MAX` (year 60056) clamps; the
-/// earliest is never reached, since FILETIME 0 (1601) is in range.
+/// Converts a FILETIME (100 ns ticks since 1601-01-01 UTC) to UTC, exactly:
+/// a time before 1970 is the real, earlier date. A value outside what
+/// `OffsetDateTime` can represent clamps to its latest or earliest time.
+/// The latest is year 9999 unless `time`'s `large-dates` feature is
+/// enabled, so `u64::MAX` (year 60056) clamps; the earliest is never
+/// reached, since FILETIME 0 (1601) is in range.
 pub(crate) fn ntfs_to_unix_time(ticks: u64) -> OffsetDateTime {
     let nanos = (ticks as i128 - EPOCH_DIFFERENCE as i128) * 100;
     OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap_or_else(|_| {
@@ -502,94 +532,5 @@ pub(crate) fn ntfs_to_unix_time(ticks: u64) -> OffsetDateTime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// FILETIME ticks (100 ns) per second.
-    const TICKS_PER_SECOND: u64 = 10_000_000;
-
-    fn unix_nanos(time: OffsetDateTime) -> i128 {
-        time.unix_timestamp_nanos()
-    }
-
-    // Each row: a FILETIME and the Unix time in nanoseconds it stands for,
-    // worked out by hand from 1601-01-01 = -11_644_473_600 s.
-    #[test]
-    fn ntfs_to_unix_time_is_exact() {
-        const EPOCH_1601_NANOS: i128 = -11_644_473_600 * 1_000_000_000;
-        let cases: [(&str, u64, i128); 5] = [
-            ("FILETIME 0 is 1601-01-01", 0, EPOCH_1601_NANOS),
-            ("one tick before the Unix epoch", EPOCH_DIFFERENCE - 1, -100),
-            ("the Unix epoch", EPOCH_DIFFERENCE, 0),
-            (
-                // 1960-01-01T00:00:00Z is 315_619_200 s before the epoch.
-                "a 1960 time",
-                EPOCH_DIFFERENCE - 315_619_200 * TICKS_PER_SECOND,
-                -315_619_200 * 1_000_000_000,
-            ),
-            (
-                "a time after the epoch, with a sub-second part",
-                EPOCH_DIFFERENCE + 1_700_000_000 * TICKS_PER_SECOND + 1_234_567,
-                1_700_000_000 * 1_000_000_000 + 123_456_700,
-            ),
-        ];
-        for (what, ticks, expected) in cases {
-            assert_eq!(
-                unix_nanos(ntfs_to_unix_time(ticks)),
-                expected,
-                "{what} ({ticks})"
-            );
-        }
-    }
-
-    #[test]
-    fn ntfs_to_unix_time_clamps_to_the_range_of_offset_date_time() {
-        let latest = PrimitiveDateTime::MAX.assume_utc();
-        // The last tick that fits, and the first that does not.
-        let last_tick = (unix_nanos(latest) / 100 + EPOCH_DIFFERENCE as i128) as u64;
-        assert_eq!(
-            unix_nanos(ntfs_to_unix_time(last_tick)),
-            unix_nanos(latest) / 100 * 100,
-            "the last representable tick is exact"
-        );
-        assert_eq!(
-            ntfs_to_unix_time(last_tick + 1),
-            latest,
-            "the first tick beyond the range clamps to the latest time, not the epoch"
-        );
-        assert!(
-            ntfs_to_unix_time(u64::MAX).year() >= 9999,
-            "u64::MAX must not fall back to the epoch"
-        );
-    }
-
-    // (code units, the WTF-8 bytes of the same text). Checked byte for byte,
-    // so the encoder is not compared against itself.
-    #[cfg(unix)]
-    const NAMES: &[(&[u16], &[u8])] = &[
-        (&[], b""),
-        (&[0x61, 0x62, 0x63], b"abc"),
-        (&[0x00E9], &[0xC3, 0xA9]),
-        (&[0x20AC], &[0xE2, 0x82, 0xAC]),
-        (&[0xD83D, 0xDE00], &[0xF0, 0x9F, 0x98, 0x80]),
-        (&[0xD800], &[0xED, 0xA0, 0x80]),
-        (&[0xDBFF, 0x41], &[0xED, 0xAF, 0xBF, 0x41]),
-        (&[0xDC00], &[0xED, 0xB0, 0x80]),
-        (&[0xDFFF], &[0xED, 0xBF, 0xBF]),
-        // A low surrogate followed by a high one is not a pair.
-        (&[0xDC00, 0xD800], &[0xED, 0xB0, 0x80, 0xED, 0xA0, 0x80]),
-        (&[0x61, 0xD800, 0x62], &[0x61, 0xED, 0xA0, 0x80, 0x62]),
-    ];
-
-    #[cfg(unix)]
-    #[test]
-    fn utf16_to_os_string_encodes_wtf8() {
-        for (units, bytes) in NAMES {
-            assert_eq!(
-                utf16_to_os_string(units).as_encoded_bytes(),
-                *bytes,
-                "{units:04x?}"
-            );
-        }
-    }
-}
+#[path = "tests/api.rs"]
+mod tests;

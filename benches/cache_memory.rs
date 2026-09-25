@@ -1,12 +1,11 @@
 //! Heap held by the loaded `Mft` and by a `DefaultPathCache` after resolving paths, measured with
-//! a counting allocator, plus one wall-clock pass of `Mft::new` and of a full scan, so a run on a
-//! big volume (the stress volume, see CONTRIBUTING.md) shows the per-file costs. Prints Markdown
-//! tables. Statistical timing is in `mft_benchmark`.
-//! Needs an elevated shell; the volume comes from `test_volume_letter()`.
+//! a counting allocator. Also one wall-clock pass of `Mft::new` and of a full scan, for per-file
+//! costs on a big volume (the stress volume, see CONTRIBUTING.md). Prints Markdown tables.
+//! Statistical timing is in `mft_benchmark`. Needs an elevated shell; volume from
+//! `test_volume_letter()`.
 //!
-//! Volume-backed, so Windows-only regardless of the `internals` feature
-//! (see `mft_benchmark.rs`'s top comment for why): every item below is
-//! `#[cfg(windows)]`, with a `#[cfg(not(windows))]` `main` that just says so.
+//! Windows-only regardless of the `internals` feature (see `mft_benchmark.rs`'s top comment):
+//! every item below is `#[cfg(windows)]`, with a `#[cfg(not(windows))]` `main` stub.
 
 #[cfg(windows)]
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -73,7 +72,7 @@ fn measure(mft: &Mft, scenario: &str, numbers: &[u64]) {
     );
 }
 
-/// One pass over every file, with `cache`: the time it took.
+/// One pass over every file with `cache`. Returns the elapsed time.
 #[cfg(windows)]
 fn full_scan(mft: &Mft, cache: &mut impl PathCache) -> Duration {
     let start = Instant::now();

@@ -1,9 +1,8 @@
 #![cfg(target_os = "windows")]
 
-// Card 013. A fresh reparse point's $FILE_NAME may not carry the reparse flag yet, and a
-// rename or move may refresh it. Whichever way the flag ends up, a junction, a file symlink
-// and a directory symlink must keep a best_name and a path that resolves to where the item
-// finally lives after being renamed and then moved to another directory.
+// A fresh reparse point's $FILE_NAME may not carry the reparse flag yet; a rename or move may
+// refresh it. Either way, a junction, file symlink, and directory symlink must keep a best_name
+// and a path that resolves to where the item ends up after a rename and then a move.
 
 use std::fs;
 use std::path::{Path, PathBuf};

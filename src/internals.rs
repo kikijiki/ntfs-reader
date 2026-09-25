@@ -2,15 +2,17 @@
 // This project is dual licensed under the Apache License 2.0 and the MIT license.
 // See the LICENSE files in the project root for details.
 
-//! Low-level entry points for the synthetic benches (`benches/*_synthetic.rs`)
-//! and the integration tests, which drive the byte-slice parsing. Only built
-//! with the `internals` feature and hidden from the documentation: none of
-//! this is part of the crate's API, and it can change or disappear in any
-//! release.
+//! Low-level entry points for the synthetic benches (`benches/*_synthetic.rs`) and the
+//! integration tests, which drive the byte-slice parsing directly. Built only with the
+//! `internals` feature and hidden from the docs: not part of the crate's API, and it can change
+//! or disappear in any release.
+
+use std::ffi::OsStr;
+use std::io::{Read, Seek};
 
 use crate::{
-    attribute::NtfsAttribute, errors::NtfsReaderResult, file::Record, usn::UsnRecord,
-    volume::Volume,
+    attribute::NtfsAttribute, bitmap::ClusterBitmap, errors::NtfsReaderResult, file::NtfsFile,
+    file::Record, usn::UsnRecord, volume::Volume,
 };
 
 pub use crate::data_run::DataRun;
@@ -28,9 +30,9 @@ pub fn parse_usn_records_bench(
     crate::usn::parse_usn_records(&buffer[..end])
 }
 
-/// The attributes stored in `data`, one whole MFT record, or `None` if `data`
-/// is not a valid record (see `Record::new`). `NtfsFile` needs an `Mft`, so this
-/// is the record-only walk (`NtfsFile::record_attributes`) without one.
+/// The attributes stored in `data`, one whole MFT record, or `None` if `data` is not a valid
+/// record (see `Record::new`). `NtfsFile` needs an `Mft`, so this is the record-only walk
+/// (`NtfsFile::record_attributes`) without one.
 pub fn record_attributes(data: &[u8]) -> Option<impl Iterator<Item = NtfsAttribute<'_>>> {
     Some(Record::new(0, data)?.attributes())
 }
@@ -42,4 +44,25 @@ pub fn nonresident_data_runs(
     volume: &Volume,
 ) -> NtfsReaderResult<(u64, Vec<DataRun>)> {
     attribute.nonresident_data_runs(volume)
+}
+
+/// The bitmap of `volume` from the `size` bytes of a `$Bitmap` stream behind `reader`: what
+/// `ClusterBitmap::new` does after it has opened record 6, for `benches/deleted_synthetic.rs`.
+pub fn cluster_bitmap(
+    volume: &Volume,
+    size: u64,
+    reader: impl Read,
+) -> NtfsReaderResult<ClusterBitmap> {
+    ClusterBitmap::read(volume, size, reader)
+}
+
+/// The stream `name` of `file` read from `volume` (any `Read + Seek`, in place of the raw volume
+/// handle `NtfsFile::open_stream` opens), so a bench can time the reading and count what it asks
+/// of the volume.
+pub fn open_stream_over<R: Read + Seek>(
+    file: &NtfsFile<'_>,
+    name: Option<&OsStr>,
+    volume: R,
+) -> NtfsReaderResult<impl Read + Seek> {
+    crate::stream::open(file, name, volume)
 }

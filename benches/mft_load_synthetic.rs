@@ -1,21 +1,18 @@
-//! Timing of `Mft::from_parts` (per-record fixups, then indexing extension
-//! records): the step `Mft::new` runs after reading a volume's `$MFT` into
-//! memory. Card 008 made this step about 25x faster and no benchmark caught
-//! it either way; this is the one that would have. Synthetic input, so it
-//! runs without a volume. See `mft_benchmark` for end-to-end, volume-backed
-//! numbers (I/O included).
+//! Timing of `Mft::from_parts` (per-record fixups, then indexing extension records), the step
+//! `Mft::new` runs after reading a volume's `$MFT` into memory. A change that once made this step
+//! about 25x faster went unmeasured; this bench would have caught it. Synthetic input runs
+//! without a volume; see `mft_benchmark` for end-to-end, volume-backed numbers (I/O included).
 //!
-//! `flat`: no file has an extension record. `with_extensions`: every file's
-//! `$DATA` lives in a second, extension record, so `index_extension_records`
-//! also has real work to do (see docs/architecture.md's "central rule": a
-//! file's attributes can spill into extension records).
+//! `flat`: no extension records. `with_extensions`: every file's `$DATA` lives in an extension
+//! record, giving the loader's extension-record index real work. `with_freed`: like
+//! `with_extensions`, with every fourth file deleted (base and extension record freed), so the
+//! loader also sees freed records.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use std::hint::black_box;
 
-#[path = "support/mod.rs"]
 mod support;
-use support::dataset_raw_parts;
+use support::{dataset_raw_parts, dataset_raw_parts_freed};
 
 use ntfs_reader::internals::test_records::build_from_parts;
 
@@ -43,6 +40,19 @@ fn bench_from_parts(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("with_extensions", count),
             &split,
+            |b, (volume, data, bitmap)| {
+                b.iter_batched(
+                    || (volume.clone(), data.clone(), bitmap.clone()),
+                    |(volume, data, bitmap)| black_box(build_from_parts(volume, data, bitmap)),
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        let freed = dataset_raw_parts_freed(count, 4);
+        group.bench_with_input(
+            BenchmarkId::new("with_freed", count),
+            &freed,
             |b, (volume, data, bitmap)| {
                 b.iter_batched(
                     || (volume.clone(), data.clone(), bitmap.clone()),

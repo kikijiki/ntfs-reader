@@ -16,8 +16,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 use windows::Win32::System::IO::DeviceIoControl;
 
-// One load of the real `$MFT`: it has records, record 0 is there, and nothing from `record_count`
-// on (including the largest number) exists.
+// The real `$MFT` has records, record 0 exists, and nothing at or past `record_count` does.
 #[test]
 fn a_loaded_mft_has_records_and_stops_at_record_count() -> NtfsReaderResult<()> {
     let vol = Volume::new(format!("\\\\.\\{}:", test_volume_letter()))?;
@@ -137,9 +136,8 @@ fn files_discovers_temp_artifacts() -> NtfsReaderResult<()> {
                         !data_att.is_resident(),
                         "sparse file data attribute should be non-resident"
                     );
-                    // Nothing on the volume can tell a sparse extent from a
-                    // dense one but the runs themselves, which only the
-                    // `internals` feature exposes.
+                    // Only the data runs (the `internals` feature) distinguish a sparse extent
+                    // from a dense one.
                     #[cfg(feature = "internals")]
                     {
                         use ntfs_reader::internals::{nonresident_data_runs, DataRun};
@@ -201,8 +199,7 @@ fn hard_links_and_alternate_streams() -> NtfsReaderResult<()> {
     let mft = Mft::new(vol)?;
 
     let mut cache = DefaultPathCache::new();
-    // Card 016: match on hard_links() rather than best_name(), which
-    // depends on $FILE_NAME order and is not guaranteed.
+    // best_name() depends on unguaranteed $FILE_NAME order; match hard_links() instead.
     let file = mft
         .files()
         .find(|file| {
@@ -241,9 +238,8 @@ fn hard_links_and_alternate_streams() -> NtfsReaderResult<()> {
     Ok(())
 }
 
-// Card 013. Names whose $FILE_NAME carries the reparse-point flag (a
-// junction, a file symlink, a directory symlink) must still get a best_name
-// and a resolvable path.
+// A junction, file symlink, or dir symlink, whose $FILE_NAME carries the reparse flag, must
+// still get a best_name and a resolvable path.
 #[test]
 fn reparse_points_get_names_and_paths() -> NtfsReaderResult<()> {
     let dir_name = "mft-reparse".to_string();

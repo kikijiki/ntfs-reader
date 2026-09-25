@@ -1,7 +1,6 @@
 use ntfs_reader::{DefaultPathCache, Mft, Volume};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open the C: volume
     let volume = Volume::new("\\\\.\\C:")?;
     let mft = Mft::new(volume)?;
     let mut cache = DefaultPathCache::new();

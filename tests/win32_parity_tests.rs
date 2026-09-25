@@ -1,6 +1,6 @@
 #![cfg(target_os = "windows")]
 
-//! Compares the crate with Win32 on a whole volume. `#[ignore]`d: it reads every file of the
+//! Compares the crate with Win32 across a whole volume. `#[ignore]`d: it reads every file on the
 //! volume named by `NTFS_READER_PARITY_VOLUME` (a drive letter; the system drive needs
 //! `NTFS_READER_ALLOW_SYSTEM_DRIVE=1`), so it runs only on request:
 //!
@@ -9,28 +9,27 @@
 //! cargo test --features internals --test win32_parity_tests -- --ignored --nocapture
 //! ```
 //!
-//! For every in-use file record (base records 24 and up) it checks, against what Win32 says about
+//! For every in-use file record (base records 24 and up), checks against what Win32 says about
 //! the same file:
 //!
-//! - `links`: `hard_links()` resolved to paths, as a set, against `FindFirstFileNameW` (a directory
-//!   against its own path: it has one name);
+//! - `links`: `hard_links()` resolved to paths, as a set, against `FindFirstFileNameW` (a
+//!   directory has one name, its own path);
 //! - `streams`: `data_streams()` names and sizes against `FindFirstStreamW` (the WOF stream
-//!   `WofCompressedData` is hidden from Win32, so it is left out of ours);
+//!   `WofCompressedData` is hidden from Win32, so left out of ours too);
 //! - `path`: `FileInfo.path` reopens a file with the same file id as `NtfsFile::file_id()`;
-//! - `is_directory`, `size`, `attributes`, `created`, `accessed`, `modified`, `mft_modified`, each its own
-//!   line: the crate against `GetFileInformationByHandleEx`. A directory's size is compared with 0
-//!   (the crate reports the unnamed `$DATA` size, which a directory does not have; Win32's
-//!   `EndOfFile` is its index size). Bits 0x200 and 0x400 of a WOF-compressed file (one with a
-//!   `WofCompressedData` stream) are not compared: the filter hides them from Win32.
-//!   Files under `\$Extend` are left out of these (NTFS changes them live) and counted as not compared;
+//! - `is_directory`, `size`, `attributes`, `created`, `accessed`, `modified`, `mft_modified`, each
+//!   its own line: the crate against `GetFileInformationByHandleEx`. A directory's size compares
+//!   against 0 (the crate reports the unnamed `$DATA` size, which a directory lacks; Win32's
+//!   `EndOfFile` is its index size instead). Bits 0x200 and 0x400 of a WOF-compressed file are
+//!   skipped (the filter hides them from Win32), as are files under `\$Extend` (NTFS changes them
+//!   live);
 //! - `children`: for every directory, the names ours attributes to it against a Win32 listing.
 //!
-//! A file whose change time falls between the MFT load and its own check is skipped (it may have
-//! changed after the snapshot). Win32 refusing to open or list something is counted, not a
-//! mismatch, unless it happens for more than 5% of the files. Everything else that differs is a
-//! mismatch and fails the test; the first ones are printed per check.
+//! A file changed between the MFT load and its own check is skipped. Win32 refusing to open or
+//! list something counts as skipped, not a mismatch, unless it happens for over 5% of the files.
+//! Everything else that differs is a mismatch and fails the test; the first ones print per check.
 //!
-//! `NTFS_READER_PARITY_STRIDE=n` checks every n-th file only (default 1, all of them).
+//! `NTFS_READER_PARITY_STRIDE=n` checks only every n-th file (default 1, all of them).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -47,9 +46,8 @@ use common::{flush_volume, parity_volume_letter};
 
 type Wide = Vec<u16>;
 
-/// Attribute bits that are not compared: `DIRECTORY` and `NORMAL` are synthesised by Win32 (the
-/// directory flag is checked on its own), and NTFS keeps the two index flags in the record but
-/// Win32 does not return them.
+/// Attribute bits skipped: `DIRECTORY` and `NORMAL` are synthesised by Win32 (the directory flag
+/// is checked on its own), and Win32 does not return the two index flags NTFS keeps in the record.
 const IGNORED_ATTRIBUTES: u32 = 0x10 | 0x80 | 0x1000_0000 | 0x2000_0000;
 /// FILETIME ticks (100 ns) between 1601-01-01 and 1970-01-01.
 const EPOCH_DIFFERENCE: i128 = 116_444_736_000_000_000;
@@ -541,8 +539,8 @@ fn check_file(context: &Context, file: &NtfsFile, cache: &mut DefaultPathCache, 
     // metadata
     if is_live_metadata_file(&relative) {
         // NTFS keeps changing these while the volume is mounted (transaction log, deleted-file
-        // tracking), so the on-disk record and what Win32 reports differ in times and in
-        // attribute bits Win32 hides. Their names, links and streams are still compared.
+        // tracking): the on-disk record and what Win32 reports differ in times and in attribute
+        // bits Win32 hides. Their names, links and streams are still compared.
         for check in METADATA_CHECKS {
             tally.skipped(check, "live NTFS metadata file under $Extend".into());
         }
@@ -682,9 +680,9 @@ fn check_metadata(
         &|| format!("crate {} vs Win32 {}", info.is_directory, opened.directory),
     );
 
-    // The crate's size is the unnamed $DATA stream's size, like `nFileSize` of `FindFirstFile`, so a
-    // directory (no such stream) is 0. `FileStandardInfo.EndOfFile` of a directory is the size of its
-    // index allocation instead, which is a different thing: compare a directory against 0.
+    // The crate's size is the unnamed $DATA stream's size, like `nFileSize` of `FindFirstFile`, so
+    // a directory (no such stream) is 0. `FileStandardInfo.EndOfFile` of a directory is its index
+    // allocation size instead: compare a directory against 0.
     let expected_size = if opened.directory { 0 } else { opened.size };
     report(tally, "size", info.size == expected_size, &|| {
         format!("crate {} vs Win32 {}", info.size, expected_size)

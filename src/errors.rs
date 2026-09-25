@@ -1,4 +1,10 @@
+// Copyright (c) 2022, Matteo Bernacchia <dev@kikijiki.com>. All rights reserved.
+// This project is dual licensed under the Apache License 2.0 and the MIT license.
+// See the LICENSE files in the project root for details.
+
 //! [`NtfsReaderError`]: the error type every fallible entry point returns.
+
+use std::ffi::OsString;
 
 use thiserror::Error;
 
@@ -9,10 +15,9 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum NtfsReaderError {
-    /// Opening the volume or the journal was refused: the process lacks the privileges to read the
-    /// raw volume (run elevated). Every entry point that opens a volume reports this the same way.
-    /// Opening a directory path such as `C:\` instead of the volume (`\\.\C:`) is refused too,
-    /// even when elevated.
+    /// Opening the volume or the journal was refused: the process lacks the privileges to read
+    /// the raw volume (run elevated). Also returned for a directory path such as `C:\` instead
+    /// of the volume path (`\\.\C:`), even when elevated.
     #[error("access denied")]
     AccessDenied,
     /// An I/O or Windows API failure. A Windows failure carries its OS error code
@@ -43,12 +48,25 @@ pub enum NtfsReaderError {
         /// What is wrong with it.
         details: &'static str,
     },
-    /// A size read from the volume does not fit in this platform's address space (a 32-bit
-    /// build reading a huge `$MFT`, or a corrupt size).
-    #[error("allocation of {size} bytes exceeds platform address space")]
+    /// A size read from the volume cannot be held: it does not fit in this platform's address
+    /// space (a 32-bit build reading a huge `$MFT`, or a corrupt size), it exceeds what the crate
+    /// reads (a `$Bitmap` over 4 GiB, which no volume NTFS can format has), or the memory for it
+    /// could not be reserved.
+    #[error("allocation of {size} bytes is too large: over the platform's address space, the crate's limit, or the memory available")]
     AllocationTooLarge {
         /// The requested size in bytes.
         size: u64,
+    },
+    /// The volume's `$Bitmap` cannot be used as a [`ClusterBitmap`](crate::ClusterBitmap):
+    /// missing, not in use, sparse or with missing parts (read as free clusters), shorter than
+    /// the volume needs (only initialized bytes; the rest reads as free too), or the volume's
+    /// size is unknown (no cluster count to work out). Also returned by
+    /// [`StreamReader::allocation`](crate::StreamReader::allocation) for a bitmap read from
+    /// another volume or with a different cluster size than the stream.
+    #[error("invalid cluster bitmap: {details}")]
+    InvalidClusterBitmap {
+        /// What is wrong with it.
+        details: &'static str,
     },
     /// A boot sector field is out of range.
     #[error("invalid boot sector field: {field}")]
@@ -85,6 +103,47 @@ pub enum NtfsReaderError {
         /// The smallest size accepted.
         min: usize,
     },
+    /// The file has no data stream of that name. A directory has no default stream either.
+    #[error("no such data stream: {}", stream_name(.name))]
+    StreamNotFound {
+        /// The stream asked for: `None` is the default stream.
+        name: Option<OsString>,
+    },
+    /// The stream is stored compressed (NTFS LZNT1). This crate does not decompress.
+    #[error("the data stream is compressed")]
+    CompressedStream,
+    /// The file is compressed by Windows Overlay Filter (WOF, CompactOS): its default stream is a
+    /// sparse placeholder reading as zeroes; the real contents live compressed in the named
+    /// stream `WofCompressedData`. This crate does not decompress them.
+    #[error("the file is WOF compressed: its default stream holds no data")]
+    WofCompressedStream,
+    /// The stream is encrypted (EFS). Its bytes on the volume are ciphertext.
+    #[error("the data stream is encrypted")]
+    EncryptedStream,
+    /// A read reached a stream part whose extent record cannot be found: a deleted file's
+    /// extension record was freed and reused. Distinct from
+    /// [`NtfsFile::stream_data_lost`](crate::NtfsFile::stream_data_lost), which is about runs
+    /// NTFS wiped outright.
+    ///
+    /// Travels only inside the [`io::Error`](std::io::Error) that
+    /// [`StreamReader`](crate::StreamReader)'s `Read` returns, never as a crate function's own
+    /// result: extract it with [`io::Error::get_ref`](std::io::Error::get_ref) and a downcast.
+    /// See [`StreamReader`](crate::StreamReader) for an example.
+    #[error(
+        "stream data at offset {offset} is missing: the record holding its extent was not found"
+    )]
+    StreamExtentMissing {
+        /// Offset in the stream of the first byte that cannot be read.
+        offset: u64,
+    },
+}
+
+/// How a stream is named in a message: the default stream has no name.
+fn stream_name(name: &Option<OsString>) -> String {
+    match name {
+        Some(name) => format!("{name:?}"),
+        None => "the default stream".to_string(),
+    }
 }
 
 /// Every `?` on an [`std::io::Error`] goes through here, so a refused volume open is
@@ -103,82 +162,5 @@ impl From<std::io::Error> for NtfsReaderError {
 pub type NtfsReaderResult<T> = core::result::Result<T, NtfsReaderError>;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // A variant that wraps another error must show that error's message, and one with fields
-    // must show each of them; the fixed messages of the other variants are not worth a row.
-    #[test]
-    fn display_includes_the_wrapped_error_and_every_field() {
-        let cases: Vec<(NtfsReaderError, &[&str])> = vec![
-            (
-                NtfsReaderError::Io(std::io::Error::other("disk exploded")),
-                &["disk exploded"],
-            ),
-            (
-                NtfsReaderError::MissingMftAttribute { attribute: "Data" },
-                &["Data"],
-            ),
-            (
-                NtfsReaderError::MftRecordFixupFailed { number: 42 },
-                &["42"],
-            ),
-            (
-                NtfsReaderError::InvalidMftRecord { position: 4096 },
-                &["4096"],
-            ),
-            (
-                NtfsReaderError::InvalidDataRun {
-                    details: "bad header",
-                },
-                &["bad header"],
-            ),
-            (
-                NtfsReaderError::AllocationTooLarge { size: 9001 },
-                &["9001"],
-            ),
-            (
-                NtfsReaderError::InvalidBootSector { field: "oem_id" },
-                &["oem_id"],
-            ),
-            (
-                NtfsReaderError::InvalidUsnRecord {
-                    details: "too short",
-                },
-                &["too short"],
-            ),
-            (
-                NtfsReaderError::ReadBufferTooSmall {
-                    size: 3071,
-                    min: 4096,
-                },
-                &["3071", "4096"],
-            ),
-        ];
-
-        for (error, expected) in cases {
-            let message = error.to_string();
-            for part in expected {
-                assert!(
-                    message.contains(part),
-                    "Display for {error:?} was {message:?}, expected it to contain {part:?}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_permission_denied_io_error_becomes_access_denied() {
-        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(matches!(
-            NtfsReaderError::from(denied),
-            NtfsReaderError::AccessDenied
-        ));
-
-        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert!(matches!(
-            NtfsReaderError::from(other),
-            NtfsReaderError::Io(_)
-        ));
-    }
-}
+#[path = "tests/errors.rs"]
+mod tests;

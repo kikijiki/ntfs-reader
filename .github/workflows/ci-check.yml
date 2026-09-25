@@ -11,6 +11,10 @@ on:
 jobs:
   lint-build-test:
     runs-on: windows-latest
+    env:
+      # The property tests still run; only their coverage counts are skipped: how far a timed
+      # search gets depends on the runner's speed, and CI must not fail by chance.
+      ARBTEST_COVERAGE: "off"
 
     steps:
       - uses: actions/checkout@v6
@@ -40,23 +44,74 @@ jobs:
 
       # The integration tests need an explicit volume and refuse the system drive
       # (tests/common/mod.rs). The checkout lives on the runner's workspace drive
-      # (D: on windows-latest), which is not the system drive, so the allow flag is
-      # only set if that ever changes; the runner is disposable either way.
+      # (D: on windows-latest), not the system drive, so the allow flag is set only if that
+      # changes; the runner is disposable either way. Tests on the live C: would make the record
+      # reuse and strict invariants tests flaky, so the drive is printed to tell a flaky run apart.
       - name: Select the test volume and enable its USN journal
         shell: pwsh
         run: |
           $drive = ($env:GITHUB_WORKSPACE -split ':')[0]
+          $system = ($env:SystemDrive -split ':')[0]
           "NTFS_READER_TEST_VOLUME=$drive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          if ($drive -ieq ($env:SystemDrive -split ':')[0]) {
+          if ($drive -ieq $system) {
             "NTFS_READER_ALLOW_SYSTEM_DRIVE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "::warning::the workspace is on the system drive: the integration tests run on the live ${system}: volume"
           }
+          Write-Host "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
+          Write-Host "NTFS_READER_TEST_VOLUME=$drive (system drive: $system)"
+          Get-Volume -DriveLetter $drive | Format-List DriveLetter, FileSystemType, Size, SizeRemaining
+          fsutil fsinfo ntfsinfo "${drive}:" | Select-String "Bytes Per Cluster"
           fsutil usn createjournal "${drive}:"
 
+      # A test that cannot check what it needs prints `SKIPPED: <test>: <why>` and, with
+      # NTFS_READER_SKIP_LOG set, appends that line to the file (libtest hides passing-test
+      # output, so a skip would look like a pass otherwise). NTFS_READER_ALLOW_FSUTIL and
+      # NTFS_READER_REQUIRE_ALL stay unset: their tests fill volumes for minutes and change
+      # system wide settings, so they run on the maintainer's VM instead. Nine skips are expected
+      # per runner; see SKIP_EXPECTED below.
       - name: Test
+        env:
+          NTFS_READER_SKIP_LOG: ${{ runner.temp }}\skips-x64.txt
         run: mise run test
 
       - name: Test (32-bit)
+        env:
+          NTFS_READER_SKIP_LOG: ${{ runner.temp }}\skips-x86.txt
         run: mise run test-32
+
+      # Prints which tests skipped, and fails the job if the count is not the expected one: a
+      # missing fixture, a changed environment, or a new unnoticed skip. The nine (per
+      # architecture) are:
+      #   recoverability_tests, five tests that change DisableDeleteNotify (NTFS_READER_ALLOW_FSUTIL unset);
+      #   stream_tests::a_huge_fragmented_sparse_file... (needs T:\large-fragmented.rar, a VM fixture),
+      #     ::a_wof_compressed_file... (needs NTFS_READER_PARITY_VOLUME) and
+      #     ::compressed_and_encrypted_streams_are_refused (its EFS case creates a certificate in the
+      #     user's profile and needs NTFS_READER_ALLOW_FSUTIL);
+      #   volume_invariants_tests::the_parity_volume_is_smoke_checked (NTFS_READER_PARITY_VOLUME unset).
+      # Update this count in the same change that adds, removes, or newly runs a test here.
+      - name: Skipped tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          SKIP_EXPECTED: "9"
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $failed = $false
+          foreach ($arch in 'x64', 'x86') {
+            $log = Join-Path $env:RUNNER_TEMP "skips-$arch.txt"
+            $lines = if (Test-Path $log) { @(Get-Content $log) } else { @() }
+            $envSkips = @($lines | Where-Object { $_ -match '^\[env\]' })
+            $skips = @($lines | Where-Object { $_ -notmatch '^\[env\]' })
+            Write-Host "::group::$arch skips: $($skips.Count) (expected $env:SKIP_EXPECTED), environment skips: $($envSkips.Count)"
+            $lines | ForEach-Object { Write-Host $_ }
+            Write-Host "::endgroup::"
+            # After a failed test the log may be partial: the failure is what to read then.
+            if ($env:JOB_STATUS -eq 'success' -and $skips.Count -ne [int]$env:SKIP_EXPECTED) {
+              Write-Host "::error::${arch}: $($skips.Count) skipped tests, expected $env:SKIP_EXPECTED (SKIP_EXPECTED in ci-check.yml)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
 
   # Type-checks what the Windows job cannot run: the `internals` feature natively.
   check-linux:

@@ -2,10 +2,10 @@
 // This project is dual licensed under the Apache License 2.0 and the MIT license.
 // See the LICENSE files in the project root for details.
 
-//! Synthetic MFT records for unit tests and the property test, and (under the
-//! `internals` feature) for `benches/*_synthetic.rs`. This is a child of
-//! `mft` so it can build an `Mft` without a volume. Not every caller uses
-//! every helper.
+//! Synthetic MFT records for unit tests and the property test, and (under
+//! the `internals` feature) for `benches/*_synthetic.rs`. A child of `mft`
+//! so it can build an `Mft` without a volume. Not every caller uses every
+//! helper.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -19,20 +19,20 @@ pub const RECORD_SIZE: usize = 1024;
 /// Cluster size of [`test_volume`].
 pub const CLUSTER_SIZE: usize = 4096;
 /// Offset of the update sequence array in a record built by [`new_record`]:
-/// right after the header of an NTFS 3.1 record (which keeps its record number
-/// at offset 44).
+/// right after the header of an NTFS 3.1 record (record number at offset 44).
 pub const UPDATE_SEQUENCE_OFFSET: usize = 48;
-/// Where the first attribute of a record built by [`new_record`] starts: after
-/// the update sequence array (a sequence number plus one saved value for each
-/// of the record's two sectors, 6 bytes), aligned to 8.
+/// Where the first attribute of a record built by [`new_record`] starts:
+/// after the update sequence array (a sequence number plus one saved value
+/// per sector, 6 bytes for the record's two sectors), aligned to 8.
 pub const ATTRIBUTES_OFFSET: usize = 56;
 /// Path of [`test_volume`].
 pub const VOLUME_PATH: &str = r"\\.\T:";
 /// The update sequence number [`finish_record`] protects records with.
 pub const UPDATE_SEQUENCE_NUMBER: u16 = 1;
 
-// The on-disk sizes of three structures, written out instead of taken from the crate's structs
-// with `size_of`, so a struct of the wrong size cannot make the fixtures agree with it.
+// On-disk sizes of three structures, written out instead of taken from the
+// crate's structs with `size_of`, so a wrongly sized struct cannot make the
+// fixtures agree with it.
 /// A `$STANDARD_INFORMATION` value of NTFS 3.x (the crate's struct reads the first 36 bytes).
 const STANDARD_INFORMATION_SIZE: usize = 72;
 /// The fixed part of a `$FILE_NAME` value, before the name.
@@ -40,24 +40,22 @@ const FILE_NAME_HEADER: usize = 66;
 /// The header of a non-resident attribute, before its name and its data runs.
 const NONRESIDENT_HEADER: usize = 64;
 
-/// Record number [`mft_with`] places its first record at (records after
-/// that are numbered by vector position). `crate::api::FIRST_NORMAL_RECORD`
-/// is `pub(crate)`, so this copies its value out for external callers
-/// (`benches/*_synthetic.rs`) that need to predict record numbers while
-/// building the input vector, e.g. to link a directory chain's parents.
+/// Record number [`mft_with`] places its first record at (later records are
+/// numbered by vector position). Copies out `crate::api::FIRST_NORMAL_RECORD`
+/// (`pub(crate)`) for external callers (`benches/*_synthetic.rs`) that need
+/// to predict record numbers, e.g. to link a directory chain's parents.
 pub const FIRST_RECORD: u64 = FIRST_NORMAL_RECORD;
 
 /// Sequence number of the synthetic root record `mft_with` places at
-/// [`ROOT_RECORD`]. Names built by [`add_file_name`] (which default their
-/// parent to the root) carry this sequence, so `resolve_path`'s root check
-/// (comparing the full reference against the root record's own
-/// `reference()`) finds a real, matching root instead of failing.
+/// [`ROOT_RECORD`]. Names built by [`add_file_name`] default to this
+/// sequence, so `resolve_path`'s root check (full reference against the
+/// root's own `reference()`) finds a real, matching root.
 pub const ROOT_SEQUENCE: u16 = 1;
 
-/// Asserts that `text` holds exactly the UTF-16 code units `units`, looking at
-/// the platform's own representation instead of converting through the crate:
-/// the units themselves on Windows, `wtf8` (the same text as WTF-8 bytes, which
-/// is what the crate writes for a lone surrogate elsewhere) on other platforms.
+/// Asserts that `text` holds exactly the UTF-16 code units `units`, checking
+/// the platform's own representation rather than converting through the
+/// crate: the units themselves on Windows, `wtf8` (what the crate writes
+/// for a lone surrogate elsewhere) on other platforms.
 #[track_caller]
 pub fn assert_os_str_is(text: &std::ffi::OsStr, units: &[u16], wtf8: &[u8]) {
     #[cfg(windows)]
@@ -79,7 +77,7 @@ pub fn reference(sequence: u16, number: u64) -> u64 {
 }
 
 /// A minimal, valid root directory record (record [`ROOT_RECORD`], sequence
-/// [`ROOT_SEQUENCE`]), for [`mft_with`] to place at its fixed position.
+/// [`ROOT_SEQUENCE`]) for [`mft_with`] to place at its fixed position.
 pub fn root_record() -> Vec<u8> {
     let mut root = new_record(ROOT_RECORD, ROOT_SEQUENCE, 0);
     set_record_flags(&mut root, directory_flags());
@@ -88,7 +86,7 @@ pub fn root_record() -> Vec<u8> {
     root
 }
 
-/// A volume with 4 KiB clusters, 1 KiB records, the `$MFT` at byte 0 and an
+/// A volume with 4 KiB clusters, 1 KiB records, `$MFT` at byte 0, and an
 /// unknown size (0: not used to bound anything).
 pub fn test_volume() -> Volume {
     Volume::synthetic(
@@ -100,12 +98,11 @@ pub fn test_volume() -> Volume {
     )
 }
 
-/// Raw `(volume, data, bitmap)` inputs to `Mft::from_parts`: the same layout
-/// [`mft_with`] builds (records placed consecutively from [`FIRST_RECORD`],
-/// plus a real root record at [`ROOT_RECORD`], see [`root_record`]), without
-/// applying fixups or indexing extension records. Lets a bench build the
-/// input once and time [`build_from_parts`] (fixup + indexing) alone,
-/// repeatedly, on a fresh clone of `data`/`bitmap`.
+/// Raw `(volume, data, bitmap)` inputs to `Mft::from_parts`: the layout
+/// [`mft_with`] builds (records from [`FIRST_RECORD`], plus a root record
+/// at [`ROOT_RECORD`], see [`root_record`]), without fixups or extension
+/// record indexing. Lets a bench build the input once and repeatedly time
+/// [`build_from_parts`] alone, on a fresh clone of `data`/`bitmap`.
 pub fn raw_parts(records: Vec<Vec<u8>>) -> (Volume, Vec<u8>, Vec<u8>) {
     let first = FIRST_NORMAL_RECORD as usize;
     let record_count = first + records.len();
@@ -126,27 +123,41 @@ pub fn raw_parts(records: Vec<Vec<u8>>) -> (Volume, Vec<u8>, Vec<u8>) {
     (test_volume(), data, bitmap)
 }
 
-/// Applies fixups and indexes extension records: the same work `Mft::new`
-/// does after reading a volume's `$MFT`. `Mft::from_parts` itself is
-/// crate-private, so this is the entry point a bench uses to time it (Card
-/// 008 made this step about 25x faster; nothing measured that until now).
+/// Applies fixups and indexes extension records: the work `Mft::new` does
+/// after reading a volume's `$MFT`. `Mft::from_parts` is crate-private, so
+/// this is the entry point a bench uses to time it (Card 008 made this step
+/// about 25x faster; nothing measured that until now).
 pub fn build_from_parts(volume: Volume, data: Vec<u8>, bitmap: Vec<u8>) -> Mft {
     Mft::from_parts(volume, data, bitmap).expect("synthetic MFT")
 }
 
-/// Places `records` at consecutive numbers starting at [`FIRST_RECORD`],
-/// plus a real root record at [`ROOT_RECORD`] (see [`root_record`]) so names
-/// that resolve up to the root (the default for [`add_file_name`]) find a
-/// real, matching record instead of an empty/invalid one.
+/// Places `records` at consecutive numbers from [`FIRST_RECORD`], plus a
+/// root record at [`ROOT_RECORD`] (see [`root_record`]) so names resolving
+/// up to the root (the default for [`add_file_name`]) find a real record.
 pub fn mft_with(records: Vec<Vec<u8>>) -> Mft {
     let (volume, data, bitmap) = raw_parts(records);
     build_from_parts(volume, data, bitmap)
 }
 
-/// Places each record at its given number, unlike [`mft_with`] which always
-/// starts at [`FIRST_NORMAL_RECORD`]. Needed for records below that (for
-/// example the root directory at record 5).
+/// Places each record at its given number, unlike [`mft_with`], which
+/// always starts at [`FIRST_NORMAL_RECORD`]. Needed below that (e.g. the
+/// root directory at record 5).
 pub fn mft_with_at(records: Vec<(u64, Vec<u8>)>) -> Mft {
+    mft_with_at_freed(records, &[])
+}
+
+/// Like [`mft_with`], with the `$BITMAP` bit of each number in `freed`
+/// clear, as a delete leaves it. The record's own in-use flag is separate:
+/// see [`mark_freed`].
+pub fn mft_with_freed(records: Vec<Vec<u8>>, freed: &[u64]) -> Mft {
+    let (volume, data, mut bitmap) = raw_parts(records);
+    clear_bitmap_bits(&mut bitmap, freed);
+    build_from_parts(volume, data, bitmap)
+}
+
+/// Like [`mft_with_at`], with the `$BITMAP` bit of each record number in
+/// `freed` clear.
+pub fn mft_with_at_freed(records: Vec<(u64, Vec<u8>)>, freed: &[u64]) -> Mft {
     let record_count = records
         .iter()
         .map(|(number, _)| number + 1)
@@ -160,14 +171,47 @@ pub fn mft_with_at(records: Vec<(u64, Vec<u8>)>) -> Mft {
         data[start..start + RECORD_SIZE].copy_from_slice(&record);
     }
 
+    clear_bitmap_bits(&mut bitmap, freed);
+
     Mft::from_parts(test_volume(), data, bitmap).expect("synthetic MFT")
+}
+
+fn clear_bitmap_bits(bitmap: &mut [u8], numbers: &[u64]) {
+    for &number in numbers {
+        bitmap[number as usize / 8] &= !(1 << (number % 8));
+    }
+}
+
+/// Clears the in-use flag, as a delete does: the record keeps everything
+/// else, directory bit included. Freeing also bumps the sequence number
+/// (see [`new_record`]'s `sequence`) and clears the `$BITMAP` bit (see
+/// [`mft_with_freed`]); the caller does those.
+pub fn mark_freed(record: &mut [u8]) {
+    let flags = u16::from_le_bytes([record[22], record[23]]);
+    write_u16(record, 22, flags & !(NtfsFileFlags::InUse as u16));
+}
+
+/// What a delete does to a record's own bytes, as measured on NTFS 3.1: the
+/// log sequence number (offset 8) moves, the sequence number (offset 16)
+/// goes up by one, and the in-use flag goes off. Nothing else changes: not
+/// the used size, hard link count, attributes, or an extension record's
+/// base reference (kept as it was while live). The `$BITMAP` bit is the
+/// volume's business, see [`mft_with_freed`]. Unlike [`mark_freed`], which
+/// only clears the flag, this is the whole change: a deleted-file fixture
+/// uses this one.
+pub fn delete_record(record: &mut [u8]) {
+    let lsn = u64::from_le_bytes(record[8..16].try_into().unwrap());
+    write_u64(record, 8, lsn.wrapping_add(0x1000));
+    let sequence = u16::from_le_bytes([record[16], record[17]]);
+    write_u16(record, 16, sequence.wrapping_add(1));
+    mark_freed(record);
 }
 
 /// A record header in the NTFS 3.1 layout: signature, a well-formed update
 /// sequence array (offset [`UPDATE_SEQUENCE_OFFSET`], one entry per sector
-/// plus the sequence number), the record number at offset 44, in use, no
-/// attributes. Add attributes and call [`finish_record`], which sets the used
-/// size and applies the update sequence protection.
+/// plus the sequence number), record number at offset 44, in use, no
+/// attributes. Add attributes, then call [`finish_record`] to set the used
+/// size and apply the update sequence protection.
 pub fn new_record(number: u64, sequence: u16, base_reference: u64) -> Vec<u8> {
     let mut record = vec![0u8; RECORD_SIZE];
     record[0..4].copy_from_slice(FILE_RECORD_SIGNATURE);
@@ -192,8 +236,8 @@ pub fn directory_flags() -> u16 {
     NtfsFileFlags::InUse as u16 | NtfsFileFlags::IsDirectory as u16
 }
 
-/// A `$STANDARD_INFORMATION` with four distinct times: created 1 s, modified
-/// 2 s, MFT modified 4 s and accessed 3 s after the Unix epoch.
+/// A `$STANDARD_INFORMATION` with four distinct times: created 1s, modified
+/// 2s, MFT modified 4s, accessed 3s after the Unix epoch.
 pub fn add_standard_information(record: &mut [u8], offset: usize, attributes: u32) -> usize {
     add_standard_information_at(
         record,
@@ -203,7 +247,7 @@ pub fn add_standard_information(record: &mut [u8], offset: usize, attributes: u3
     )
 }
 
-/// A `$STANDARD_INFORMATION` with the given FILETIMEs, in the on-disk order:
+/// A `$STANDARD_INFORMATION` with the given FILETIMEs, in on-disk order:
 /// created, modified, MFT modified, accessed.
 pub fn add_standard_information_at(
     record: &mut [u8],
@@ -228,8 +272,8 @@ pub fn add_standard_information_at(
 }
 
 /// Defaults the parent to the real root record [`mft_with`] places at
-/// [`ROOT_RECORD`] with sequence [`ROOT_SEQUENCE`] - not the bare record
-/// number (which would mean sequence 0, not matching that root).
+/// [`ROOT_RECORD`] with sequence [`ROOT_SEQUENCE`], not the bare record
+/// number (sequence 0, which would not match that root).
 pub fn add_file_name(record: &mut [u8], offset: usize, name: &str, attributes: u32) -> usize {
     add_file_name_ex(
         record,
@@ -257,10 +301,10 @@ pub fn add_file_name_ex(
 }
 
 /// Like [`add_file_name_ex`], but takes the name as raw UTF-16 code units
-/// instead of `&str`. `str::encode_utf16` can only ever produce well-formed
-/// UTF-16 (a lone surrogate cannot appear in a valid `str`), but NTFS does
-/// not require that: an unpaired surrogate is a real, accepted Windows
-/// filename, and this is how a test builds one.
+/// instead of `&str`. `str::encode_utf16` only ever produces well-formed
+/// UTF-16 (a lone surrogate cannot appear in a valid `str`), but NTFS
+/// accepts an unpaired surrogate as a real filename; this is how a test
+/// builds one.
 #[allow(clippy::too_many_arguments)]
 pub fn add_file_name_raw(
     record: &mut [u8],
@@ -324,7 +368,7 @@ pub fn add_resident_attribute_raw(
 }
 
 /// A non-resident attribute extent without data runs. Only the extent with
-/// `lowest_vcn == 0` carries a meaningful `size`.
+/// `lowest_vcn == 0` has a meaningful `size`.
 #[allow(clippy::too_many_arguments)]
 pub fn add_nonresident_attribute(
     record: &mut [u8],
@@ -355,23 +399,48 @@ pub fn add_nonresident_attribute(
     offset + length
 }
 
+/// A non-resident attribute as NTFS leaves it when deleting a file with an
+/// `$ATTRIBUTE_LIST`: `lowest_vcn` 0, `highest_vcn` -1, allocated, data and
+/// initialized sizes 0, and a run list that is only the terminator byte.
+pub fn add_truncated_nonresident(
+    record: &mut [u8],
+    offset: usize,
+    attribute_type: NtfsAttributeType,
+    name: &str,
+) -> usize {
+    add_nonresident_data_runs(record, offset, attribute_type, name, 0, u64::MAX, 0, &[])
+}
+
 pub fn add_nonresident_data(record: &mut [u8], offset: usize, size: u64) -> usize {
     add_nonresident_attribute(record, offset, NtfsAttributeType::Data, 2, "", 0, size)
 }
 
-/// Writes the `End` marker (with a non-zero length, as found on disk) and
-/// returns the offset after it.
+/// Writes the `End` marker as it is on disk (`0xFFFFFFFF`, then the 4 bytes
+/// NTFS leaves after it, `0x11477982`) and returns the offset after it: 8
+/// bytes, so a record with no attributes has a used size of 64.
 pub fn add_end_marker(record: &mut [u8], offset: usize) -> usize {
     write_u32(record, offset, NtfsAttributeType::End as u32);
-    write_u32(record, offset + 4, 16);
-    offset + 16
+    write_u32(record, offset + 4, 0x1147_7982);
+    offset + 8
 }
 
 /// Sets the record's used size and applies the update sequence protection
-/// (see [`protect_record`]). Call it last: the record's sector ends move into
-/// the update sequence array, so bytes written over them afterwards are lost
-/// to the fixup.
+/// (see [`protect_record`]). Call it last: the record's sector ends move
+/// into the update sequence array, so later writes over them are lost to
+/// the fixup.
+///
+/// NTFS ends every record's attributes with the end marker, so a record
+/// whose attributes were added without [`add_end_marker`] gets one here
+/// (when it fits), its used size then including it, as on disk.
 pub fn finish_record(record: &mut [u8], used_size: usize) {
+    let marker = NtfsAttributeType::End as u32;
+    let has_marker = used_size >= ATTRIBUTES_OFFSET + 8
+        && record[used_size - 8..used_size - 4] == marker.to_le_bytes();
+    let used_size = if has_marker || used_size + 8 > RECORD_SIZE {
+        used_size
+    } else {
+        add_end_marker(record, used_size)
+    };
     write_u32(record, 24, used_size as u32);
     protect_record(record, UPDATE_SEQUENCE_NUMBER);
 }
@@ -393,10 +462,9 @@ pub fn write_u64(data: &mut [u8], offset: usize, value: u64) {
 }
 
 /// Applies NTFS update sequence protection to a record, the inverse of
-/// `fixup_record`: sector ends move into the array, `usn` takes their place.
-/// A record that is already protected (the array's own number sits at every
-/// sector end) is restored first, so this can be called again to change the
-/// number.
+/// `fixup_record`: sector ends move into the array, `usn` takes their
+/// place. A record already protected (the array's number sits at every
+/// sector end) is restored first, so this can be called again to change it.
 pub fn protect_record(record: &mut [u8], usn: u16) {
     let sectors = record.len() / SECTOR_SIZE;
     let previous = [
@@ -429,6 +497,18 @@ pub fn list_entry(
     starting_vcn: u64,
     record: u64,
 ) -> Vec<u8> {
+    list_entry_to(attribute_type, name, starting_vcn, reference(1, record))
+}
+
+/// One `$ATTRIBUTE_LIST` entry pointing at record `target` (a reference:
+/// NTFS writes the sequence the record had when the entry was made, one
+/// less than it has once the file is deleted).
+pub fn list_entry_to(
+    attribute_type: NtfsAttributeType,
+    name: &str,
+    starting_vcn: u64,
+    target: u64,
+) -> Vec<u8> {
     const NAME_OFFSET: usize = 26;
     let name: Vec<u16> = name.encode_utf16().collect();
     let length = align_to_eight(NAME_OFFSET + name.len() * 2);
@@ -438,7 +518,7 @@ pub fn list_entry(
     entry[6] = name.len() as u8;
     entry[7] = NAME_OFFSET as u8;
     write_u64(&mut entry, 8, starting_vcn);
-    write_u64(&mut entry, 16, (1u64 << 48) | record);
+    write_u64(&mut entry, 16, target);
     for (index, unit) in name.into_iter().enumerate() {
         write_u16(&mut entry, NAME_OFFSET + index * 2, unit);
     }
@@ -446,10 +526,10 @@ pub fn list_entry(
 }
 
 /// A non-resident attribute extent covering `lowest_vcn..=highest_vcn` with
-/// the given mapping pairs (the terminator is added). Unlike
-/// [`add_nonresident_attribute`], which writes a single implicit extent from
-/// a size alone, this builds the explicit data runs bytes, for tests that
-/// exercise `$MFT`'s own `$DATA` extent mapping.
+/// the given mapping pairs (terminator added). Unlike
+/// [`add_nonresident_attribute`], which writes a single implicit extent
+/// from a size alone, this builds explicit data runs bytes, for tests
+/// exercising `$MFT`'s own `$DATA` extent mapping.
 #[allow(clippy::too_many_arguments)]
 pub fn add_nonresident_data_runs(
     record: &mut [u8],
@@ -517,7 +597,8 @@ pub fn add_nonresident_data_runs_raw(
 /// Mapping pairs (without the terminator) for a list of runs: each is a
 /// length in clusters and either the LCN delta from the previous run or
 /// `None` for a sparse run. A zero length encodes with a zero-width length
-/// field, which the decoder rejects, so the property test can build that too.
+/// field, which the decoder rejects, so the property test can build that
+/// too.
 pub fn encode_runs(runs: &[(u64, Option<i64>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for &(length, delta) in runs {
@@ -542,10 +623,10 @@ pub fn encode_runs(runs: &[(u64, Option<i64>)]) -> Vec<u8> {
 /// Adds a minimal unnamed, non-resident `$DATA` attribute standing in for
 /// `$MFT`'s own VCN-0 extent: one run at LCN 0, covering `clusters`
 /// clusters. `read_data_fs` needs this to locate any extension record by
-/// number at all; tests that aren't specifically about the shape of that
-/// mapping use this so record numbers translate to the same byte position
-/// their bytes are laid out at (`mft_position` is 0 in [`test_volume`]).
-/// Tests exercising non-contiguous runs build their own instead.
+/// number at all; tests not specifically about that mapping's shape use it
+/// so record numbers translate to the byte position their bytes are laid
+/// out at (`mft_position` is 0 in [`test_volume`]). Tests exercising
+/// non-contiguous runs build their own instead.
 pub fn add_identity_mft_data(record: &mut [u8], offset: usize, clusters: u8) -> usize {
     add_nonresident_data_runs(
         record,
@@ -560,70 +641,5 @@ pub fn add_identity_mft_data(record: &mut [u8], offset: usize, clusters: u8) -> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::attribute::NtfsAttribute;
-    use crate::data_run::DataRun;
-
-    // The sizes written out above are the ones of the structs the crate reads the fixtures with.
-    #[test]
-    fn the_fixture_sizes_agree_with_the_crates_structs() {
-        assert_eq!(size_of::<NtfsFileNameHeader>(), FILE_NAME_HEADER);
-        assert_eq!(
-            size_of::<NtfsNonResidentAttributeHeader>(),
-            NONRESIDENT_HEADER
-        );
-        // The struct is the leading part of the value: the times and the attribute flags.
-        assert!(size_of::<NtfsStandardInformation>() <= STANDARD_INFORMATION_SIZE);
-    }
-
-    // `encode_runs` is the inverse of the decoder, for the run shapes the
-    // property test builds: a first run at an LCN, a backwards
-    // delta, a sparse run, and multi-byte lengths and deltas.
-    #[test]
-    fn encode_runs_round_trips_through_the_decoder() {
-        let cluster = CLUSTER_SIZE as u64;
-        let runs = [
-            (3, Some(10)),
-            (300, None),
-            (1, Some(-4)),
-            (70_000, Some(200)),
-            (2, Some(-100)),
-        ];
-        let mut record = new_record(FIRST_NORMAL_RECORD, 1, 0);
-        let offset = add_nonresident_data_runs(
-            &mut record,
-            ATTRIBUTES_OFFSET,
-            NtfsAttributeType::Data,
-            "",
-            0,
-            0,
-            0,
-            &encode_runs(&runs),
-        );
-        let attribute = NtfsAttribute::new(&record[ATTRIBUTES_OFFSET..offset]).expect("attribute");
-        let decoded = attribute
-            .nonresident_extent_runs(&test_volume())
-            .expect("runs");
-
-        let mut lcn = 0i64;
-        let expected: Vec<(u64, Option<u64>)> = runs
-            .iter()
-            .map(|&(length, delta)| {
-                let start = delta.map(|delta| {
-                    lcn += delta;
-                    lcn as u64 * cluster
-                });
-                (length * cluster, start)
-            })
-            .collect();
-        let decoded: Vec<(u64, Option<u64>)> = decoded
-            .into_iter()
-            .map(|run| match run {
-                DataRun::Data { offset, length } => (length, Some(offset)),
-                DataRun::Sparse { length } => (length, None),
-            })
-            .collect();
-        assert_eq!(decoded, expected);
-    }
-}
+#[path = "tests/test_records.rs"]
+mod tests;

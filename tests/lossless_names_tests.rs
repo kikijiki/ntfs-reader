@@ -1,19 +1,17 @@
 #![cfg(target_os = "windows")]
 
-//! Card 036. Stream names and USN journal names are raw UTF-16 code unit
-//! sequences like file names (card 034), so they can hold an unpaired
-//! surrogate, which `String` cannot represent. These tests create such names
-//! on a real volume and check that the crate reports them exactly: a
-//! caller must be able to reopen `path:stream` with the reported stream name,
-//! and to match a journal record's name against the name the file really has.
+//! Stream names and USN journal names are raw UTF-16 code unit sequences like file names, so
+//! they can hold an unpaired surrogate, which `String` cannot represent. These tests create such
+//! names on a real volume and check the crate reports them exactly: a caller must be able to
+//! reopen `path:stream` with the reported stream name, and match a journal record's name against
+//! the file's real name.
 //!
-//! Each test first creates the file or stream with `CreateFileW` directly, with
-//! a message that says so if Windows itself rejects the name (then the card's
-//! premise would not hold).
+//! Each test creates the file or stream with `CreateFileW` directly, with a message that says so
+//! if Windows itself rejects the name (then the test's premise does not hold).
 //!
-//! See `file::tests::data_streams_report_a_stream_name_with_an_unpaired_surrogate_losslessly`
-//! and `usn::tests::a_name_with_an_unpaired_surrogate_is_kept` for the synthetic, VM-free
-//! versions of these checks.
+//! See `file::tests::data_streams_report_a_stream_name_with_an_unpaired_surrogate_losslessly` and
+//! `usn::tests::a_name_with_an_unpaired_surrogate_is_kept` for the synthetic, VM-free versions of
+//! these checks.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -62,7 +60,7 @@ fn create(path: &Path, what: &str) {
             .unwrap_or_else(|e| {
                 panic!(
                     "CreateFileW rejected {what} {path:?}: {e}. If Windows itself refuses a name \
-                     with an unpaired surrogate here, card 036's premise does not hold for this \
+                     with an unpaired surrogate here, the premise of this test does not hold for this \
                      kind of name"
                 )
             }),
@@ -113,7 +111,7 @@ fn finds_and_reopens_a_stream_with_an_unpaired_surrogate_name() {
          the unpaired surrogate)"
     );
 
-    // The real proof: `path:stream` built from the reported name must reopen the stream.
+    // `path:stream` built from the reported name must reopen the stream.
     let reported = named
         .iter()
         .find(|name| name.to_string_lossy().starts_with("ads-"))
