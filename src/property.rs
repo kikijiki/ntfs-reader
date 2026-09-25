@@ -13,8 +13,9 @@
 //!   [`heavy_property`]). `ARBTEST_BUDGET_MS=60000` runs a test for a minute; `mise run
 //!   test-linux-long` does that for every property test.
 //! - Two tests also count the shapes they reached and fail if the search was too short to reach
-//!   them (see [`coverage`]). Skipped when a seed is replayed (`ARBTEST_SEED`) or the budget is a
-//!   quick look under [`GATE_MIN_BUDGET_MS`].
+//!   them (see [`coverage`]). Skipped when a seed is replayed (`ARBTEST_SEED`), the budget is a
+//!   quick look under [`GATE_MIN_BUDGET_MS`], or `ARBTEST_COVERAGE=off` (CI: how far a timed
+//!   search gets depends on the runner's speed, and CI must not fail by chance).
 //! - A failure prints `arbtest failed! Seed: 0x...`. Replay it with `ARBTEST_SEED=0x... cargo test
 //!   --features internals --lib <test name>`, which also prints the generated description. Set
 //!   `ARBTEST_SEED` only for a single test: it applies to every property test the command selects.
@@ -56,12 +57,13 @@ fn run(default_budget_ms: u64, check: impl FnMut(&mut Unstructured<'_>) -> arbit
     test.run();
 }
 
-/// Whether coverage counts are checked, given `ARBTEST_SEED` and `ARBTEST_BUDGET_MS`: not when a
-/// seed is set (arbtest then runs that one case once), and not when the budget is a quick look
-/// under [`GATE_MIN_BUDGET_MS`]. A budget that fails to parse is arbtest's own error to report, so
-/// it does not disable the checks.
-fn gates_apply(seed: Option<&str>, budget_ms: Option<&str>) -> bool {
-    if seed.is_some() {
+/// Whether coverage counts are checked, given `ARBTEST_COVERAGE`, `ARBTEST_SEED` and
+/// `ARBTEST_BUDGET_MS`: not when switched off (`ARBTEST_COVERAGE=off`), not when a seed is set
+/// (arbtest then runs that one case once), and not when the budget is a quick look under
+/// [`GATE_MIN_BUDGET_MS`]. A budget that fails to parse is arbtest's own error to report, so it
+/// does not disable the checks.
+fn gates_apply(coverage: Option<&str>, seed: Option<&str>, budget_ms: Option<&str>) -> bool {
+    if coverage.is_some_and(|value| value.trim() == "off") || seed.is_some() {
         return false;
     }
     match budget_ms.and_then(|ms| ms.trim().parse::<u64>().ok()) {
@@ -72,13 +74,14 @@ fn gates_apply(seed: Option<&str>, budget_ms: Option<&str>) -> bool {
 
 /// Coverage gate for a property test: the search must reach more than `more_than` cases of the
 /// shape `what`, or a green run proves nothing about it. Skipped when it cannot mean anything (see
-/// [`gates_apply`]). CI runs with a fresh random seed each time, so a failure here has no seed to
-/// replay; the message says the search was too short and gives the command to search longer.
+/// [`gates_apply`]). A failure here has no seed to replay; the message says the search was too
+/// short and gives the command to search longer.
 #[track_caller]
 pub(crate) fn coverage(what: &str, reached: u64, more_than: u64) {
+    let switch = std::env::var("ARBTEST_COVERAGE").ok();
     let seed = std::env::var("ARBTEST_SEED").ok();
     let budget = std::env::var("ARBTEST_BUDGET_MS").ok();
-    if !gates_apply(seed.as_deref(), budget.as_deref()) {
+    if !gates_apply(switch.as_deref(), seed.as_deref(), budget.as_deref()) {
         return;
     }
     assert!(
@@ -115,35 +118,43 @@ mod tests {
 
     #[test]
     fn the_gates_apply_to_a_normal_search() {
-        assert!(gates_apply(None, None));
-        assert!(gates_apply(None, Some("60000")));
-        assert!(gates_apply(None, Some(" 5000 ")));
+        assert!(gates_apply(None, None, None));
+        assert!(gates_apply(None, None, Some("60000")));
+        assert!(gates_apply(None, None, Some(" 5000 ")));
+        assert!(gates_apply(Some("on"), None, None));
+    }
+
+    #[test]
+    fn the_gates_do_not_apply_when_switched_off() {
+        assert!(!gates_apply(Some("off"), None, None));
+        assert!(!gates_apply(Some(" off "), None, Some("60000")));
     }
 
     #[test]
     fn the_gates_do_not_apply_to_a_replayed_seed() {
-        assert!(!gates_apply(Some("0x1234"), None));
+        assert!(!gates_apply(None, Some("0x1234"), None));
         // Whatever the budget: one seed is one case.
-        assert!(!gates_apply(Some("0x1234"), Some("60000")));
+        assert!(!gates_apply(None, Some("0x1234"), Some("60000")));
     }
 
     #[test]
     fn the_gates_do_not_apply_to_a_quick_look() {
-        assert!(!gates_apply(None, Some("1000")));
-        assert!(!gates_apply(None, Some("4999")));
-        assert!(!gates_apply(None, Some("0")));
+        assert!(!gates_apply(None, None, Some("1000")));
+        assert!(!gates_apply(None, None, Some("4999")));
+        assert!(!gates_apply(None, None, Some("0")));
     }
 
     #[test]
     fn a_budget_that_does_not_parse_is_left_to_arbtest() {
-        assert!(gates_apply(None, Some("soon")));
+        assert!(gates_apply(None, None, Some("soon")));
     }
 
     #[test]
     fn a_gate_that_is_not_met_says_how_to_search_longer_and_how_to_replay() {
         // This process's own env vars decide whether the gate applies; build the message the same
-        // way `coverage` does, for a run with neither variable set.
+        // way `coverage` does, for a run with none of its variables set.
         if !gates_apply(
+            std::env::var("ARBTEST_COVERAGE").ok().as_deref(),
             std::env::var("ARBTEST_SEED").ok().as_deref(),
             std::env::var("ARBTEST_BUDGET_MS").ok().as_deref(),
         ) {

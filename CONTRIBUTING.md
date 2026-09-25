@@ -132,7 +132,9 @@ reached (files with extension records, lost extents, wrapped sequence numbers, `
 and fail with "too few ..." if the search was too short, so a green run actually covered the cases
 it claims. That failure is about search length, not a bug, and has no seed: search longer
 (`ARBTEST_BUDGET_MS=60000`). Counts are not checked when replaying one seed (`ARBTEST_SEED`) or when
-`ARBTEST_BUDGET_MS` is under 5000 (a quick look): neither reaches them.
+`ARBTEST_BUDGET_MS` is under 5000 (a quick look): neither reaches them. CI sets `ARBTEST_COVERAGE=off`:
+how far a timed search gets depends on the runner's speed, and CI must not fail by chance. Run the
+counts locally, ideally with `mise run test-linux-long`.
 
 ## Win32 parity test and the stress volume
 

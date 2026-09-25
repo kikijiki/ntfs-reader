@@ -11,6 +11,10 @@ on:
 jobs:
   lint-build-test:
     runs-on: windows-latest
+    env:
+      # The property tests still run; only their coverage counts are skipped: how far a timed
+      # search gets depends on the runner's speed, and CI must not fail by chance.
+      ARBTEST_COVERAGE: "off"
 
     steps:
       - uses: actions/checkout@v6
