@@ -3,8 +3,8 @@
 The USN journal is NTFS's log of changes: one record per file event, with its id, parent id,
 name, what changed, and when. `Journal` reads it. This page covers turning records into events,
 paths for deleted files, and resuming after a restart. Other guides:
-[deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), [paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md),
-[reading data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md).
+[deleted files](deleted-files.md), [paths and caches](paths-and-caches.md),
+[reading data](reading-data.md).
 
 ## Reading the journal
 
@@ -140,7 +140,7 @@ still gives its old path, but returns `None` once a directory above it was also 
 quiet volume was the very next file created, so after the delete the path or record may be gone
 where an earlier snapshot has both live. It also misses directories created after loading, and
 shows a renamed directory's old path. Loading takes seconds on a big volume; flush first (see
-[deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), "Flush the volume first") so the snapshot is not older than the disk.
+[deleted files](deleted-files.md), "Flush the volume first") so the snapshot is not older than the disk.
 
 ## A monitor loop
 

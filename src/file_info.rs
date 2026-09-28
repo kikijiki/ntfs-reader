@@ -161,7 +161,7 @@ impl FileInfo {
                 // The live cache must not learn what a freed directory leads to, nor be asked
                 // about it.
                 let resolved = file.mft().resolve_deleted_path(name, deleted_cache);
-                resolved.complete.then_some(resolved.path)
+                resolved.is_complete().then_some(resolved.path)
             } else {
                 file.mft().resolve_path(name, cache)
             }

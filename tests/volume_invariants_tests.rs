@@ -93,7 +93,7 @@ fn check_volume(letter: &str, strict: bool) {
         }
         for name in file.names() {
             names += 1;
-            if mft.resolve_deleted_path(&name, &mut cache).complete {
+            if mft.resolve_deleted_path(&name, &mut cache).is_complete() {
                 complete += 1;
             } else {
                 incomplete += 1;

@@ -31,15 +31,6 @@ const EXTEND_RECORD: u64 = 11;
 /// case insensitive, as NTFS names are): no user can create one there.
 const DELETED_DIRECTORY: &str = "$Deleted";
 
-/// The component [`Mft::resolve_deleted_path`] puts where `$Extend\$Deleted`
-/// would be. An ordinary Win32 name cannot contain `<` or `>`, so no file has
-/// this name (a POSIX namespace name can, hence convention, not proof).
-const DELETED_MARKER: &str = "<deleted>";
-
-/// The component that stands for a path too long to address (see
-/// [`MAX_PATH_UNITS`]).
-const TOO_LONG_MARKER: &str = "<too long>";
-
 /// Counts the records a deleted walk visits, so tests can assert its work
 /// without timing it. [`walk_budget::run`] sets a budget; going over it
 /// panics, stopping a walk that would take minutes.
@@ -165,17 +156,17 @@ impl PathCache for DefaultPathCache {
     }
 }
 
-/// The result of [`Mft::resolve_deleted_path`]: a path, and whether it is
-/// the whole file's path.
+/// The result of [`Mft::resolve_deleted_path`]: the path, and the marker
+/// where the walk stopped short of the volume, if it did.
 ///
-/// An incomplete path ends, below the volume path, in a marker no ordinary
-/// Win32 name can be (`<`/`>` are illegal; a POSIX name can hold them, hence
-/// convention, not proof): `<lost 1234>` for record 1234 (missing, reused,
-/// an earlier incarnation, or a loop, named by its lowest record),
-/// `<deleted>` for `$Extend\$Deleted` (a directory `remove_dir_all` renamed
-/// before deleting it, or a file deleted while open: below keeps the random
-/// name NTFS gave it), and `<too long>` for a path Win32 could not address.
-/// What resolved below the marker is kept: `\\.\C:\<lost 1234>\dir\file.txt`.
+/// A complete path (`marker` is `None`) starts with the volume path like
+/// [`Mft::resolve_path`]'s: `\\.\C:\dir\file.txt`. An incomplete one is
+/// relative: the names that resolved below the marker, ending with the
+/// file's, `dir\file.txt` under [`DeletedPathMarker::Lost`]. Either way
+/// `path` holds only names read from records, never marker text, so a
+/// recovery tool can recreate it under a folder of its own, with a name of
+/// its choosing for the marker. [`to_marked_path`](Self::to_marked_path)
+/// gives the one-path form for display, `\\.\C:\<lost 1234>\dir\file.txt`.
 ///
 /// NTFS keeps no rename history: a directory shows the name in its record,
 /// current if live, or as of its deletion. The path is where the file was
@@ -183,32 +174,70 @@ impl PathCache for DefaultPathCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeletedPath {
-    /// The path, starting with the volume path like [`Mft::resolve_path`]'s.
+    /// Why the path stops short of the volume, or `None` if every directory
+    /// up to the volume was identified.
+    pub marker: Option<DeletedPathMarker>,
+    /// The whole path from the volume path if complete, else the names below
+    /// the marker (just the file's name under [`DeletedPathMarker::TooLong`]).
     /// It names where the file was, not something openable: the file is
-    /// deleted, and an incomplete path has a marker component.
+    /// deleted.
     pub path: PathBuf,
-    /// Whether every directory on the way was identified. `false` means the
-    /// path has a marker component (see the type's docs).
-    pub complete: bool,
 }
 
-/// A marker component where the walk of a deleted path stopped: what could
-/// not be identified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Marker {
-    /// A directory that is missing, unnamed, not a directory, reused, or on a
-    /// loop: the loop's lowest record, else the record number the walk
-    /// could not use.
+impl DeletedPath {
+    /// Whether every directory up to the volume was identified: no marker.
+    pub fn is_complete(&self) -> bool {
+        self.marker.is_none()
+    }
+
+    /// The path with the marker as a component under `volume`, the volume
+    /// path the [`Mft`] was loaded from (`mft.volume().path()`):
+    /// `\\.\C:\<lost 1234>\dir\file.txt`. A complete path is returned as is.
+    /// For display: a marker's text holds `<` and `>`, illegal in a Win32
+    /// name, so this is not a path to create; match on
+    /// [`marker`](Self::marker) for that.
+    pub fn to_marked_path(&self, volume: &Path) -> PathBuf {
+        match self.marker {
+            None => self.path.clone(),
+            Some(marker) => join_one(
+                &join_one(volume, OsStr::new(&marker.to_string())),
+                self.path.as_os_str(),
+            ),
+        }
+    }
+}
+
+/// Why [`Mft::resolve_deleted_path`] could not resolve a path up to the
+/// volume. [`Display`](fmt::Display) gives the text
+/// [`DeletedPath::to_marked_path`] uses as a component: `<lost 1234>`,
+/// `<deleted>`, `<too long>`. No ordinary Win32 name can be one (`<` and `>`
+/// are illegal; a POSIX namespace name can hold them, hence convention, not
+/// proof), so it is no name to create a file or folder with: match on the
+/// variant and pick a name of your own for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DeletedPathMarker {
+    /// A directory that could not be identified: missing, unnamed, not a
+    /// directory, reused by another file, another incarnation of the record,
+    /// or on a parent loop. The record number the walk could not use; for a
+    /// loop, its lowest record, whichever member the walk entered at. Not
+    /// related to [`FileInfo::data_lost`](crate::FileInfo::data_lost).
     Lost(u64),
-    /// `$Extend\$Deleted`.
+    /// `$Extend\$Deleted`, where NTFS moves a directory `remove_dir_all` is
+    /// about to delete, or a file deleted while open, under a random name.
+    /// What is below keeps that random name; the real one is gone for good.
     Deleted,
+    /// The path would exceed 32767 UTF-16 units, the Win32 limit, marker
+    /// text included. Only the file's name is kept below it.
+    TooLong,
 }
 
-impl Marker {
-    fn text(self) -> String {
+impl fmt::Display for DeletedPathMarker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Marker::Lost(record_number) => lost_marker(record_number),
-            Marker::Deleted => DELETED_MARKER.to_string(),
+            DeletedPathMarker::Lost(record_number) => write!(f, "<lost {record_number}>"),
+            DeletedPathMarker::Deleted => f.write_str("<deleted>"),
+            DeletedPathMarker::TooLong => f.write_str("<too long>"),
         }
     }
 }
@@ -218,7 +247,9 @@ impl Marker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Parent {
     Volume,
-    Marker(Marker),
+    /// [`DeletedPathMarker::Lost`] or [`DeletedPathMarker::Deleted`]; a path
+    /// too long is [`DeletedEntry::TooLong`] instead.
+    Marker(DeletedPathMarker),
     /// A directory with a [`DeletedEntry::Dir`] in the cache, by reference.
     Dir(u64),
 }
@@ -230,15 +261,15 @@ enum Parent {
 #[derive(Debug)]
 enum DeletedEntry {
     /// The directory's path is a marker: `$Extend\$Deleted`, or a loop member.
-    Marker(Marker),
+    Marker(DeletedPathMarker),
     /// The directory's path is its parent's plus its name.
     Dir {
         parent: Parent,
         name: OsString,
         /// Length in UTF-16 units of the whole path, at most [`MAX_PATH_UNITS`].
         units: usize,
-        /// Whether every directory up to the volume was identified.
-        complete: bool,
+        /// The marker the path is built on, `None` if it reaches the volume.
+        marker: Option<DeletedPathMarker>,
     },
     /// This directory's path, or one above it, exceeds [`MAX_PATH_UNITS`].
     TooLong,
@@ -452,9 +483,10 @@ impl Mft {
 }
 
 impl Mft {
-    /// Full path of `name`, a name of a possibly deleted file, with whatever
-    /// cannot be identified marked in the path instead of ending the walk
-    /// (see [`DeletedPath`]). `name` is one of the file's
+    /// Full path of `name`, a name of a possibly deleted file. Where a
+    /// directory cannot be identified the walk ends at a
+    /// [`DeletedPathMarker`] and keeps the names below it, instead of giving
+    /// nothing (see [`DeletedPath`]). `name` is one of the file's
     /// [`hard_links`](crate::NtfsFile::hard_links), like
     /// [`resolve_path`](Self::resolve_path)'s.
     ///
@@ -464,24 +496,26 @@ impl Mft {
     /// [`Mft::record_by_id`]). The name is whatever the record still holds.
     /// A record reused by another file (in use, higher sequence), any other
     /// incarnation, a nonexistent or unnamed record ends the walk at
-    /// `<lost N>`; `$Extend\$Deleted` ends it at `<deleted>`.
+    /// [`Lost`](DeletedPathMarker::Lost); `$Extend\$Deleted` ends it at
+    /// [`Deleted`](DeletedPathMarker::Deleted).
     ///
     /// With all directories live, the result matches
     /// [`resolve_path`](Self::resolve_path) and is complete, except for a
     /// delete-pending file (still open, renamed into live
     /// `$Extend\$Deleted`): `resolve_path` gives
-    /// `\\.\C:\$Extend\$Deleted\<random>`, this walk the incomplete
-    /// `\\.\C:\<deleted>\<random>`, since it always stops at `$Deleted`.
-    /// Deleting with `remove_file`/`remove_dir` one entry at a time keeps
-    /// a complete path regardless of how many directories are gone;
-    /// `remove_dir_all` ends at `<deleted>`, since it renames the
+    /// `\\.\C:\$Extend\$Deleted\<random>`, this walk the random name under
+    /// [`Deleted`](DeletedPathMarker::Deleted), since it always stops at
+    /// `$Deleted`. Deleting with `remove_file`/`remove_dir` one entry at a
+    /// time keeps a complete path regardless of how many directories are
+    /// gone; `remove_dir_all` ends at `Deleted`, since it renames the
     /// directories away first and the real names are gone for good.
     ///
     /// A parent must be a directory, live or freed, or the walk ends at
-    /// `<lost N>`. A loop collapses to one `<lost N>` (its lowest record)
-    /// regardless of entry point. A path over 32767 UTF-16 units, markers
-    /// included, becomes `<too long>` plus the name alone; neither case is
-    /// ever complete. A warm cache answers the same as none.
+    /// `Lost`. A loop collapses to one `Lost` (its lowest record) regardless
+    /// of entry point. A path over 32767 UTF-16 units, marker text (its
+    /// [`Display`](fmt::Display) form) included, becomes
+    /// [`TooLong`](DeletedPathMarker::TooLong) with the name alone below it.
+    /// A warm cache answers the same as none.
     ///
     /// Work is bounded by directories, not files: the walk climbs to the
     /// volume, a marker, a loop, or a cached directory, remembering every
@@ -497,14 +531,21 @@ impl Mft {
     /// when deleted.
     ///
     /// ```no_run
-    /// # use ntfs_reader::{DeletedPathCache, Mft, Volume};
+    /// # use ntfs_reader::{DeletedPathCache, DeletedPathMarker, Mft, Volume};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
     /// let mut cache = DeletedPathCache::new();
     /// for file in mft.deleted_files() {
     ///     for name in file.hard_links() {
     ///         let found = mft.resolve_deleted_path(&name, &mut cache);
-    ///         println!("{} (complete: {})", found.path.display(), found.complete);
+    ///         match found.marker {
+    ///             None => println!("{}", found.path.display()),
+    ///             Some(DeletedPathMarker::Lost(record)) => {
+    ///                 println!("under lost directory {record}: {}", found.path.display())
+    ///             }
+    ///             // `\\.\C:\<deleted>\...` or `\\.\C:\<too long>\...`.
+    ///             Some(_) => println!("{}", found.to_marked_path(mft.volume().path()).display()),
+    ///         }
     ///     }
     /// }
     /// # Ok(())
@@ -534,7 +575,7 @@ impl Mft {
                 break Some(if is_root {
                     Parent::Volume
                 } else {
-                    Parent::Marker(Marker::Lost(record_number))
+                    Parent::Marker(DeletedPathMarker::Lost(record_number))
                 });
             }
             match cache.0.get(&reference) {
@@ -550,7 +591,7 @@ impl Mft {
                 // with what leads into the loop kept below it. The walk may
                 // have entered before that first visit, so members are found
                 // by stepping back while it repeats itself. Every member is
-                // cached as the marker: a loop is always `<lost N>`,
+                // cached as the marker: a loop is always `Lost`,
                 // regardless of entry point or names.
                 let visit = pending
                     .iter()
@@ -568,11 +609,12 @@ impl Mft {
                     .min()
                     .unwrap_or(record_number);
                 for (member, _) in members {
-                    cache
-                        .0
-                        .insert(member, DeletedEntry::Marker(Marker::Lost(lowest)));
+                    cache.0.insert(
+                        member,
+                        DeletedEntry::Marker(DeletedPathMarker::Lost(lowest)),
+                    );
                 }
-                break Some(Parent::Marker(Marker::Lost(lowest)));
+                break Some(Parent::Marker(DeletedPathMarker::Lost(lowest)));
             }
 
             // A parent is a directory the reference names: live, or freed with
@@ -585,7 +627,7 @@ impl Mft {
                 })
                 .and_then(|record| record.best_name());
             let Some(directory) = directory else {
-                break Some(Parent::Marker(Marker::Lost(record_number)));
+                break Some(Parent::Marker(DeletedPathMarker::Lost(record_number)));
             };
 
             let component = directory.to_os_string();
@@ -594,8 +636,8 @@ impl Mft {
             {
                 cache
                     .0
-                    .insert(reference, DeletedEntry::Marker(Marker::Deleted));
-                break Some(Parent::Marker(Marker::Deleted));
+                    .insert(reference, DeletedEntry::Marker(DeletedPathMarker::Deleted));
+                break Some(Parent::Marker(DeletedPathMarker::Deleted));
             }
             pending.push((reference, component));
             reference = directory.parent_reference();
@@ -606,32 +648,34 @@ impl Mft {
             for (reference, _) in pending {
                 cache.0.insert(reference, DeletedEntry::TooLong);
             }
-            return self.too_long_path(&leaf);
+            return Self::too_long_path(&leaf);
         };
 
         // Top down: each directory's path length is its parent's plus its own
         // name, so a level costs only its name. A directory whose path is
         // too long is cached as such, and so is everything below it.
-        let (mut units, mut ends_with_separator_now, complete) = match parent {
+        // The length of a path on a marker counts the marker's text, as
+        // `DeletedPath::to_marked_path` writes it.
+        let (mut units, mut ends_with_separator_now, marker) = match parent {
             Parent::Volume => {
                 let path = self.volume().path().as_os_str();
-                (utf16_len(path), ends_with_separator(path), true)
+                (utf16_len(path), ends_with_separator(path), None)
             }
             Parent::Marker(marker) => {
-                let path = self.marker_path(&marker.text());
+                let path = self.marker_path(marker);
                 (
                     utf16_len(path.as_os_str()),
                     ends_with_separator(path.as_os_str()),
-                    false,
+                    Some(marker),
                 )
             }
             Parent::Dir(reference) => match cache.0.get(&reference) {
                 Some(DeletedEntry::Dir {
                     units,
                     name,
-                    complete,
+                    marker,
                     ..
-                }) => (*units, ends_with_separator_after(name), *complete),
+                }) => (*units, ends_with_separator_after(name), *marker),
                 _ => unreachable!("a cached directory was just found"),
             },
         };
@@ -646,7 +690,7 @@ impl Mft {
                         parent,
                         name: component,
                         units,
-                        complete,
+                        marker,
                     },
                 );
                 parent = Parent::Dir(reference);
@@ -657,22 +701,23 @@ impl Mft {
         }
         let leaf_units = units + usize::from(!ends_with_separator_now) + utf16_len(&leaf);
         if !resolvable || leaf_units > MAX_PATH_UNITS {
-            return self.too_long_path(&leaf);
+            return Self::too_long_path(&leaf);
         }
         DeletedPath {
+            marker,
             path: self.assemble(parent, cache, &leaf),
-            complete,
         }
     }
 
-    /// The path of the directory `parent`, followed by `leaf`, built once.
+    /// The path of the directory `parent`, followed by `leaf`, built once:
+    /// from the volume path, or relative if it is built on a marker.
     fn assemble(&self, parent: Parent, cache: &DeletedPathCache, leaf: &OsStr) -> PathBuf {
         let mut names = Vec::new();
         let mut current = parent;
         let base = loop {
             match current {
-                Parent::Volume => break self.volume().path().to_path_buf(),
-                Parent::Marker(marker) => break self.marker_path(&marker.text()),
+                Parent::Volume => break self.volume().path(),
+                Parent::Marker(_) => break Path::new(""),
                 Parent::Dir(reference) => match cache.0.get(&reference) {
                     Some(DeletedEntry::Dir { parent, name, .. }) => {
                         names.push(name.as_os_str());
@@ -689,7 +734,11 @@ impl Mft {
         let mut path = OsString::with_capacity(size);
         path.push(base.as_os_str());
         for component in names.into_iter().rev().chain(std::iter::once(leaf)) {
-            if !ends_with_separator(&path) {
+            // Relative on a marker: no leading separator, `to_marked_path`
+            // adds the one after the marker. An empty first name (a corrupt
+            // record) then adds nothing, and the marked path is what a walk
+            // from the marker's own path builds.
+            if !path.is_empty() && !ends_with_separator(&path) {
                 path.push(MAIN_SEPARATOR_STR);
             }
             path.push(component);
@@ -697,24 +746,19 @@ impl Mft {
         PathBuf::from(path)
     }
 
-    /// The volume path plus one marker component.
-    fn marker_path(&self, marker: &str) -> PathBuf {
-        join_one(self.volume().path(), OsStr::new(marker))
+    /// The volume path plus the marker's text as one component: what the
+    /// length of a path on the marker is counted from.
+    fn marker_path(&self, marker: DeletedPathMarker) -> PathBuf {
+        join_one(self.volume().path(), OsStr::new(&marker.to_string()))
     }
 
     /// What a path too long to address becomes: the marker and the name.
-    fn too_long_path(&self, leaf: &OsStr) -> DeletedPath {
+    fn too_long_path(leaf: &OsStr) -> DeletedPath {
         DeletedPath {
-            path: join_one(&self.marker_path(TOO_LONG_MARKER), leaf),
-            complete: false,
+            marker: Some(DeletedPathMarker::TooLong),
+            path: PathBuf::from(leaf),
         }
     }
-}
-
-/// The marker for the directory of record `record_number`, which the walk
-/// could not identify.
-fn lost_marker(record_number: u64) -> String {
-    format!("<lost {record_number}>")
 }
 
 /// Length of `text` in UTF-16 units, how Win32 counts a path: a character

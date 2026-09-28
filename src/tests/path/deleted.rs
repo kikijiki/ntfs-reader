@@ -8,12 +8,13 @@
 // than when live, so fixtures store the old sequence plus one and reference it with the old
 // sequence.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::resolve::{chain_ending_at, first_name, native_units};
 use crate::api::*;
 use crate::file_info::FileInfo;
 use crate::mft::test_records::*;
+use crate::path::DeletedPathMarker::{Deleted, Lost, TooLong};
 use crate::path::*;
 
 /// A record of the fixtures. References to it carry `sequence`; the record is stored with
@@ -133,10 +134,19 @@ fn under_volume(components: &[&str]) -> PathBuf {
         })
 }
 
-fn found(components: &[&str], complete: bool) -> DeletedPath {
+/// A complete path: the volume path and then `components`.
+fn found(components: &[&str]) -> DeletedPath {
     DeletedPath {
+        marker: None,
         path: under_volume(components),
-        complete,
+    }
+}
+
+/// An incomplete path: `marker`, and `components` below it as a relative path.
+fn marked(marker: DeletedPathMarker, components: &[&str]) -> DeletedPath {
+    DeletedPath {
+        marker: Some(marker),
+        path: components.iter().collect(),
     }
 }
 
@@ -186,7 +196,7 @@ fn a_deleted_file_in_a_live_directory_has_the_path_it_had() {
     let live = tree(Node::file(26, at(25), "report.txt"));
     let deleted = tree(Node::file(26, at(25), "report.txt").freed());
 
-    let expected = found(&["docs", "2026", "report.txt"], true);
+    let expected = found(&["docs", "2026", "report.txt"]);
     assert_eq!(resolve(&deleted, 26), expected);
     assert_eq!(resolve(&live, 26), expected);
     assert_eq!(
@@ -200,7 +210,7 @@ fn a_deleted_file_in_a_live_directory_has_the_path_it_had() {
 #[test]
 fn a_deleted_file_in_the_root_is_complete() {
     let mft = volume_of(&[Node::file(24, root(), "top.txt").freed()]);
-    assert_eq!(resolve(&mft, 24), found(&["top.txt"], true));
+    assert_eq!(resolve(&mft, 24), found(&["top.txt"]));
 }
 
 // Directories freed one at a time keep their names, so the path through them to the live
@@ -215,18 +225,15 @@ fn a_deleted_file_in_deleted_directories_is_complete() {
         Node::dir(28, root(), "gone").freed(),
         Node::file(30, at(28), "other.txt").freed(),
     ]);
-    assert_eq!(
-        resolve(&mft, 27),
-        found(&["kept", "l1", "l2", "leaf.txt"], true)
-    );
-    assert_eq!(resolve(&mft, 30), found(&["gone", "other.txt"], true));
+    assert_eq!(resolve(&mft, 27), found(&["kept", "l1", "l2", "leaf.txt"]));
+    assert_eq!(resolve(&mft, 30), found(&["gone", "other.txt"]));
     // A freed directory's own path, and its own name as a "file": the same walk.
-    assert_eq!(resolve(&mft, 26), found(&["kept", "l1", "l2"], true));
+    assert_eq!(resolve(&mft, 26), found(&["kept", "l1", "l2"]));
     assert_cache_is_transparent(&mft);
 }
 
 // The reference rule, parent's side: reference `(24, 1)` names the record when live at sequence 1
-// or freed at sequence 2; anything else is another incarnation, breaking the chain at `<lost 24>`
+// or freed at sequence 2; anything else is another incarnation, breaking the chain at `Lost(24)`
 // while keeping what is below. Seen failing: accepting a freed record by its own sequence
 // (`Freed => reference` in `Liveness::of_reference`) fails the freed rows, accepting any sequence
 // fails S and S + 2, and dropping the freed rule fails the first row.
@@ -252,13 +259,13 @@ fn a_parent_is_named_by_its_sequence_when_live_and_by_its_sequence_plus_one_when
             Node::file(26, at(25), "leaf.txt").freed(),
         ]);
         let expected = if identified {
-            found(&["parent", "middle", "leaf.txt"], true)
+            found(&["parent", "middle", "leaf.txt"])
         } else {
-            found(&["<lost 24>", "middle", "leaf.txt"], false)
+            marked(Lost(24), &["middle", "leaf.txt"])
         };
         let row = format!("stored +{delta}, in use {in_use}, allocated {allocated}");
         assert_eq!(resolve(&mft, 26), expected, "{row}");
-        assert_eq!(resolve(&mft, 25).complete, identified, "{row}: middle");
+        assert_eq!(resolve(&mft, 25).is_complete(), identified, "{row}: middle");
         assert_cache_is_transparent(&mft);
     }
 }
@@ -273,12 +280,9 @@ fn a_reused_directory_breaks_the_chain_and_keeps_what_is_below() {
         Node::dir(26, at(25), "b").freed(),
         Node::file(27, at(26), "file.txt").freed(),
     ]);
-    assert_eq!(
-        resolve(&mft, 27),
-        found(&["<lost 24>", "a", "b", "file.txt"], false)
-    );
+    assert_eq!(resolve(&mft, 27), marked(Lost(24), &["a", "b", "file.txt"]));
     // The reused directory's own file, if it were still listed, is not under the old directory.
-    assert_eq!(resolve(&mft, 25), found(&["<lost 24>", "a"], false));
+    assert_eq!(resolve(&mft, 25), marked(Lost(24), &["a"]));
 }
 
 // A parent past the last record, one never valid, and a root not matching the reference's
@@ -290,18 +294,9 @@ fn a_missing_parent_and_a_stale_root_are_lost() {
         Node::file(25, reference(9, ROOT_RECORD), "stale-root.txt").freed(),
         Node::file(26, at(60), "nothing.txt").freed(),
     ]);
-    assert_eq!(
-        resolve(&mft, 24),
-        found(&["<lost 500>", "orphan.txt"], false)
-    );
-    assert_eq!(
-        resolve(&mft, 25),
-        found(&["<lost 5>", "stale-root.txt"], false)
-    );
-    assert_eq!(
-        resolve(&mft, 26),
-        found(&["<lost 60>", "nothing.txt"], false)
-    );
+    assert_eq!(resolve(&mft, 24), marked(Lost(500), &["orphan.txt"]));
+    assert_eq!(resolve(&mft, 25), marked(Lost(5), &["stale-root.txt"]));
+    assert_eq!(resolve(&mft, 26), marked(Lost(60), &["nothing.txt"]));
 }
 
 // A directory that kept no name cannot be shown in a path.
@@ -321,12 +316,12 @@ fn a_directory_without_a_name_is_lost() {
         ],
         &[24, 25],
     );
-    assert_eq!(resolve(&mft, 25), found(&["<lost 24>", "leaf.txt"], false));
+    assert_eq!(resolve(&mft, 25), marked(Lost(24), &["leaf.txt"]));
 }
 
 // `remove_dir_all` renames each directory under `$Extend\$Deleted` (record 29) before deleting
 // it, so a freed directory keeps only that random name and its files keep theirs. The walk stops
-// at `<deleted>` with the random name; without the `$Deleted` special case (a real live directory
+// at `Deleted` with the random name; without the `$Deleted` special case (a real live directory
 // here) it would give the complete path `$Extend\$Deleted\...` instead. A freed delete-pending
 // file keeps its own names under it.
 #[test]
@@ -352,19 +347,19 @@ fn a_directory_renamed_by_remove_dir_all_ends_the_path_at_deleted() {
     assert_ne!(resolved.path, live_29);
     assert_eq!(
         resolved,
-        found(&["<deleted>", "u9kq2xw7pf3n5c8v1jd4h6ra", "one.txt"], false)
+        marked(Deleted, &["u9kq2xw7pf3n5c8v1jd4h6ra", "one.txt"])
     );
     assert_eq!(
         resolve(&mft, 28),
-        found(&["<deleted>", "b3m7t1z5e9y2g6k0s4w8n2ql", "two.txt"], false)
+        marked(Deleted, &["b3m7t1z5e9y2g6k0s4w8n2ql", "two.txt"])
     );
     assert_eq!(
         resolve(&mft, 30),
-        found(&["<deleted>", "r8d2c6h0v4x1b5n9j3m7t2ya"], false)
+        marked(Deleted, &["r8d2c6h0v4x1b5n9j3m7t2ya"])
     );
     assert_eq!(
         resolve(&mft, 25),
-        found(&["<deleted>", "u9kq2xw7pf3n5c8v1jd4h6ra"], false)
+        marked(Deleted, &["u9kq2xw7pf3n5c8v1jd4h6ra"])
     );
     assert_cache_is_transparent(&mft);
 }
@@ -386,13 +381,13 @@ fn only_the_deleted_directory_under_extend_is_deleted() {
     ]);
     assert_eq!(
         resolve(&mft, 43),
-        found(&["<deleted>", "h4f8k2m6q0t3w7z1b5d9j2ne", "a.txt"], false)
+        marked(Deleted, &["h4f8k2m6q0t3w7z1b5d9j2ne", "a.txt"])
     );
-    assert_eq!(resolve(&mft, 44), found(&["documents", "b.txt"], true));
-    assert_eq!(resolve(&mft, 45), found(&["$Deleted", "c.txt"], true));
+    assert_eq!(resolve(&mft, 44), found(&["documents", "b.txt"]));
+    assert_eq!(resolve(&mft, 45), found(&["$Deleted", "c.txt"]));
 }
 
-// A directory loop collapses to one `<lost N>` component, named by the loop's lowest record
+// A directory loop collapses to one `Lost` marker, named by the loop's lowest record
 // regardless of entry point; what leads into the loop stays below the marker. Nothing on the loop
 // or the way in is cached, so a warm cache cannot change the answer. Seen failing: naming the
 // marker after the record where the walk noticed the loop gave different paths per entry point
@@ -420,20 +415,19 @@ fn a_loop_of_directories_is_lost_at_its_lowest_record() {
         nodes.push(Node::file(other, at(first + (tail + cycle) as u64 - 1), "other").freed());
         let mft = volume_of(&nodes);
 
-        let marker = format!("<lost {lowest}>");
-        let mut expected = vec![marker.as_str()];
+        let mut expected = Vec::new();
         let tail_names: Vec<String> = (0..tail).rev().map(|index| format!("d{index}")).collect();
         expected.extend(tail_names.iter().map(String::as_str));
         expected.push("leaf");
         let row = format!("{tail}+{cycle}");
         assert_eq!(
             resolve(&mft, leaf),
-            found(&expected, false),
+            marked(Lost(lowest), &expected),
             "{row}: the path into the loop"
         );
         assert_eq!(
             resolve(&mft, other),
-            found(&[marker.as_str(), "other"], false),
+            marked(Lost(lowest), &["other"]),
             "{row}: entered at another member"
         );
 
@@ -455,6 +449,81 @@ fn a_loop_of_directories_is_lost_at_its_lowest_record() {
     }
 }
 
+// A marker is a value, not text in the path: each kind and a lost record's number come out of
+// `marker` with no parsing, and `path` holds only real names, so it can be recreated under a
+// recovery folder as is (`<` and `>` are illegal in a Win32 name). `to_marked_path` gives the
+// display form with the marker as a component. Seen failing: before 0.5.3 the marker was text
+// in `path` and there was no `marker` field (this test did not compile).
+#[test]
+fn a_marker_is_a_value_and_the_path_below_it_has_only_real_names() {
+    let long = "d".repeat(254);
+    let mut nodes = vec![
+        Node::dir(11, root(), "$Extend"),
+        Node::dir(24, root(), "old-name").reused(),
+        Node::dir(25, at(24), "a").freed(),
+        Node::file(26, at(25), "lost.txt").freed(),
+        Node::dir(29, at(11), "$Deleted"),
+        Node::dir(30, at(29), "u9kq2xw7pf3n5c8v1jd4h6ra").freed(),
+        Node::file(31, at(30), "deleted.txt").freed(),
+        Node::dir(32, root(), "kept").freed(),
+        Node::file(33, at(32), "complete.txt").freed(),
+    ];
+    for level in 0..140 {
+        let number = 40 + level;
+        let parent = if level == 0 { root() } else { at(number - 1) };
+        nodes.push(Node::dir(number, parent, &long).freed());
+    }
+    nodes.push(Node::file(200, at(179), "deep.txt").freed());
+    let mft = volume_of(&nodes);
+
+    let lost = resolve(&mft, 26);
+    let Some(DeletedPathMarker::Lost(record_number)) = lost.marker else {
+        panic!("not lost: {lost:?}");
+    };
+    assert_eq!(record_number, 24);
+    assert_eq!(lost.path, PathBuf::from("a").join("lost.txt"));
+    assert!(!lost.is_complete());
+
+    let deleted = resolve(&mft, 31);
+    assert_eq!(deleted.marker, Some(DeletedPathMarker::Deleted));
+    assert_eq!(
+        deleted.path,
+        PathBuf::from("u9kq2xw7pf3n5c8v1jd4h6ra").join("deleted.txt")
+    );
+
+    let too_long = resolve(&mft, 200);
+    assert_eq!(too_long.marker, Some(DeletedPathMarker::TooLong));
+    assert_eq!(too_long.path, PathBuf::from("deep.txt"));
+
+    for (resolved, text) in [
+        (&lost, "<lost 24>"),
+        (&deleted, "<deleted>"),
+        (&too_long, "<too long>"),
+    ] {
+        let marker = resolved.marker.expect("a marker");
+        assert_eq!(marker.to_string(), text);
+        assert!(resolved.path.is_relative(), "{text}");
+        assert!(
+            !resolved.path.to_string_lossy().contains(['<', '>']),
+            "{text}: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.to_marked_path(Path::new(VOLUME_PATH)),
+            Path::new(VOLUME_PATH).join(text).join(&resolved.path),
+            "{text}"
+        );
+    }
+
+    // A complete path is the whole path, volume included, and has no marker to add.
+    let complete = resolve(&mft, 33);
+    assert_eq!(complete, found(&["kept", "complete.txt"]));
+    assert!(complete.is_complete());
+    assert_eq!(
+        complete.to_marked_path(Path::new(VOLUME_PATH)),
+        complete.path
+    );
+}
+
 // A loop of live directories gives the same answer: loop handling does not depend on freed
 // records.
 #[test]
@@ -464,10 +533,10 @@ fn a_loop_of_live_directories_is_lost_too() {
         Node::dir(25, at(24), "b"),
         Node::file(26, at(25), "f").freed(),
     ]);
-    assert_eq!(resolve(&mft, 26), found(&["<lost 24>", "f"], false));
+    assert_eq!(resolve(&mft, 26), marked(Lost(24), &["f"]));
 }
 
-// A path Win32 cannot address becomes `<too long>` plus the name, nothing above it. Exactly 32767
+// A path Win32 cannot address becomes `TooLong` with the name, nothing above it. Exactly 32767
 // UTF-16 units resolve, 32768 does not, whatever the units are made of, matching `resolve_path`'s
 // limit and chain.
 #[test]
@@ -484,7 +553,7 @@ fn a_path_is_complete_up_to_32767_utf16_units_and_too_long_after() {
             let mut cache = DeletedPathCache::new();
             for _ in 0..2 {
                 let at_end = mft.resolve_deleted_path(&first_name(&mft, end), &mut cache);
-                assert_eq!(at_end.complete, fits, "{row}");
+                assert_eq!(at_end.is_complete(), fits, "{row}");
                 if fits {
                     assert_eq!(native_units(&at_end.path), total, "{row}");
                     assert_eq!(
@@ -495,16 +564,16 @@ fn a_path_is_complete_up_to_32767_utf16_units_and_too_long_after() {
                 }
                 let under = mft.resolve_deleted_path(&first_name(&mft, file), &mut cache);
                 assert!(
-                    !under.complete && under.path.starts_with(under_volume(&["<too long>"])),
+                    under.marker == Some(TooLong),
                     "{row}: a file under the directory is past the limit"
                 );
                 let short = mft.resolve_deleted_path(&first_name(&mft, shallow), &mut cache);
-                assert!(short.complete, "{row}: the short path is not affected");
+                assert!(short.is_complete(), "{row}: the short path is not affected");
             }
             // A directory too long is remembered as such, and everything below it too; one that
             // fits is remembered with its path.
             match cache.0.get(&reference(1, end)) {
-                Some(DeletedEntry::Dir { complete: true, .. }) if fits => {}
+                Some(DeletedEntry::Dir { marker: None, .. }) if fits => {}
                 Some(DeletedEntry::TooLong) if !fits => {}
                 cached => panic!("{row}: the directory is cached as {cached:?}"),
             }
@@ -512,7 +581,7 @@ fn a_path_is_complete_up_to_32767_utf16_units_and_too_long_after() {
     }
 }
 
-// A chain far past the limit gives `<too long>`, unchanged by a cache holding the directories.
+// A chain far past the limit gives `TooLong`, unchanged by a cache holding the directories.
 #[test]
 fn a_deep_chain_of_deleted_directories_is_too_long() {
     let long = "d".repeat(254);
@@ -530,7 +599,7 @@ fn a_deep_chain_of_deleted_directories_is_too_long() {
     nodes.push(Node::file(shallow, at(FIRST_NORMAL_RECORD + 3), "shallow.txt").freed());
     let mft = volume_of(&nodes);
 
-    let expected = found(&["<too long>", "deep.txt"], false);
+    let expected = marked(TooLong, &["deep.txt"]);
     assert!(resolve(&mft, leaf) == expected);
     let mut cache = DeletedPathCache::new();
     for number in [leaf, shallow, leaf, shallow] {
@@ -540,7 +609,7 @@ fn a_deep_chain_of_deleted_directories_is_too_long() {
             "a cache changed the answer for {number}"
         );
     }
-    assert!(resolve(&mft, shallow).complete);
+    assert!(resolve(&mft, shallow).is_complete());
 }
 
 // A file with several hard links has one path per name, each walked on its own.
@@ -589,10 +658,10 @@ fn every_hard_link_of_a_deleted_file_resolves_on_its_own() {
     assert_eq!(
         paths,
         [
-            found(&["live-dir", "live-link"], true),
-            found(&["freed-dir", "freed-link"], true),
-            found(&["<lost 26>", "lost-link"], false),
-            found(&["<deleted>", "random-name", "deleted-link"], false),
+            found(&["live-dir", "live-link"]),
+            found(&["freed-dir", "freed-link"]),
+            marked(Lost(26), &["lost-link"]),
+            marked(Deleted, &["random-name", "deleted-link"]),
         ]
     );
     assert_cache_is_transparent(&mft);
@@ -610,9 +679,9 @@ fn a_cache_keeps_references_to_one_record_apart() {
         Node::file(27, reference(3, 24), "one-above.txt").freed(),
     ]);
     let expected = [
-        (25, found(&["dir", "valid.txt"], true)),
-        (26, found(&["<lost 24>", "same-sequence.txt"], false)),
-        (27, found(&["<lost 24>", "one-above.txt"], false)),
+        (25, found(&["dir", "valid.txt"])),
+        (26, marked(Lost(24), &["same-sequence.txt"])),
+        (27, marked(Lost(24), &["one-above.txt"])),
     ];
     for order in [[0usize, 1, 2], [2, 1, 0], [1, 0, 2]] {
         let mut cache = DeletedPathCache::new();
@@ -644,7 +713,7 @@ fn a_name_with_an_unpaired_surrogate_survives_in_a_deleted_path() {
             .freed(),
     ]);
     let resolved = resolve(&mft, 25);
-    assert!(resolved.complete);
+    assert!(resolved.is_complete());
 
     let separator = MAIN_SEPARATOR_STR;
     let units: Vec<u16> = VOLUME_PATH
@@ -725,7 +794,7 @@ fn the_deleted_directory_is_found_whatever_the_case_of_its_name() {
         ]);
         assert_eq!(
             resolve(&mft, 31),
-            found(&["<deleted>", "h4f8k2m6q0t3w7z1b5d9j2ne", "a.txt"], false),
+            marked(Deleted, &["h4f8k2m6q0t3w7z1b5d9j2ne", "a.txt"]),
             "{name}"
         );
     }
@@ -738,7 +807,7 @@ fn the_deleted_directory_is_found_whatever_the_case_of_its_name() {
         ]);
         assert_eq!(
             resolve(&mft, 31),
-            found(&["$Extend", name, "a.txt"], true),
+            found(&["$Extend", name, "a.txt"]),
             "{name}"
         );
     }
@@ -756,7 +825,7 @@ fn a_deleted_directory_under_another_system_record_is_an_ordinary_directory() {
     ]);
     assert_eq!(
         resolve(&mft, 31),
-        found(&["system", "$Deleted", "child", "a.txt"], true)
+        found(&["system", "$Deleted", "child", "a.txt"])
     );
 }
 
@@ -774,7 +843,7 @@ fn a_parent_slot_that_holds_zeroes_is_lost() {
         assert!(mft.record_count() > 26);
         assert_eq!(
             resolve(&mft, 24),
-            found(&["<lost 25>", "orphan.txt"], false),
+            marked(Lost(25), &["orphan.txt"]),
             "claimed sequence {claimed}"
         );
     }
@@ -792,9 +861,10 @@ fn long_chain(top: u64, levels: u64) -> Vec<Node> {
         .collect()
 }
 
-// A marker counts toward the 32767-unit limit like any other component: under `<lost 500>`, a
-// directory at exactly 32767 units is remembered with its path, 32768 as too long. Counting only
-// the volume path would keep the second.
+// A marker's text counts toward the 32767-unit limit like any other component: under
+// `Lost(500)`, a directory at exactly 32767 units (with `<lost 500>` as a component) is
+// remembered with its path, 32768 as too long. Counting only the volume path would keep the
+// second.
 #[test]
 fn a_marker_counts_toward_the_32767_unit_limit() {
     // Volume path, separator and marker, then 128 levels of 1 + 254, then the directory under test.
@@ -808,11 +878,11 @@ fn a_marker_counts_toward_the_32767_unit_limit() {
         let mut cache = DeletedPathCache::new();
         let resolved = mft.resolve_deleted_path(&name_of_record(&mft, 153), &mut cache);
         // A file under it is past the limit either way.
-        assert_eq!(resolved, found(&["<too long>", "f"], false));
+        assert_eq!(resolved, marked(TooLong, &["f"]));
         match cache.0.get(&at(152)) {
             Some(DeletedEntry::Dir {
                 units,
-                complete: false,
+                marker: Some(Lost(500)),
                 ..
             }) if fits => assert_eq!(*units, 32767),
             Some(DeletedEntry::TooLong) if !fits => {}
@@ -858,14 +928,15 @@ fn an_empty_directory_name_costs_one_separator_in_the_length() {
         let mut cache = DeletedPathCache::new();
         for _ in 0..2 {
             let resolved = mft.resolve_deleted_path(&name_of_record(&mft, 153), &mut cache);
-            assert_eq!(resolved.complete, fits, "{name_units} units, a file");
+            assert_eq!(resolved.is_complete(), fits, "{name_units} units, a file");
             if fits {
                 assert_eq!(native_units(&resolved.path), 32767, "{name_units} units");
             }
         }
         let second = mft.resolve_deleted_path(&name_of_record(&mft, 328), &mut cache);
         assert_eq!(
-            second.complete, fits,
+            second.is_complete(),
+            fits,
             "{name_units} units, the second branch"
         );
         assert_eq!(
@@ -874,7 +945,7 @@ fn an_empty_directory_name_costs_one_separator_in_the_length() {
             "a warm cache changed the answer"
         );
         let below = mft.resolve_deleted_path(&name_of_record(&mft, 155), &mut cache);
-        assert_eq!(below.path, found(&["<too long>", "f"], false).path);
+        assert_eq!(below.path, marked(TooLong, &["f"]).path);
         match cache.0.get(&at(154)) {
             Some(DeletedEntry::Dir { units, .. }) if fits => assert_eq!(*units, 32767),
             Some(DeletedEntry::TooLong) if !fits => {}
@@ -898,7 +969,7 @@ fn a_cached_too_long_directory_makes_what_is_below_it_too_long() {
     let mut cache = DeletedPathCache::new();
 
     let a = mft.resolve_deleted_path(&name_of_record(&mft, 154), &mut cache);
-    assert_eq!(a, found(&["<too long>", "a.txt"], false));
+    assert_eq!(a, marked(TooLong, &["a.txt"]));
     assert!(
         matches!(cache.0.get(&at(152)), Some(DeletedEntry::TooLong)),
         "the directory that does not fit"
@@ -906,7 +977,7 @@ fn a_cached_too_long_directory_makes_what_is_below_it_too_long() {
     assert!(!cache.0.contains_key(&at(153)), "not walked yet");
 
     let b = mft.resolve_deleted_path(&name_of_record(&mft, 155), &mut cache);
-    assert_eq!(b, found(&["<too long>", "b.txt"], false));
+    assert_eq!(b, marked(TooLong, &["b.txt"]));
     assert!(
         matches!(cache.0.get(&at(153)), Some(DeletedEntry::TooLong)),
         "learnt from the cached directory"
@@ -918,9 +989,9 @@ fn a_cached_too_long_directory_makes_what_is_below_it_too_long() {
     );
 }
 
-// A loop is always `<lost N>` at its lowest record, whatever its names: the walk finds the loop
+// A loop is always `Lost` at its lowest record, whatever its names: the walk finds the loop
 // before checking length, so a loop of long names, or one over the limit, never ends in
-// `<too long>` for some entry points and `<lost N>` for others.
+// `TooLong` for some entry points and `Lost` for others.
 #[test]
 fn a_loop_of_long_names_is_always_lost() {
     // The number of members and the name of each by its index.
@@ -950,7 +1021,7 @@ fn a_loop_of_long_names_is_always_lost() {
         for index in 0..members {
             assert_eq!(
                 resolve(&mft, 24 + members + index),
-                found(&["<lost 24>", "f"], false),
+                marked(Lost(24), &["f"]),
                 "{members} members, entry {index}"
             );
         }
@@ -994,9 +1065,7 @@ fn a_loop_of_unnamed_directories_is_walked_once_for_a_whole_scan() {
     let mft = volume_of(&nodes);
 
     let paths = scan_with_budget(&mft, 24 + LOOP..24 + 2 * LOOP, 8 * LOOP);
-    assert!(paths
-        .iter()
-        .all(|path| *path == found(&["<lost 24>", "f"], false)));
+    assert!(paths.iter().all(|path| *path == marked(Lost(24), &["f"])));
 }
 
 // A chain deeper than the limit: the deepest files are asked first, so each finds its path too
@@ -1026,12 +1095,8 @@ fn a_chain_past_the_limit_is_walked_once_for_a_whole_scan() {
     for (level, path) in paths.iter().rev().enumerate() {
         let fits = VOLUME_PATH.len() + (NAME_UNITS + 1) * (level + 1) + 2 <= 32767;
         fitting += usize::from(fits);
-        assert_eq!(path.complete, fits, "level {level}");
-        assert_eq!(
-            path.path.starts_with(under_volume(&["<too long>"])),
-            !fits,
-            "level {level}"
-        );
+        assert_eq!(path.is_complete(), fits, "level {level}");
+        assert_eq!(path.marker == Some(TooLong), !fits, "level {level}");
     }
     // Both sides of the limit were reached.
     assert!(
@@ -1084,8 +1149,8 @@ fn a_parent_that_is_not_a_directory_is_lost() {
         Node::file(26, root(), "live-not-a-directory"),
         Node::file(27, at(26), "leaf2.txt").freed(),
     ]);
-    assert_eq!(resolve(&mft, 25), found(&["<lost 24>", "leaf.txt"], false));
-    assert_eq!(resolve(&mft, 27), found(&["<lost 26>", "leaf2.txt"], false));
+    assert_eq!(resolve(&mft, 25), marked(Lost(24), &["leaf.txt"]));
+    assert_eq!(resolve(&mft, 27), marked(Lost(26), &["leaf2.txt"]));
 }
 
 // An unnamed directory adds no units to a path, but its separator does: a chain of 40k unnamed

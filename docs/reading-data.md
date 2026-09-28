@@ -3,7 +3,7 @@
 `NtfsFile::open_stream` returns a `StreamReader` (`Read + Seek`) over one data stream. It reads
 from the raw volume, so it works on a file Windows has open with no sharing, one you are denied,
 or a deleted one, without ever buffering the whole stream. This page covers what the reader does
-per stream kind, its errors, and what it cannot read. Other guides: [deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), [paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md), [the journal](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md).
+per stream kind, its errors, and what it cannot read. Other guides: [deleted files](deleted-files.md), [paths and caches](paths-and-caches.md), [the journal](journal.md).
 
 ## Opening a stream
 
@@ -55,7 +55,7 @@ clustered bytes. A stream with nothing stored (sparse, empty, lost) needs no ele
 
 `StreamReader::size` is the logical size, `initialized_size` the part NTFS wrote, `cluster_size`
 the unit of the runs, and `data_lost` marks a deleted file whose runs were lost (see
-[deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md)).
+[deleted files](deleted-files.md)).
 
 ## Extents
 
@@ -116,7 +116,7 @@ all read as they sit on the volume. A reparse point (`FILE_ATTRIBUTE_REPARSE_POI
 
 The reader reads through a normal volume handle, not the disk itself. A file being written, or
 written moments ago, may read old bytes until the volume is flushed. Flush before opening the
-`Mft` and the streams (see [deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), "Flush the volume first"):
+`Mft` and the streams (see [deleted files](deleted-files.md), "Flush the volume first"):
 
 ```rust,no_run
 # fn main() -> std::io::Result<()> {

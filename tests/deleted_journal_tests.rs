@@ -199,7 +199,7 @@ fn a_journal_delete_record_leads_to_the_deleted_file() {
         .find(|name| name.to_os_string() == file_record.name)
         .expect("the name");
     let resolved = mft.resolve_deleted_path(&name, &mut DeletedPathCache::new());
-    assert!(resolved.complete, "{resolved:?}");
+    assert!(resolved.is_complete(), "{resolved:?}");
     assert_eq!(resolved.path, volume_path(&file));
 }
 
