@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-28
+
+The path of a deleted file no longer has its marker as text inside it. The old text form put `<` and `>`
+into a path segment (`<lost 1234>`, `<deleted>`), and Win32 refuses those characters in a file name, so
+recreating the path elsewhere (for example copying it out) failed.
+
+### Added
+
+- `DeletedPathMarker` (`Lost(u64)`, `Deleted`, `TooLong`, `#[non_exhaustive]`): why
+  `Mft::resolve_deleted_path` stopped short of the volume, with the record number of a lost directory. Its
+  `Display` is the old marker text, `<lost 1234>`, `<deleted>` and `<too long>`.
+- `DeletedPath::marker`, `DeletedPath::is_complete()` and `DeletedPath::to_marked_path(volume)`, which gives
+  the path as 0.5.2 printed it (`\\.\C:\<lost 1234>\dir\file.txt`), for display.
+
+### Changed
+
+- **Breaking:** `DeletedPath::path` holds only names read from records, never marker text. A complete path
+  starts with the volume path, as before; an incomplete one is relative, the names below the marker
+  (`dir\file.txt` under `Lost(1234)`, the file's name alone under `TooLong`). Match on `marker` and pick a
+  name of your own for it instead of parsing the path. Resolution is unchanged: the same walk, the same
+  markers, and the marker's text still counts toward the 32767-unit limit.
+- **Breaking:** `DeletedPath::complete` is removed; use `is_complete()` (`marker.is_none()`).
+- The `list_deleted` example tells a file renamed by Windows on delete from `marker` instead of matching the
+  `<deleted>` text.
+
 ## [0.5.2] - 2026-09-25
 
 Deleted files work again, and this release adds the tools to use them: reading their data, resolving their
@@ -417,7 +442,8 @@ is 6 times faster.
 First tagged release. The crate could already read the `$MFT` into memory and read the USN journal.
 Earlier history (0.1.0 to 0.2.0, 2022) is not tagged and is not covered here.
 
-[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/kikijiki/ntfs-reader/compare/v0.4.7...v0.5.0

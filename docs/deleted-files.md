@@ -2,8 +2,8 @@
 
 Reading deleted files: what you get back, and what was measured. Reads the raw volume, so it
 needs an elevated process (see "Opening a volume" in the README). Other guides:
-[reading data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md),
-[paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md), [the journal](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md).
+[reading data](reading-data.md),
+[paths and caches](paths-and-caches.md), [the journal](journal.md).
 
 Deleting a file frees its MFT record and clusters; little else changes. Name, times, size and
 cluster list usually stay in the record; the data stays in the clusters until NTFS reuses them.
@@ -43,8 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for file in mft.deleted_files().filter(|file| !file.is_directory()) {
         let Some(name) = file.best_name() else { continue };
         let found = mft.resolve_deleted_path(&name, &mut cache);
-        // An incomplete path has a marker such as `<lost 1234>` where a directory is unknown.
-        println!("{} (complete path: {})", found.path.display(), found.complete);
+        // An incomplete path has a marker (`found.marker`) where a directory is unknown, shown as
+        // `\\.\C:\<lost 1234>\dir\file.txt`; `found.path` alone holds only the real names.
+        println!("{}", found.to_marked_path(mft.volume().path()).display());
 
         let Ok(mut stream) = file.open_stream(None) else { continue };
         // A file that had an attribute list lost the location of its non-resident data when it
@@ -69,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `examples/list_deleted.rs` and `examples/recover_file.rs` build on these calls with the checks a
 real tool needs (partial copies, refused destinations, exit codes). Paths and their markers are
-covered in [paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md).
+covered in [paths and caches](paths-and-caches.md).
 
 ## Flush the volume first
 
@@ -132,7 +133,7 @@ virtual disk it took 6 to 20 s, and one busy run saw nothing erased in 30 s. Era
 zeroes, or as random-looking bytes on a BitLocker volume, where the zeroes the SSD returns are
 decrypted. With delete notifications off
 (`fsutil behavior set DisableDeleteNotify NTFS 1`) nothing was erased in 22 minutes. The reader
-returns whatever the volume handle gives, not necessarily what's on the disk (see [The reader is not the disk](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md#the-reader-is-not-the-disk)),
+returns whatever the volume handle gives, not necessarily what's on the disk (see [The reader is not the disk](reading-data.md#the-reader-is-not-the-disk)),
 so zeroes or noise are an answer, not an error.
 
 ## What erodes it
@@ -147,15 +148,17 @@ so zeroes or noise are an answer, not an error.
   holds it open keeps its MFT record in use, under `$Extend\$Deleted` with a random name, until
   the last handle closes. Until then `Mft::files()` lists it under that name and
   `NtfsFile::is_deleted` is `false`. Once the handle closes, the record frees and the original
-  name and directory are gone for good: only the random name remains, path
-  `\\.\C:\<deleted>\<random name>`, `DeletedPath::complete` is `false`. Seen whenever something
-  (Windows Defender, observed) still held the file open.
+  name and directory are gone for good: only the random name remains, `DeletedPath::marker` is
+  `Some(DeletedPathMarker::Deleted)` and `path` is `<random name>` (shown as
+  `\\.\C:\<deleted>\<random name>`). Seen whenever something (Windows Defender, observed)
+  still held the file open.
 - **`remove_dir_all`.** `std::fs::remove_dir_all` renames each directory to a random name before
-  deleting it. Files inside keep their names, but directory names are lost: path becomes
-  `\\.\C:\<deleted>\<random name>\file.txt`, marker `<deleted>` where the real directories were,
-  `DeletedPath::complete` is `false`. Deleting entries one at a time (`remove_file`, then
-  `remove_dir`) keeps every directory name. `del`, `rd /s`, `Remove-Item -Recurse` and a Shell
-  permanent delete left the same record state as `remove_file`.
+  deleting it. Files inside keep their names, but directory names are lost: the marker is
+  `DeletedPathMarker::Deleted` where the real directories were and `path` is
+  `<random name>\file.txt` (shown as `\\.\C:\<deleted>\<random name>\file.txt`). Deleting
+  entries one at a time (`remove_file`, then `remove_dir`) keeps every directory name. `del`,
+  `rd /s`, `Remove-Item -Recurse` and a Shell permanent delete left the same record state as
+  `remove_file`.
 - **The Recycle Bin.** Sending a file to the Recycle Bin is a rename, not a delete: it stays a
   live file under `$RECYCLE.BIN`, and `Mft::files()` lists it.
 
@@ -172,7 +175,7 @@ so zeroes or noise are an answer, not an error.
   `file.names().any(|name| name.parent_id() == directory.file_id())`. Holds for live and deleted
   directories alike; `name.parent_reference() == directory.reference()` does not, since a freed
   record's sequence number is one higher.
-- Compressed and encrypted streams cannot be read (see [reading data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md)); like the rest of the crate, everything here needs an elevated process.
+- Compressed and encrypted streams cannot be read (see [reading data](reading-data.md)); like the rest of the crate, everything here needs an elevated process.
 - One `Mft` can be shared across threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap` and
   the path caches are `Send + Sync`); a path cache needs `&mut`, so give each thread its own.
 - To find what a USN journal `FILE_DELETE` record deleted, load the `Mft` before the delete: it
@@ -181,7 +184,7 @@ so zeroes or noise are an answer, not an error.
   can still find the file up to a point: `record_by_id` accepts a freed record, but rejects one
   NTFS has reused, which happened for the very next file on a quiet volume. Paths are a second
   problem when the directory was also deleted: `resolve_path` returns `None`, while
-  `resolve_deleted_path` still walks it. See [the journal guide](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md), "Paths of deleted files".
+  `resolve_deleted_path` still walks it. See [the journal guide](journal.md), "Paths of deleted files".
 
 ## What was measured
 

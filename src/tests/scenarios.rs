@@ -344,8 +344,8 @@ fn a_delete_pending_file_is_not_deleted_yet() {
         Some(path(&["$Extend", "$Deleted", "1b3f9a"]))
     );
     let walked = mft.resolve_deleted_path(&name, &mut DeletedPathCache::new());
-    assert!(!walked.complete);
-    assert_eq!(walked.path, path(&["<deleted>", "1b3f9a"]));
+    assert_eq!(walked.marker, Some(crate::DeletedPathMarker::Deleted));
+    assert_eq!(walked.path, std::path::Path::new("1b3f9a"));
 }
 
 // An extension record whose own flag and `$BITMAP` bit disagree is not a freed record, so it is
@@ -1085,7 +1085,7 @@ fn listing_deleted_files_gives_names_sizes_paths_and_what_can_be_recovered() {
         assert!(info.is_deleted);
         let name = file.best_name().expect("a name");
         let path = mft.resolve_deleted_path(&name, &mut cache);
-        assert!(path.complete);
+        assert!(path.is_complete());
         let mut stream = file.open_stream(None).expect("the stream opens");
         let state = stream.allocation(&bitmap).expect("the bitmap").state();
         let mut bytes = Vec::new();
@@ -1417,7 +1417,7 @@ fn a_journal_delete_is_resolved_from_the_snapshot_before_it_when_the_directory_i
     assert!(gone.is_deleted());
     let name = gone.best_name().expect("a name");
     let resolved = plain.resolve_deleted_path(&name, &mut DeletedPathCache::new());
-    assert!(resolved.complete);
+    assert!(resolved.is_complete());
     assert_eq!(resolved.path, expected_path);
 
     // After, with the directory record taken by another directory (same sequence as the freed one:
@@ -1433,13 +1433,8 @@ fn a_journal_delete_is_resolved_from_the_snapshot_before_it_when_the_directory_i
     let gone = reused.record_by_id(file_id).expect("the deleted file");
     let name = gone.best_name().expect("a name");
     let resolved = reused.resolve_deleted_path(&name, &mut DeletedPathCache::new());
-    assert!(!resolved.complete);
-    assert_eq!(
-        resolved.path,
-        std::path::Path::new(VOLUME_PATH)
-            .join("<lost 24>")
-            .join("report.txt")
-    );
+    assert_eq!(resolved.marker, Some(crate::DeletedPathMarker::Lost(24)));
+    assert_eq!(resolved.path, std::path::Path::new("report.txt"));
     assert_eq!(FileInfo::new(&gone).path, None);
 
     // The earlier snapshot has both, live, and the whole path.
@@ -1771,4 +1766,5 @@ fn what_the_guides_say_can_be_shared_between_threads_can() {
     shared::<DeletedPathCache>();
     shared::<DefaultPathCache>();
     shared::<crate::DeletedPath>();
+    shared::<crate::DeletedPathMarker>();
 }

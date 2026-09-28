@@ -108,7 +108,9 @@ pub use journal::{HistorySize, Journal, JournalOptions, JournalPosition, NextUsn
 #[cfg(any(windows, feature = "internals"))]
 pub use mft::Mft;
 #[cfg(any(windows, feature = "internals"))]
-pub use path::{CachedPath, DefaultPathCache, DeletedPath, DeletedPathCache, PathCache};
+pub use path::{
+    CachedPath, DefaultPathCache, DeletedPath, DeletedPathCache, DeletedPathMarker, PathCache,
+};
 #[cfg(any(windows, feature = "internals"))]
 pub use stream::{ExtentLocation, StreamExtent, StreamReader};
 #[cfg(any(windows, feature = "internals"))]

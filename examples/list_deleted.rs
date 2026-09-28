@@ -9,12 +9,13 @@
 //! trailing backslash; `C:` or `C:\` fail with "Access is denied" even elevated).
 //!
 //! A path starting with `?` is incomplete: a directory on the way could not be identified, and
-//! its place holds a marker like `<lost 1234>` (names record 1234) or `<deleted>`. A file
-//! deleted while open, or inside a `remove_dir_all` tree, is renamed by Windows into
-//! `$Extend\$Deleted` with a random name; the line adds `(renamed by Windows on delete)` when
-//! that marker is its own parent. A file inside such a tree keeps its real name; only its
-//! directories were renamed. `(data lost)` after a size means NTFS wiped the default stream on
-//! delete, or the record was reused: the size shown is not real. Directories print `<dir>`.
+//! its place holds a marker like `<lost 1234>` (names record 1234) or `<deleted>` (the display
+//! form of `DeletedPath::marker`). A file deleted while open, or inside a `remove_dir_all` tree,
+//! is renamed by Windows into `$Extend\$Deleted` with a random name; the line adds `(renamed by
+//! Windows on delete)` when that marker is its own parent. A file inside such a tree keeps its
+//! real name; only its directories were renamed. `(data lost)` after a size means NTFS wiped the
+//! default stream on delete, or the record was reused: the size shown is not real. Directories
+//! print `<dir>`.
 //! `--allocation` adds what the cluster bitmap says about the file's data. Control characters in
 //! names and paths are escaped as `\u{..}`.
 use std::env;
@@ -24,7 +25,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ntfs_reader::{
-    AllocationState, ClusterBitmap, DeletedPathCache, FileInfo, Mft, NtfsFile, Volume,
+    AllocationState, ClusterBitmap, DeletedPathCache, DeletedPathMarker, FileInfo, Mft, NtfsFile,
+    Volume,
 };
 
 mod support;
@@ -44,15 +46,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether the file's own name is in `$Extend\$Deleted`: the marker is the leaf's parent. A path
-/// that only passes through the marker (a file inside a renamed `remove_dir_all` tree) says
-/// nothing about the file's own name.
-fn renamed_on_delete(path: &Path, complete: bool) -> bool {
-    !complete
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|parent| parent == "<deleted>")
+/// Whether the file's own name is in `$Extend\$Deleted`: the marker is the leaf's parent, so
+/// the path below it is the name alone. A path that only passes through the marker (a file
+/// inside a renamed `remove_dir_all` tree) says nothing about the file's own name.
+fn renamed_on_delete(marker: Option<DeletedPathMarker>, below: &Path) -> bool {
+    marker == Some(DeletedPathMarker::Deleted) && below.components().count() == 1
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,10 +108,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (path, renamed) = match file.best_name() {
             Some(name) => {
                 let found = mft.resolve_deleted_path(&name, &mut cache);
-                let mark = if found.complete { "" } else { "? " };
+                let mark = if found.is_complete() { "" } else { "? " };
                 (
-                    format!("{mark}{}", found.path.display()),
-                    renamed_on_delete(&found.path, found.complete),
+                    format!(
+                        "{mark}{}",
+                        found.to_marked_path(mft.volume().path()).display()
+                    ),
+                    renamed_on_delete(found.marker, &found.path),
                 )
             }
             None => (String::from("? <no name>"), false),
@@ -175,25 +176,24 @@ mod tests {
 
     #[test]
     fn only_a_name_directly_under_the_deleted_marker_is_renamed_by_windows() {
-        let under = |parts: &[&str]| {
-            parts
-                .iter()
-                .fold(Path::new(r"\\.\C:").to_path_buf(), |p, c| p.join(c))
-        };
+        use DeletedPathMarker::{Deleted, Lost, TooLong};
+        let below = |parts: &[&str]| parts.iter().collect::<std::path::PathBuf>();
         // A file deleted while open, or a directory of a `remove_dir_all` tree: its own name.
-        assert!(renamed_on_delete(&under(&["<deleted>", "02BD0000"]), false));
+        assert!(renamed_on_delete(Some(Deleted), &below(&["02BD0000"])));
         // A file inside that tree keeps its real name: the marker is its grandparent.
         assert!(!renamed_on_delete(
-            &under(&["<deleted>", "02BD0000", "one.txt"]),
-            false
+            Some(Deleted),
+            &below(&["02BD0000", "one.txt"])
         ));
         assert!(!renamed_on_delete(
-            &under(&["<deleted>", "a", "b", "c.txt"]),
-            false
+            Some(Deleted),
+            &below(&["a", "b", "c.txt"])
         ));
-        // A complete path never has the marker, whatever a directory is called.
-        assert!(!renamed_on_delete(&under(&["<deleted>", "x"]), true));
-        assert!(!renamed_on_delete(&under(&["<lost 5>", "x"]), false));
-        assert!(!renamed_on_delete(&under(&["x"]), false));
+        // Only the `Deleted` marker; a complete path has none, whatever a directory is called.
+        assert!(!renamed_on_delete(None, &below(&["x"])));
+        assert!(!renamed_on_delete(Some(Lost(5)), &below(&["x"])));
+        assert!(!renamed_on_delete(Some(TooLong), &below(&["x"])));
+        let complete = Path::new(r"\\.\C:").join("$Deleted").join("x");
+        assert!(!renamed_on_delete(None, &complete));
     }
 }

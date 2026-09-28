@@ -27,7 +27,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ntfs_reader::{DeletedPath, DeletedPathCache, FileId, FileInfo, Mft, NtfsFileName, Volume};
+use ntfs_reader::{
+    DeletedPath, DeletedPathCache, DeletedPathMarker, FileId, FileInfo, Mft, NtfsFileName, Volume,
+};
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -136,7 +138,7 @@ fn volume_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("\\\\.\\{letter}:{}", &text[2..]))
 }
 
-/// The components of `path` under the volume path.
+/// The components of `path` under the volume path, or of a relative path (below a marker).
 fn below_volume(path: &Path) -> Vec<String> {
     path.components()
         .filter_map(|component| match component {
@@ -157,14 +159,16 @@ fn resolve(mft: &Mft, cache: &mut DeletedPathCache, name: &NtfsFileName) -> Dele
     resolved
 }
 
-/// `resolved` is `path`, complete or not.
+/// `resolved` is `path` under `marker`: the whole path when `marker` is `None`, else the part
+/// below the marker.
 #[track_caller]
-fn assert_path(resolved: &DeletedPath, path: PathBuf, complete: bool, what: &str) {
-    assert_eq!(
-        (&resolved.path, resolved.complete),
-        (&path, complete),
-        "{what}"
-    );
+fn assert_path(
+    resolved: &DeletedPath,
+    path: PathBuf,
+    marker: Option<DeletedPathMarker>,
+    what: &str,
+) {
+    assert_eq!((&resolved.path, resolved.marker), (&path, marker), "{what}");
 }
 
 /// Checks that `std`'s deletion did what was measured: freed record `number` has a name under
@@ -247,7 +251,7 @@ fn a_file_deleted_from_a_live_directory_has_its_win32_path() {
 
     let name = name_of(&mft, reference, "live parent");
     let resolved = resolve(&mft, &mut DeletedPathCache::new(), &name);
-    assert_path(&resolved, volume_path(&path), true, "the deleted file");
+    assert_path(&resolved, volume_path(&path), None, "the deleted file");
 
     let file = mft.record(number).expect("the record");
     let info = FileInfo::new(&file);
@@ -323,7 +327,7 @@ fn a_tree_deleted_one_entry_at_a_time_has_complete_paths() {
         assert_path(
             &resolve(&mft, &mut cache, &name),
             volume_path(path),
-            true,
+            None,
             &what,
         );
     }
@@ -337,8 +341,9 @@ fn a_tree_deleted_one_entry_at_a_time_has_complete_paths() {
 }
 
 /// The same tree deleted with `remove_dir_all`: every directory is renamed to a random name under
-/// `$Extend\$Deleted` before it is deleted, so the resolved path is `<deleted>`, the directory's
-/// random name, and the file's own name: incomplete. The files themselves keep their real names.
+/// `$Extend\$Deleted` before it is deleted, so the resolved path ends at the `Deleted` marker,
+/// with the directory's random name and the file's own name below it. The files themselves keep
+/// their real names.
 #[test]
 fn a_tree_deleted_with_remove_dir_all_ends_at_deleted() {
     let _serial = serial();
@@ -392,7 +397,7 @@ fn a_tree_deleted_with_remove_dir_all_ends_at_deleted() {
         }
         let name = name_of(&mft, *reference, &what);
         let resolved = resolve(&mft, &mut cache, &name);
-        assert!(!resolved.complete, "{what}");
+        assert_eq!(resolved.marker, Some(DeletedPathMarker::Deleted), "{what}");
         let parts = below_volume(&resolved.path);
         let real_directory = file
             .parent()
@@ -400,11 +405,10 @@ fn a_tree_deleted_with_remove_dir_all_ends_at_deleted() {
             .file_name()
             .unwrap()
             .to_string_lossy();
-        assert_eq!(parts.len(), 3, "{what}: {:?}", resolved.path);
-        assert_eq!(parts[0], "<deleted>", "{what}");
-        assert_ne!(parts[1], real_directory, "{what}: the real name is gone");
+        assert_eq!(parts.len(), 2, "{what}: {:?}", resolved.path);
+        assert_ne!(parts[0], real_directory, "{what}: the real name is gone");
         assert_eq!(
-            parts[2],
+            parts[1],
             file.file_name().unwrap().to_string_lossy(),
             "{what}"
         );
@@ -414,7 +418,7 @@ fn a_tree_deleted_with_remove_dir_all_ends_at_deleted() {
             "{what}: FileInfo has no path for an incomplete one"
         );
     }
-    // The directories themselves: `<deleted>` and the random name.
+    // The directories themselves: the random name under `Deleted`.
     for ((directory, reference), parent) in [&top, &l1]
         .iter()
         .zip(&directory_references)
@@ -433,10 +437,13 @@ fn a_tree_deleted_with_remove_dir_all_ends_at_deleted() {
         );
         let name = name_of(&mft, *reference, &what);
         let resolved = resolve(&mft, &mut cache, &name);
-        assert!(!resolved.complete, "{what}");
-        let parts = below_volume(&resolved.path);
-        assert_eq!(parts.len(), 2, "{what}: {:?}", resolved.path);
-        assert_eq!(parts[0], "<deleted>", "{what}");
+        assert_eq!(resolved.marker, Some(DeletedPathMarker::Deleted), "{what}");
+        assert_eq!(
+            below_volume(&resolved.path).len(),
+            1,
+            "{what}: {:?}",
+            resolved.path
+        );
     }
 }
 
@@ -453,7 +460,7 @@ fn take_record(dir: &Path, number: u64) -> bool {
 
 /// A directory record another directory reuses after the delete is not the directory the child's
 /// parent reference names (the sequence is the old one plus one, now in use): the chain breaks
-/// there with `<lost N>`, and what is below it is kept.
+/// there with `Lost(N)`, and what is below it is kept.
 #[test]
 fn a_reused_directory_record_breaks_the_path_at_lost() {
     let _serial = serial();
@@ -538,11 +545,8 @@ fn a_reused_directory_record_breaks_the_path_at_lost() {
     let resolved = resolve(&mft, &mut cache, &name);
     assert_path(
         &resolved,
-        PathBuf::from(format!("\\\\.\\{}:", test_volume_letter()))
-            .join(format!("<lost {top_number}>"))
-            .join("mid")
-            .join("victim.txt"),
-        false,
+        PathBuf::from("mid").join("victim.txt"),
+        Some(DeletedPathMarker::Lost(top_number)),
         "below the reused directory",
     );
 }
@@ -550,7 +554,7 @@ fn a_reused_directory_record_breaks_the_path_at_lost() {
 /// A file deleted while another handle keeps it open (delete-pending): the name is gone at once
 /// and the record stays in use, under a random name below `$Extend\$Deleted`, so it is not in
 /// `deleted_files()`. Once the handle closes, the record is freed and its path breaks at
-/// `<deleted>`: the original name and directory are lost for good.
+/// `Deleted`: the original name and directory are lost for good.
 #[test]
 fn a_file_deleted_while_open_breaks_at_deleted_once_it_is_freed() {
     let _serial = serial();
@@ -593,11 +597,8 @@ fn a_file_deleted_while_open_breaks_at_deleted_once_it_is_freed() {
         "the original name is lost at the rename"
     );
     let while_open = resolve(&pending, &mut DeletedPathCache::new(), &name);
-    assert!(!while_open.complete);
-    assert_eq!(
-        below_volume(&while_open.path),
-        ["<deleted>".to_string(), random.clone()]
-    );
+    assert_eq!(while_open.marker, Some(DeletedPathMarker::Deleted));
+    assert_eq!(below_volume(&while_open.path), [random.as_str()]);
 
     drop(handle);
     let mft = load_where("pending", &[number], |mft| is_freed(mft, number));
@@ -617,11 +618,8 @@ fn a_file_deleted_while_open_breaks_at_deleted_once_it_is_freed() {
         "the freed record keeps the random name"
     );
     let resolved = resolve(&mft, &mut DeletedPathCache::new(), &name);
-    assert!(!resolved.complete);
-    assert_eq!(
-        below_volume(&resolved.path),
-        ["<deleted>".to_string(), random]
-    );
+    assert_eq!(resolved.marker, Some(DeletedPathMarker::Deleted));
+    assert_eq!(below_volume(&resolved.path), [random]);
     let info = FileInfo::new(&mft.record(number).expect("the record"));
     assert!(info.is_deleted);
     assert_eq!(info.path, None);

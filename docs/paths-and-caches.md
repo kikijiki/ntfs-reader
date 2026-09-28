@@ -2,8 +2,8 @@
 
 The MFT stores only a name and parent per file; a full path is built by walking up the parent
 chain. This page covers the live and deleted walks, the caches that speed a scan, incomplete-path
-markers, and the limits. Other guides: [deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md),
-[the journal](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md), [reading data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md).
+markers, and the limits. Other guides: [deleted files](deleted-files.md),
+[the journal](journal.md), [reading data](reading-data.md).
 
 ## Live paths
 
@@ -108,28 +108,33 @@ cargo bench --bench cache_memory    # heap held by the cache
 
 `Mft::resolve_path` is strict on purpose: a live file never resolves through a freed directory. A
 deleted file needs a walk through freed directories that marks where it had to guess:
-`Mft::resolve_deleted_path(&name, &mut DeletedPathCache)` gives a `DeletedPath`: a `path` and
-`complete`, whether every directory was identified.
+`Mft::resolve_deleted_path(&name, &mut DeletedPathCache)` gives a `DeletedPath`: a `marker`,
+`None` when every directory was identified, and a `path`.
 
 A parent reference is followed when it names a live directory, like `resolve_path`, or a freed
 one: not in use, not allocated, sequence number one above the reference's, which is what deleting
 a directory does to its record. A parent must have the directory flag; its names are whatever the
 record still holds.
 
-When the walk cannot continue, it does not return `None`: it marks where the directory would be
-and sets `complete` to `false`. The marker is a component no ordinary Win32 name can be
-(`<`/`>` are forbidden there; a POSIX namespace name allows them, so this is only a convention),
-keeping whatever resolved below it, e.g. `\\.\C:\<lost 1234>\dir\file.txt`:
+When the walk cannot continue, it does not return `None`: it stops at a `DeletedPathMarker` and
+keeps whatever resolved below it. A complete `path` starts with the volume path, like
+`resolve_path`'s: `\\.\C:\dir\file.txt`. An incomplete one is relative, the names below the
+marker: `dir\file.txt` under `Lost(1234)`. `path` never holds marker text, so a recovery tool can
+recreate it under a folder of its own and name the marker's folder as it likes (`lost 1234`,
+`renamed on delete`). For display, `found.to_marked_path(mft.volume().path())` puts the
+marker's `Display` text in as a component: `\\.\C:\<lost 1234>\dir\file.txt`. That text holds `<`
+and `>`, which a Win32 name cannot (a POSIX namespace name can, so this is only a convention), so
+it is never a path to create a file at.
 
-| Marker         | Why the walk stopped                                                                                                    |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `<lost N>`     | Record N is missing, unnamed, reused, or another incarnation. A loop of directories collapses to one `<lost N>`, N its lowest record. Marks a directory record only; unrelated to `data_lost` or `AllocationState::Lost`. |
-| `<deleted>`    | `$Extend\$Deleted`: a directory `remove_dir_all` renamed before deleting, or a file deleted while open. What is below it keeps the random name NTFS gave it. |
-| `<too long>`   | Path would exceed 32767 UTF-16 units, markers included; followed by the name alone.                                     |
+| Marker        | Displays as  | Why the walk stopped                                                                                        |
+| ---------- | ------------ | ----------------------------------------------------------------------------------------------------------- |
+| `Lost(N)`  | `<lost N>`   | Record N is missing, unnamed, not a directory, reused, or another incarnation. A loop of directories collapses to one `Lost(N)`, N its lowest record. Marks a directory record only; unrelated to `data_lost` or `AllocationState::Lost`. |
+| `Deleted`  | `<deleted>`  | `$Extend\$Deleted`: a directory `remove_dir_all` renamed before deleting, or a file deleted while open. What is below it keeps the random name NTFS gave it. |
+| `TooLong`  | `<too long>` | Path would exceed 32767 UTF-16 units, marker text included; `path` is the name alone.                       |
 
 A marker means an incomplete path. Deleting with `remove_file`/`remove_dir` one entry at a time
 keeps the path complete regardless of how many directories were deleted; `remove_dir_all` ends it
-at `<deleted>`, since directories were renamed first and the real names are gone for good.
+at `Deleted`, since directories were renamed first and the real names are gone for good.
 
 NTFS keeps no rename history: a directory shows whatever name its record holds, at deletion or,
 if still live, now. A path reflects where the file was when its directories were last renamed,
@@ -146,7 +151,7 @@ time. Never reuse one across two `Mft`s; the result does not depend on the cache
 should use `with_caches` with one of each cache.
 
 ```rust,no_run
-# use ntfs_reader::{DefaultPathCache, DeletedPathCache, FileInfo, Mft, Volume};
+# use ntfs_reader::{DefaultPathCache, DeletedPathCache, DeletedPathMarker, FileInfo, Mft, Volume};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
 let (mut live, mut deleted) = (DefaultPathCache::new(), DeletedPathCache::new());
@@ -159,7 +164,17 @@ for file in mft.files().chain(mft.deleted_files()) {
 for file in mft.deleted_files() {
     for name in file.hard_links() {
         let found = mft.resolve_deleted_path(&name, &mut deleted);
-        println!("{} (complete: {})", found.path.display(), found.complete);
+        match found.marker {
+            None => println!("{}", found.path.display()),
+            // A name of your own for the marker, and the real names below it.
+            Some(DeletedPathMarker::Lost(record)) => {
+                println!("lost {record}\\{}", found.path.display())
+            }
+            Some(DeletedPathMarker::Deleted) => {
+                println!("renamed on delete\\{}", found.path.display())
+            }
+            Some(_) => println!("{}", found.to_marked_path(mft.volume().path()).display()),
+        }
     }
 }
 # Ok(())

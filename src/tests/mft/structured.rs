@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Cursor;
-use std::path::{PathBuf, MAIN_SEPARATOR_STR};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arbitrary::Arbitrary;
@@ -29,7 +29,7 @@ use crate::file::NtfsFile;
 use crate::file_info::FileInfo;
 use crate::mft::test_records::*;
 use crate::mft::Mft;
-use crate::path::{DefaultPathCache, DeletedPathCache};
+use crate::path::{DefaultPathCache, DeletedPathCache, DeletedPathMarker};
 use crate::property::{coverage, heavy_property, list, show_on_replay};
 use crate::volume::Volume;
 
@@ -262,7 +262,7 @@ enum AttributeSpec {
     /// A Win32 name `$Deleted` (upper case when `upper`, which the deleted walk also knows), whose
     /// parent is record 11 (`$Extend`) when `extend`, else the root. On a directory record under
     /// `$Extend` this is what Windows leaves after renaming a directory to `$Extend\$Deleted`; the
-    /// deleted walk ends there with `<deleted>`. A directory of that name anywhere else is
+    /// deleted walk ends there with `Deleted`. A directory of that name anywhere else is
     /// ordinary.
     DeletedName {
         upper: bool,
@@ -1459,7 +1459,7 @@ fn check_deleted_view(image: &Image) -> DeletedViewStats {
                 let resolved =
                     deleted.resolve_deleted_path(&gone_name, &mut DeletedPathCache::new());
                 assert!(
-                    resolved.complete && resolved.path == path,
+                    resolved.is_complete() && resolved.path == path,
                     "file {number}: the deleted path is not the live path: {resolved:?} against {path:?}"
                 );
                 stats.paths += 1;
@@ -1867,8 +1867,9 @@ fn delete_some(image: &Image) -> Option<History<'_>> {
 /// What the model says a path is.
 #[derive(Debug, PartialEq, Eq)]
 enum ModelPath {
-    /// The path as UTF-16, and whether the walk reached the volume.
-    Path(Vec<u16>, bool),
+    /// The path as UTF-16 with the marker's text as a component (`DeletedPath::to_marked_path`),
+    /// and the marker, `None` if the walk reached the volume.
+    Path(Vec<u16>, Option<DeletedPathMarker>),
     /// The description does not say (a loop, an extension record as a parent, a corrupted record).
     Unknown,
 }
@@ -1895,8 +1896,8 @@ fn names_of_file(deleted: &[DeletedFile], number: u64, world: &World) -> Option<
 /// The path `resolve_deleted_path` should give for a name with this parent and this leaf, worked out
 /// from the description: a hop names a directory that is live (the same reference) or freed (the
 /// sequence one above the reference's, wrapping), and takes its best name; anything else ends the
-/// walk at `<lost N>`; a directory called `$Deleted` whose parent is record 11 ends it at
-/// `<deleted>`; the root ends it at the volume when the reference is the root's.
+/// walk at `Lost(N)`; a directory called `$Deleted` whose parent is record 11 ends it at
+/// `Deleted`; the root ends it at the volume when the reference is the root's.
 fn model_path(
     history: &History,
     deleted: &[DeletedFile],
@@ -1913,7 +1914,7 @@ fn model_path(
             if reference == history.root_reference {
                 break None;
             }
-            break Some(format!("<lost {number}>"));
+            break Some(DeletedPathMarker::Lost(number));
         }
         if seen.contains(&reference) {
             return ModelPath::Unknown;
@@ -1925,7 +1926,7 @@ fn model_path(
         }
         let Some(record) = world.record(number) else {
             // Not one of the records (a reserved number, or past the end).
-            break Some(format!("<lost {number}>"));
+            break Some(DeletedPathMarker::Lost(number));
         };
         if history.tainted.contains(&number) {
             return ModelPath::Unknown;
@@ -1942,7 +1943,7 @@ fn model_path(
             false
         };
         if !record.is_directory || !named {
-            break Some(format!("<lost {number}>"));
+            break Some(DeletedPathMarker::Lost(number));
         }
         let Some(names) = names_of_file(deleted, number, world) else {
             return ModelPath::Unknown;
@@ -1954,24 +1955,23 @@ fn model_path(
             )
         };
         let Some(best) = names.iter().find(is_win32).or(names.first()) else {
-            break Some(format!("<lost {number}>"));
+            break Some(DeletedPathMarker::Lost(number));
         };
         let is_deleted_directory = best.0.len() == DELETED_NAME.len()
             && best.0.iter().zip(DELETED_NAME).all(|(&unit, expected)| {
                 unit < 0x80 && (unit as u8).eq_ignore_ascii_case(&(expected as u8))
             });
         if is_deleted_directory && best.2 & RECORD_NUMBER_MASK == EXTEND_RECORD {
-            break Some("<deleted>".to_string());
+            break Some(DeletedPathMarker::Deleted);
         }
         components.push(best.0.clone());
         reference = best.2;
     };
 
     let mut path: Vec<u16> = VOLUME_PATH.encode_utf16().collect();
-    let complete = marker.is_none();
     let below = marker
         .iter()
-        .map(|text| text.encode_utf16().collect::<Vec<u16>>())
+        .map(|marker| marker.to_string().encode_utf16().collect::<Vec<u16>>())
         .chain(components.into_iter().rev())
         .chain(std::iter::once(leaf.to_vec()));
     for component in below {
@@ -1983,7 +1983,7 @@ fn model_path(
         }
         path.extend_from_slice(&component);
     }
-    ModelPath::Path(path, complete)
+    ModelPath::Path(path, marker)
 }
 
 /// What `check_deleted_model` counted, so the test can tell the search reached each shape.
@@ -2198,19 +2198,21 @@ fn check_deleted_model(image: &Image) -> ModelStats {
                 resolved == mft.resolve_deleted_path(&name, &mut DeletedPathCache::new()),
                 "{what}: a cache changed the deleted path"
             );
-            if let ModelPath::Path(path, complete) =
+            if let ModelPath::Path(path, marker) =
                 model_path(&history, &model, &world, parent, &leaf)
             {
+                let marked = resolved.to_marked_path(Path::new(VOLUME_PATH));
                 assert_eq!(
-                    (units(resolved.path.as_os_str()), resolved.complete),
-                    (path, complete),
+                    (units(marked.as_os_str()), resolved.marker),
+                    (path, marker),
                     "{what}: the deleted path of {:?}",
                     name.to_string()
                 );
-                let text = resolved.path.to_string_lossy();
-                stats.paths_complete += usize::from(resolved.complete);
-                stats.paths_lost += usize::from(text.contains("<lost "));
-                stats.paths_deleted += usize::from(text.contains("<deleted>"));
+                stats.paths_complete += usize::from(resolved.is_complete());
+                stats.paths_lost +=
+                    usize::from(matches!(resolved.marker, Some(DeletedPathMarker::Lost(_))));
+                stats.paths_deleted +=
+                    usize::from(resolved.marker == Some(DeletedPathMarker::Deleted));
             }
         }
     }
@@ -2246,7 +2248,7 @@ fn check_deleted_model(image: &Image) -> ModelStats {
             }
             let resolved = mft.resolve_deleted_path(&gone_name, &mut DeletedPathCache::new());
             assert!(
-                resolved.complete && resolved.path == path,
+                resolved.is_complete() && resolved.path == path,
                 "file {number}: the path after a partial delete is not the live path: {resolved:?} against {path:?}"
             );
             stats.live_paths_after_partial_delete += 1;
@@ -2293,8 +2295,8 @@ fn the_deleted_view_is_what_the_description_says_for_a_partly_deleted_volume() {
     );
     coverage("files freed at the sequence wrap", stats.wrapped as u64, 5);
     coverage("complete deleted paths", stats.paths_complete as u64, 20);
-    coverage("<lost N> deleted paths", stats.paths_lost as u64, 5);
-    coverage("<deleted> paths", stats.paths_deleted as u64, 2);
+    coverage("Lost deleted paths", stats.paths_lost as u64, 5);
+    coverage("Deleted paths", stats.paths_deleted as u64, 2);
     coverage(
         "files deleted under live directories",
         stats.live_paths_after_partial_delete as u64,
@@ -2304,7 +2306,7 @@ fn the_deleted_view_is_what_the_description_says_for_a_partly_deleted_volume() {
 
 /// What `remove_dir_all` leaves: a directory renamed below `$Extend\$Deleted` (a directory called
 /// `$Deleted`, whose parent is record 11) under a random name and then deleted, and a file in it
-/// that keeps its own name and its parent reference. The path of the file ends at `<deleted>`,
+/// that keeps its own name and its parent reference. The path of the file ends at `Deleted`,
 /// followed by the random name and the file's own.
 #[test]
 fn a_file_below_a_directory_renamed_under_extend_deleted_ends_its_path_at_deleted() {
@@ -2358,11 +2360,14 @@ fn a_file_below_a_directory_renamed_under_extend_deleted_ends_its_path_at_delete
         &file.best_name().expect("a name"),
         &mut DeletedPathCache::new(),
     );
-    let expected: std::path::PathBuf = [VOLUME_PATH, "<deleted>", "d", "a"].iter().collect();
-    assert_eq!((resolved.path, resolved.complete), (expected, false));
+    let expected: std::path::PathBuf = ["d", "a"].iter().collect();
+    assert_eq!(
+        (resolved.marker, resolved.path),
+        (Some(DeletedPathMarker::Deleted), expected)
+    );
 
     let stats = check_deleted_model(&image);
-    // The file, and the directory `d` (already freed) whose own path ends at `<deleted>` too.
+    // The file, and the directory `d` (already freed) whose own path ends at `Deleted` too.
     assert_eq!((stats.newly_deleted, stats.paths_deleted), (1, 2));
 }
 

@@ -30,8 +30,8 @@ Complete programs in `examples`, run from an elevated shell with `cargo run --ex
 
 ## Guides
 
-[Deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), [the USN journal](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md),
-[paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md) and [reading file data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md), also on
+[Deleted files](docs/deleted-files.md), [the USN journal](docs/journal.md),
+[paths and caches](docs/paths-and-caches.md) and [reading file data](docs/reading-data.md), also on
 docs.rs in the `ntfs_reader::guide` modules.
 
 ## Opening a volume
@@ -62,7 +62,7 @@ for file in mft.files() {
 # }
 ```
 
-More: [paths and caches](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/paths-and-caches.md), docs.rs `ntfs_reader::guide::paths_and_caches`.
+More: [paths and caches](docs/paths-and-caches.md), docs.rs `ntfs_reader::guide::paths_and_caches`.
 
 ## Reading a stream
 
@@ -82,7 +82,7 @@ for file in mft.files().filter(|file| !file.is_directory()).take(10) {
 ```
 
 The reader is `Read + Seek` and works on a locked file; `Some(name)` opens an alternate stream.
-Compressed and encrypted streams error out. More: [reading data](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/reading-data.md), docs.rs `ntfs_reader::guide::reading_data`.
+Compressed and encrypted streams error out. More: [reading data](docs/reading-data.md), docs.rs `ntfs_reader::guide::reading_data`.
 
 ## Deleted files
 
@@ -94,15 +94,16 @@ let mut cache = DeletedPathCache::new();
 for file in mft.deleted_files().filter(|file| !file.is_directory()) {
     let Some(name) = file.best_name() else { continue };
     let found = mft.resolve_deleted_path(&name, &mut cache);
-    // An incomplete path has a marker such as `<lost 1234>` where a directory is unknown.
-    println!("{} (complete path: {})", found.path.display(), found.complete);
+    // An incomplete path has a marker (`found.marker`) where a directory is unknown, shown as
+    // `\\.\C:\<lost 1234>\dir\file.txt`; `found.path` alone holds only the real names.
+    println!("{}", found.to_marked_path(mft.volume().path()).display());
 }
 # Ok(())
 # }
 ```
 
 Deleted data is best effort: NTFS reuses a freed record for a new file (the very next one, on a quiet
-volume), and a free cluster may already be trimmed (zeroes, or noise on BitLocker). More: [deleted files](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/deleted-files.md), docs.rs `ntfs_reader::guide::deleted_files`.
+volume), and a free cluster may already be trimmed (zeroes, or noise on BitLocker). More: [deleted files](docs/deleted-files.md), docs.rs `ntfs_reader::guide::deleted_files`.
 
 ## Watching the journal
 
@@ -137,9 +138,9 @@ loop {
 ```
 
 Test `FILE_DELETE` first: a temporary file created and deleted through one handle is one record with
-both bits. Modified files, attributes and hard links have their own reasons. More: [the journal](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/docs/journal.md), docs.rs `ntfs_reader::guide::journal`.
+both bits. Modified files, attributes and hard links have their own reasons. More: [the journal](docs/journal.md), docs.rs `ntfs_reader::guide::journal`.
 
 ## Development
 
 Building, testing and the development shell are described in
-[CONTRIBUTING.md](https://github.com/kikijiki/ntfs-reader/blob/v0.5.2/CONTRIBUTING.md).
+[CONTRIBUTING.md](CONTRIBUTING.md).
