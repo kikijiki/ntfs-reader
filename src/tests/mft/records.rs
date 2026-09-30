@@ -541,7 +541,7 @@ fn read_data_fs_ignores_record_of_another_base() {
     assert_eq!(data, Some(vec![0xAB, 0xCD]));
 }
 
-// Review follow-up: a list entry whose target record's sequence no longer matches what the
+// A list entry whose target record's sequence no longer matches what the
 // entry expects (freed and reused since the list was written) is ignored, the same check
 // NtfsFile::records makes for a base record's own reference.
 #[test]
@@ -1027,4 +1027,496 @@ fn read_data_fs_rejects_extents_that_do_not_follow_each_other() {
         matches!(repeated, Err(NtfsReaderError::InvalidDataRun { .. })),
         "the same extent twice: {repeated:?}"
     );
+}
+
+/// A compact `Mft` finds the same live file, with the same `FileInfo`, as the ordinary
+/// fixed-stride one built from the same bytes, and ends up smaller (a name and a size take far
+/// less than a whole 1 KiB record).
+#[test]
+fn new_compact_matches_from_parts_and_is_smaller() {
+    let mut file = new_record(24, 1, 0);
+    let offset = add_standard_information(&mut file, ATTRIBUTES_OFFSET, 0);
+    let offset = add_file_name(&mut file, offset, "a.txt", 0);
+    finish_record(&mut file, offset);
+
+    let (volume, data, bitmap) = raw_parts(vec![file]);
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let compact = Mft::from_parts_compact(volume, data, bitmap).expect("a compact Mft");
+
+    let mut cache = DefaultPathCache::new();
+    let expected: Vec<_> = whole
+        .files()
+        .map(|file| (file.number(), FileInfo::with_cache(&file, &mut cache)))
+        .collect();
+    let found: Vec<_> = compact
+        .files()
+        .map(|file| (file.number(), FileInfo::with_cache(&file, &mut cache)))
+        .collect();
+    assert_eq!(found, expected);
+    assert_eq!(found[0].1.name, "a.txt");
+
+    assert!(
+        compact.size_in_memory() < whole.size_in_memory(),
+        "compact {} must be smaller than whole {}",
+        compact.size_in_memory(),
+        whole.size_in_memory()
+    );
+}
+
+/// A compact `Mft` keeps the same extension-record index and freed records as a whole `Mft`,
+/// preserving the metadata needed by `deleted_files()` and `is_deleted()`.
+#[test]
+fn new_compact_indexes_extensions_and_keeps_freed_records() {
+    let mut live = new_record(24, 1, 0);
+    let offset = add_standard_information(&mut live, ATTRIBUTES_OFFSET, 0);
+    let offset = add_file_name(&mut live, offset, "live.txt", 0);
+    finish_record(&mut live, offset);
+
+    let mut extension = new_record(25, 1, reference(1, 24));
+    let offset = add_nonresident_data(&mut extension, ATTRIBUTES_OFFSET, 5000);
+    finish_record(&mut extension, offset);
+
+    let freed_number = FIRST_NORMAL_RECORD + 2;
+    let mut freed = new_record(freed_number, 3, 0);
+    let offset = add_standard_information(&mut freed, ATTRIBUTES_OFFSET, 0);
+    let offset = add_file_name(&mut freed, offset, "gone.txt", 0);
+    finish_record(&mut freed, offset);
+    mark_freed(&mut freed);
+
+    let (volume, data, mut bitmap) = raw_parts(vec![live, extension, freed]);
+    bitmap[freed_number as usize / 8] &= !(1 << (freed_number % 8));
+
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let names = |mft: &Mft| -> Vec<u64> { mft.files().map(|file| file.number()).collect() };
+    let record_names =
+        |mft: &Mft, base: u64| -> usize { mft.record(base).unwrap().records().count() };
+
+    assert_eq!(names(&whole), vec![FIRST_NORMAL_RECORD]);
+    assert_eq!(record_names(&whole, FIRST_NORMAL_RECORD), 2);
+    assert_eq!(whole.deleted_files().count(), 1);
+
+    let compact = Mft::from_parts_compact(volume, data, bitmap).expect("a compact Mft");
+    assert_eq!(names(&compact), vec![FIRST_NORMAL_RECORD]);
+    assert_eq!(record_names(&compact, FIRST_NORMAL_RECORD), 2);
+    assert_eq!(compact.deleted_files().count(), 1);
+    assert!(compact.record(freed_number).is_some());
+}
+
+fn assert_compact_keeps_record_with_the_usa_after_used_size(freed: bool) {
+    let mut record = new_record(24, 2, 0);
+    let offset = add_standard_information(&mut record, ATTRIBUTES_OFFSET, 0);
+    let offset = add_file_name(&mut record, offset, "late-usa.txt", 0);
+    finish_record(&mut record, offset);
+    record.copy_within(UPDATE_SEQUENCE_OFFSET..UPDATE_SEQUENCE_OFFSET + 6, 900);
+    write_u16(&mut record, 4, 900);
+    if freed {
+        mark_freed(&mut record);
+    }
+    let (volume, data, mut bitmap) = raw_parts(vec![record]);
+    if freed {
+        bitmap[24 / 8] &= !(1 << (24 % 8));
+    }
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let compact = Mft::from_parts_compact(volume, data, bitmap).unwrap();
+    let expected = whole
+        .record(24)
+        .expect("whole loader accepts this USA layout");
+    let found = compact
+        .record(24)
+        .expect("compact loader must retain the accepted record's USA");
+    assert_eq!(FileInfo::new(&found), FileInfo::new(&expected));
+    assert_eq!(found.is_deleted(), freed);
+    assert_eq!(compact.files().count(), whole.files().count());
+    assert_eq!(
+        compact.deleted_files().count(),
+        whole.deleted_files().count()
+    );
+    assert_eq!(compact.corrupt_records(), whole.corrupt_records());
+    assert_eq!(compact.corrupt_records(), 0);
+}
+
+#[test]
+fn compact_keeps_live_record_with_the_usa_after_used_size() {
+    assert_compact_keeps_record_with_the_usa_after_used_size(false);
+}
+
+#[test]
+fn compact_keeps_freed_record_with_the_usa_after_used_size() {
+    assert_compact_keeps_record_with_the_usa_after_used_size(true);
+}
+
+#[test]
+fn compact_allocation_failures_return_errors() {
+    let mut live = new_record(24, 1, 0);
+    let end = add_file_name(&mut live, ATTRIBUTES_OFFSET, "live", 0);
+    finish_record(&mut live, end);
+    let mut live_extension = new_record(25, 1, reference(1, 24));
+    let end = add_nonresident_data(&mut live_extension, ATTRIBUTES_OFFSET, 123);
+    finish_record(&mut live_extension, end);
+    let mut freed = new_record(26, 2, 0);
+    let end = add_file_name(&mut freed, ATTRIBUTES_OFFSET, "freed", 0);
+    finish_record(&mut freed, end);
+    mark_freed(&mut freed);
+    let mut freed_extension = new_record(27, 2, reference(1, 26));
+    let end = add_nonresident_data(&mut freed_extension, ATTRIBUTES_OFFSET, 456);
+    finish_record(&mut freed_extension, end);
+    mark_freed(&mut freed_extension);
+    let (volume, data, mut bitmap) = raw_parts(vec![live, live_extension, freed, freed_extension]);
+    bitmap[26 / 8] &= !((1 << (26 % 8)) | (1 << (27 % 8)));
+    let compact_bytes: u64 = data
+        .as_chunks::<RECORD_SIZE>()
+        .0
+        .iter()
+        .map(|record| u32::from_le_bytes(record[24..28].try_into().unwrap()) as u64)
+        .map(|used| used.next_multiple_of(8))
+        .sum();
+    // Chunk buffer, compact bytes, offset table, live and freed extension indexes.
+    let requests = [
+        data.len() as u64,
+        compact_bytes,
+        (data.len() as u64 / 1024 + 1) * 8,
+        16,
+        16,
+    ];
+    for (successful, expected) in requests.into_iter().enumerate() {
+        let result = allocation_budget::after(successful, || {
+            Mft::from_parts_compact(volume.clone(), data.clone(), bitmap.clone())
+        });
+        assert!(
+            matches!(result, Err(NtfsReaderError::AllocationTooLarge { size }) if size == expected),
+            "allocation {successful} ({expected} bytes) must return AllocationTooLarge: {result:?}"
+        );
+    }
+    let compact = allocation_budget::after(requests.len(), || {
+        Mft::from_parts_compact(volume, data, bitmap)
+    })
+    .unwrap();
+    assert_eq!(compact.record(24).unwrap().records().count(), 2);
+    assert_eq!(compact.record(26).unwrap().records().count(), 2);
+}
+
+/// Switch images when the compact loader seeks back after reading its first image in full.
+struct ChangingCompactReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+    second: Option<Vec<u8>>,
+}
+
+impl Read for ChangingCompactReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.cursor.read(buf)
+    }
+}
+
+impl Seek for ChangingCompactReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        if position == SeekFrom::Start(0)
+            && self.cursor.position() == self.cursor.get_ref().len() as u64
+        {
+            if let Some(second) = self.second.take() {
+                self.cursor = std::io::Cursor::new(second);
+            }
+        }
+        self.cursor.seek(position)
+    }
+}
+
+fn changing_compact(existing: bool) -> NtfsReaderResult<Mft> {
+    let record = |contents: &[u8]| {
+        let mut record = new_record(24, 1, 0);
+        let end = add_file_name(&mut record, ATTRIBUTES_OFFSET, "growing.txt", 0);
+        let end =
+            add_resident_attribute(&mut record, end, NtfsAttributeType::Data, 1, "", contents);
+        finish_record(&mut record, end);
+        record
+    };
+    let (volume, mut first, bitmap) = raw_parts(vec![record(&[])]);
+    if !existing {
+        first.fill(0);
+    }
+    let (_, second, _) = raw_parts(vec![record(&[0xAB; 512])]);
+    let size = first.len() as u64;
+    let value = MftValue::Runs(RunCursor::new(
+        &volume,
+        size,
+        vec![DataRun::Data {
+            offset: 0,
+            length: size,
+        }],
+    )?);
+    let reader = ChangingCompactReader {
+        cursor: std::io::Cursor::new(first),
+        second: Some(second),
+    };
+    Mft::from_value_compact(volume, reader, value, bitmap)
+}
+
+fn assert_compact_growth_is_fallible(existing: bool, successful: usize) {
+    let result = allocation_budget::after(successful, || changing_compact(existing));
+    assert!(
+        matches!(result, Err(NtfsReaderError::AllocationTooLarge { .. })),
+        "growing second-pass records must reserve fallibly: {result:?}"
+    );
+    let compact = changing_compact(existing).unwrap();
+    let file = compact.record(24).expect("second-pass record is retained");
+    assert_eq!(FileInfo::new(&file).size, 512);
+    assert_eq!(FileInfo::new(&file).name, "growing.txt");
+    assert_eq!(compact.corrupt_records(), 0);
+    assert_eq!(compact.files().count(), 1);
+}
+
+#[test]
+fn compact_newly_valid_records_reserve_fallibly() {
+    // The initially empty compact buffer needs no allocation until the second pass.
+    assert_compact_growth_is_fallible(false, 2);
+}
+
+#[test]
+fn compact_growing_records_reserve_fallibly() {
+    assert_compact_growth_is_fallible(true, 3);
+}
+
+#[test]
+fn compact_size_arithmetic_rejects_unrepresentable_allocations() {
+    assert_eq!(checked_compact_entries(24).unwrap(), 25);
+    assert!(matches!(
+        checked_compact_entries(u64::MAX),
+        Err(NtfsReaderError::AllocationTooLarge { .. })
+    ));
+    let table = checked_compact_entries(u32::MAX as u64);
+    let four_gib_table = checked_compact_entries(536_870_911);
+    let bytes = checked_chunk_bytes(4_294_967_296, 1);
+    if usize::BITS == 32 {
+        assert!(
+            matches!(
+                four_gib_table,
+                Err(NtfsReaderError::AllocationTooLarge {
+                    size: 4_294_967_296
+                })
+            ),
+            "representable entry count still needs a 4 GiB offset table: {four_gib_table:?}"
+        );
+        assert!(
+            matches!(table, Err(NtfsReaderError::AllocationTooLarge { .. })),
+            "compact offset table must not narrow on i686: {table:?}"
+        );
+        assert!(
+            matches!(
+                bytes,
+                Err(NtfsReaderError::AllocationTooLarge {
+                    size: 4_294_967_296
+                })
+            ),
+            "compact byte count must not narrow on i686: {bytes:?}"
+        );
+    } else {
+        assert_eq!(four_gib_table.unwrap(), 536_870_912);
+        assert_eq!(table.unwrap() as u64, 4_294_967_296);
+        assert_eq!(bytes.unwrap() as u64, 4_294_967_296);
+    }
+}
+
+/// Chunk sizing must check both multiplication overflow and narrowing to `usize`. An unchecked
+/// `(count * record_size) as usize` truncates once the product exceeds 32-bit `usize` capacity.
+/// Exercise u64 overflow separately from a 4 GiB product that fits u64 but not 32-bit usize,
+/// using the arithmetic helper without allocating a large buffer.
+#[test]
+fn checked_chunk_bytes_rejects_what_it_cannot_hold() {
+    assert_eq!(checked_chunk_bytes(10, 1024).unwrap(), 10240);
+    assert!(matches!(
+        checked_chunk_bytes(u64::MAX, 2),
+        Err(NtfsReaderError::AllocationTooLarge { .. })
+    ));
+    let four_gib = checked_chunk_bytes(4_194_304, 1024);
+    if usize::BITS == 32 {
+        assert!(
+            matches!(
+                four_gib,
+                Err(NtfsReaderError::AllocationTooLarge {
+                    size: 4_294_967_296
+                })
+            ),
+            "4 GiB fits u64 but must not narrow into a 32-bit chunk: {four_gib:?}"
+        );
+    } else {
+        assert_eq!(four_gib.unwrap() as u64, 4_294_967_296);
+    }
+}
+
+#[test]
+fn a_small_window_rejects_a_record_ending_at_four_gib() {
+    let mut mft = mft_with(Vec::new());
+    mft.record_count = 4_194_304;
+    mft.load_window(0, 1, |data| {
+        data.fill(0);
+        Ok(())
+    })
+    .unwrap();
+    assert!(mft.record(4_194_303).is_none());
+    assert!(mft.record(4_194_304).is_none());
+    // A nonzero window start must apply the same bound to the relative record index.
+    mft.first = 1;
+    mft.record_count += 1;
+    assert!(mft.record(4_194_304).is_none());
+}
+
+#[test]
+fn run_cursor_visits_each_sequential_run_once() {
+    const RUNS: usize = 4096;
+    let mut cursor = RunCursor::new(
+        &test_volume(),
+        (RUNS * RECORD_SIZE) as u64,
+        vec![
+            DataRun::Sparse {
+                length: RECORD_SIZE as u64
+            };
+            RUNS
+        ],
+    )
+    .unwrap();
+    let mut reader = std::io::Cursor::new(Vec::new());
+    let mut buf = [0xAB; RECORD_SIZE];
+    for _ in 0..RUNS {
+        assert_eq!(cursor.read(&mut reader, &mut buf).unwrap(), RECORD_SIZE);
+        assert!(buf.iter().all(|&byte| byte == 0));
+    }
+    assert_eq!(cursor.read(&mut reader, &mut buf).unwrap(), 0);
+    assert_eq!(
+        cursor.run_visits, RUNS,
+        "sequential reads must not revisit earlier runs"
+    );
+}
+
+#[test]
+fn run_cursor_preserves_bytes_across_chunk_boundaries_and_rewind() {
+    let runs = vec![
+        DataRun::Data {
+            offset: 5,
+            length: 3,
+        },
+        DataRun::Sparse { length: 0 },
+        DataRun::Sparse { length: 3 },
+        DataRun::Data {
+            offset: 1,
+            length: 5,
+        },
+        DataRun::Sparse { length: 2 },
+        DataRun::Data {
+            offset: 8,
+            length: 4,
+        },
+    ];
+    let expected = [5, 6, 7, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0, 8, 9];
+    for chunk_size in 1..=18 {
+        let mut value = MftValue::Runs(
+            RunCursor::new(&test_volume(), expected.len() as u64, runs.clone()).unwrap(),
+        );
+        let mut reader = std::io::Cursor::new((0..32).collect::<Vec<u8>>());
+        for _ in 0..2 {
+            let mut found = Vec::new();
+            let mut buf = vec![0xAB; chunk_size];
+            loop {
+                let read = value.read(&mut reader, &mut buf).unwrap();
+                if read == 0 {
+                    break;
+                }
+                found.extend_from_slice(&buf[..read]);
+            }
+            assert_eq!(found, expected, "chunk size {chunk_size}");
+            value.rewind();
+        }
+    }
+}
+
+/// Chunk-buffer growth must return `NtfsReaderError` when allocation fails rather than abort
+/// through `Vec::resize`. `resize_checked` first reserves with `try_reserve_exact`.
+#[test]
+fn resize_checked_reports_an_allocation_that_cannot_be_made_instead_of_aborting() {
+    let mut buf = Vec::new();
+    assert!(matches!(
+        resize_checked(&mut buf, usize::MAX),
+        Err(NtfsReaderError::AllocationTooLarge { size }) if size == usize::MAX as u64
+    ));
+    resize_checked(&mut buf, 16).unwrap();
+    assert_eq!(buf, vec![0u8; 16]);
+}
+
+/// Compact offsets use 8-byte units, so a u32 table would wrap past about 32 GiB of trimmed
+/// records and make later records address the wrong spans. Exercise `push_compact_offset`
+/// across that boundary without allocating the corresponding record data.
+#[test]
+fn compact_offsets_do_not_wrap_past_32_gib_of_trimmed_records() {
+    // One 8-byte unit below the u32 offset boundary, then four more 8-byte records.
+    let mut offsets = vec![0u64];
+    let mut total = (u64::from(u32::MAX) - 1) * 8;
+    for _ in 0..4 {
+        push_compact_offset(&mut offsets, &mut total, 8);
+    }
+    assert!(
+        offsets.windows(2).all(|pair| pair[0] < pair[1]),
+        "offsets must strictly increase past the u32 boundary too: {offsets:?}"
+    );
+    let last = *offsets.last().unwrap();
+    assert!(
+        last > u64::from(u32::MAX),
+        "the real offset is past u32::MAX: {last}"
+    );
+    assert_ne!(
+        last, last as u32 as u64,
+        "this offset would wrap in a u32 table"
+    );
+}
+
+/// Compact trimming must preserve resident data at the end of a record: data filling the
+/// record with no room for an End marker, a marker in the last eight bytes, and a shorter
+/// record that can be trimmed. These exact boundaries expose alignment and off-by-one errors.
+#[test]
+fn new_compact_matches_at_used_size_edges() {
+    for target in [RECORD_SIZE, RECORD_SIZE - 8, RECORD_SIZE - 16] {
+        let mut base = new_record(24, 1, 0);
+        let mut offset = ATTRIBUTES_OFFSET;
+        offset = add_standard_information(&mut base, offset, 0);
+        offset = add_file_name(&mut base, offset, "a.txt", 0);
+
+        // Every offset these builders hand back is 8-aligned (they `align_to_eight` their own
+        // length), and so is every `target`, so this fills the resident $DATA value to exactly
+        // `target` bytes with nothing left to pad: `add_resident_attribute`'s own 8-byte
+        // alignment of the value never has to round up.
+        let value_len = target - offset - 24; // 24 = add_resident_attribute_raw's NAME_OFFSET.
+        assert_eq!(
+            value_len % 8,
+            0,
+            "target {target} is not reachable with no padding"
+        );
+        let value = vec![0xABu8; value_len];
+        offset = add_resident_attribute(&mut base, offset, NtfsAttributeType::Data, 2, "", &value);
+        assert_eq!(
+            offset, target,
+            "fixture did not reach the intended used_size"
+        );
+        finish_record(&mut base, offset);
+
+        let (volume, data, bitmap) = raw_parts(vec![base]);
+        let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+        let compact = Mft::from_parts_compact(volume, data, bitmap)
+            .unwrap_or_else(|e| panic!("target {target}: a compact Mft: {e}"));
+
+        let whole_file = whole
+            .files()
+            .next()
+            .unwrap_or_else(|| panic!("target {target}: whole"));
+        let compact_file = compact
+            .files()
+            .next()
+            .unwrap_or_else(|| panic!("target {target}: compact"));
+        assert_eq!(
+            compact_file.resident_data(),
+            whole_file.resident_data(),
+            "target {target}: resident $DATA differs between Mft::new_compact and Mft::new"
+        );
+        assert_eq!(
+            FileInfo::new(&compact_file),
+            FileInfo::new(&whole_file),
+            "target {target}: FileInfo differs between Mft::new_compact and Mft::new"
+        );
+    }
 }

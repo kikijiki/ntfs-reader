@@ -4,6 +4,49 @@
 
 use super::*;
 
+struct FlatImage(PathBuf);
+
+impl FlatImage {
+    fn new(boot: &[u8], length: u64) -> Self {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+        let number = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ntfs-reader-volume-image-{}-{nonce}-{number}.img",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create a unique synthetic image");
+        let image = Self(path);
+        file.write_all(boot).unwrap();
+        file.set_len(length).unwrap();
+        image
+    }
+
+    fn set_len(&self, length: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.0)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+    }
+}
+
+impl Drop for FlatImage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 // A NUL ends a Windows path string early, so `CreateFileW` would open a shorter path than the
 // one asked for. This must be rejected before any open attempt, not surfaced as a not-found error.
 #[test]
@@ -159,6 +202,112 @@ fn geometry_rejects_overflowing_volume_size() {
         &boot_sector(512, 8, u64::MAX, 786_432, -10),
         "total_sectors",
     );
+}
+
+// Exercise the same construction path as Volume::new, with bytes and an independent
+// backing-device length instead of a real Windows handle.
+#[test]
+fn volume_rejects_a_boot_size_wildly_larger_than_its_device() {
+    let boot = boot_sector(512, 8, 1 << 40, 4, -10);
+    let result = Volume::from_reader(Path::new("volume"), boot.as_slice(), 1 << 20);
+    assert!(
+        matches!(
+            result,
+            Err(NtfsReaderError::InvalidBootSector {
+                field: "total_sectors"
+            })
+        ),
+        "a 1 MiB device must reject a 512 TiB boot size, got {result:?}"
+    );
+}
+
+#[test]
+fn volume_rejects_any_boot_size_above_its_device_length() {
+    // Include the first byte/sector above the bound and sizes near both integer limits.
+    for (sectors, device_size) in [
+        (16, 8191),
+        (16, 7680),
+        (1 << 54, i64::MAX as u64),
+        (u64::MAX / 512, i64::MAX as u64),
+    ] {
+        let boot = boot_sector(512, 8, sectors, 1, -10);
+        let result = Volume::from_reader(Path::new("volume"), boot.as_slice(), device_size);
+        assert!(
+            matches!(
+                result,
+                Err(NtfsReaderError::InvalidBootSector {
+                    field: "total_sectors"
+                })
+            ),
+            "{sectors} sectors on a {device_size} byte device: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn volume_accepts_equal_or_larger_devices_and_keeps_the_boot_size() {
+    for sector_size in [512, 4096] {
+        let boot = boot_sector(sector_size, 8, 64, 4, -10);
+        let size = u64::from(sector_size) * 64;
+        // A volume may have one trailing sector or a larger region of unused backing space.
+        for device_size in [size, size + u64::from(sector_size), 1 << 40] {
+            let volume = Volume::from_reader(Path::new("volume"), boot.as_slice(), device_size)
+                .expect("the file system fits in its device");
+            assert_eq!(volume.volume_size(), size, "keep the file-system boundary");
+            assert_eq!(volume.cluster_size(), u64::from(sector_size) * 8);
+            assert_eq!(volume.path(), Path::new("volume"));
+        }
+    }
+}
+
+#[test]
+fn device_length_rejects_incomplete_or_nonpositive_replies() {
+    for (length, returned) in [
+        (4096, 0),
+        (4096, 7),
+        (4096, 9),
+        (0, 8),
+        (-1, 8),
+        (i64::MIN, 8),
+    ] {
+        let error = checked_device_length(length, returned)
+            .expect_err("a malformed reply must not become a usable device length");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    for length in [1, 4096, i64::MAX] {
+        assert_eq!(checked_device_length(length, 8).unwrap(), length as u64);
+    }
+}
+
+#[test]
+fn ordinary_image_file_opens_and_keeps_its_boot_size() {
+    let image = FlatImage::new(&boot_sector(512, 8, 16, 1, -10), 8192);
+    for length in [8192, 8704, 65536] {
+        image.set_len(length);
+        let volume = Volume::new(&image.0).expect("open a flat image using its file length");
+        assert_eq!(volume.volume_size(), 8192);
+        assert_eq!(volume.cluster_size(), 4096);
+        assert_eq!(volume.path(), image.0);
+    }
+}
+
+#[test]
+fn ordinary_image_file_rejects_a_boot_size_larger_than_the_file() {
+    // One byte too short, or a huge claim in a small file: the containing disk's
+    // capacity must never replace the image's own logical file length.
+    for (sectors, length) in [(16, 8191), (1 << 40, 8192)] {
+        let image = FlatImage::new(&boot_sector(512, 8, sectors, 1, -10), length);
+        let result = Volume::new(&image.0);
+        assert!(
+            matches!(
+                result,
+                Err(NtfsReaderError::InvalidBootSector {
+                    field: "total_sectors"
+                })
+            ),
+            "{sectors} sectors in a {length} byte image must be refused: {result:?}"
+        );
+    }
 }
 
 // `Volume::new` has no test for a non-elevated process: the test machine runs elevated, so

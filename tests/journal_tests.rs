@@ -195,6 +195,55 @@ fn journal_new_returns_an_error_for_a_non_utf8_path_instead_of_panicking() {
     );
 }
 
+/// `fsutil usn deletejournal /D` only schedules deletion and returns before it finishes;
+/// adding `/N` waits. A large journal can otherwise still be deleting when `createjournal`
+/// immediately follows. Panics on failure with the `fsutil` output, since a deletion that
+/// could not be scheduled cannot be fixed by waiting.
+fn deletejournal_and_wait(volume_arg: &str) {
+    let output = std::process::Command::new("fsutil")
+        .args(["usn", "deletejournal", "/D", "/N", volume_arg])
+        .output()
+        .expect("run fsutil usn deletejournal");
+    assert!(
+        output.status.success(),
+        "fsutil usn deletejournal /D /N failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `fsutil usn createjournal`, retried briefly on `ERROR_JOURNAL_DELETE_IN_PROGRESS` (1178) in
+/// case a delete `/N` was supposed to have waited for is somehow still finishing (belt and braces
+/// alongside [`deletejournal_and_wait`], not a substitute for it). Any other failure panics on the
+/// first attempt's own message.
+fn createjournal_retrying(volume_arg: &str) {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        let output = std::process::Command::new("fsutil")
+            .args(["usn", "createjournal", "m=1000", "a=100", volume_arg])
+            .output()
+            .expect("run fsutil usn createjournal");
+        if output.status.success() {
+            return;
+        }
+        let message =
+            String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("1178"),
+            "fsutil usn createjournal failed: {message}"
+        );
+        if attempt + 1 == ATTEMPTS {
+            panic!(
+                "fsutil usn createjournal still failed with 1178 (journal delete in progress) \
+                 after {ATTEMPTS} attempts: {message}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            500 * u64::from(attempt + 1),
+        ));
+    }
+}
+
 /// Restores the USN journal on `volume_arg` (e.g. `"T:"`) when dropped, so a test that
 /// deactivates the journal to force `Journal::new` to fail after `CreateFileW` still leaves the
 /// volume as it found it, even if an assertion above fails.
@@ -224,13 +273,7 @@ fn journal_new_does_not_leak_the_volume_handle_when_it_fails_after_create_file(
     // Deactivate the journal so CreateFileW succeeds but the following FSCTL_QUERY_USN_JOURNAL
     // fails: exercises the early-return path in Journal::new that drops the volume handle
     // without closing it.
-    let status = std::process::Command::new("fsutil")
-        .args(["usn", "deletejournal", "/D", &volume_arg])
-        .status()?;
-    assert!(
-        status.success(),
-        "fsutil usn deletejournal failed, cannot deactivate the journal for this test"
-    );
+    deletejournal_and_wait(&volume_arg);
     let _restore = JournalRestoreGuard {
         volume_arg: volume_arg.clone(),
     };
@@ -332,18 +375,12 @@ fn journal_new_rejects_a_stale_journal_id() -> NtfsReaderResult<()> {
     drop(journal);
 
     // Recreate the journal so its UsnJournalID changes, making the saved position above stale.
-    let status = std::process::Command::new("fsutil")
-        .args(["usn", "deletejournal", "/D", &volume_arg])
-        .status()?;
-    assert!(status.success(), "fsutil usn deletejournal failed");
+    deletejournal_and_wait(&volume_arg);
     // The guard's own `createjournal` on drop is a harmless no-op after the explicit one below.
     let _restore = JournalRestoreGuard {
         volume_arg: volume_arg.clone(),
     };
-    let status = std::process::Command::new("fsutil")
-        .args(["usn", "createjournal", "m=1000", "a=100", &volume_arg])
-        .status()?;
-    assert!(status.success(), "fsutil usn createjournal failed");
+    createjournal_retrying(&volume_arg);
 
     let volume = Volume::new(format!("\\\\?\\{}", volume_arg))?;
     let options = JournalOptions {

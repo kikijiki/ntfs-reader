@@ -206,6 +206,31 @@ fn a_deleted_file_in_a_live_directory_has_the_path_it_had() {
     assert_cache_is_transparent(&deleted);
 }
 
+// `DeletedPathCache` is meaningful only for the `Mft` it walked. Reusing it with another `Mft`
+// must clear cached paths, even when both images share a directory record number and sequence.
+#[test]
+fn deleted_path_cache_reused_on_a_second_mft_starts_empty_instead_of_stale() {
+    let build = |name: &str| {
+        volume_of(&[
+            Node::dir(24, root(), name),
+            Node::file(25, at(24), "leaf.txt").freed(),
+        ])
+    };
+    let mft1 = build("from-mft1");
+    let mft2 = build("from-mft2");
+
+    let mut cache = DeletedPathCache::new();
+    assert_eq!(
+        mft1.resolve_deleted_path(&name_of_record(&mft1, 25), &mut cache),
+        found(&["from-mft1", "leaf.txt"]),
+    );
+    assert_eq!(
+        mft2.resolve_deleted_path(&name_of_record(&mft2, 25), &mut cache),
+        found(&["from-mft2", "leaf.txt"]),
+        "reusing the cache on a second Mft must resolve its own path, not the first Mft's stale one",
+    );
+}
+
 // A file at the top of the volume: no directory at all.
 #[test]
 fn a_deleted_file_in_the_root_is_complete() {
@@ -572,7 +597,7 @@ fn a_path_is_complete_up_to_32767_utf16_units_and_too_long_after() {
             }
             // A directory too long is remembered as such, and everything below it too; one that
             // fits is remembered with its path.
-            match cache.0.get(&reference(1, end)) {
+            match cache.entries.get(&reference(1, end)) {
                 Some(DeletedEntry::Dir { marker: None, .. }) if fits => {}
                 Some(DeletedEntry::TooLong) if !fits => {}
                 cached => panic!("{row}: the directory is cached as {cached:?}"),
@@ -879,7 +904,7 @@ fn a_marker_counts_toward_the_32767_unit_limit() {
         let resolved = mft.resolve_deleted_path(&name_of_record(&mft, 153), &mut cache);
         // A file under it is past the limit either way.
         assert_eq!(resolved, marked(TooLong, &["f"]));
-        match cache.0.get(&at(152)) {
+        match cache.entries.get(&at(152)) {
             Some(DeletedEntry::Dir {
                 units,
                 marker: Some(Lost(500)),
@@ -946,7 +971,7 @@ fn an_empty_directory_name_costs_one_separator_in_the_length() {
         );
         let below = mft.resolve_deleted_path(&name_of_record(&mft, 155), &mut cache);
         assert_eq!(below.path, marked(TooLong, &["f"]).path);
-        match cache.0.get(&at(154)) {
+        match cache.entries.get(&at(154)) {
             Some(DeletedEntry::Dir { units, .. }) if fits => assert_eq!(*units, 32767),
             Some(DeletedEntry::TooLong) if !fits => {}
             cached => panic!("{name_units} units: the directory is cached as {cached:?}"),
@@ -971,15 +996,15 @@ fn a_cached_too_long_directory_makes_what_is_below_it_too_long() {
     let a = mft.resolve_deleted_path(&name_of_record(&mft, 154), &mut cache);
     assert_eq!(a, marked(TooLong, &["a.txt"]));
     assert!(
-        matches!(cache.0.get(&at(152)), Some(DeletedEntry::TooLong)),
+        matches!(cache.entries.get(&at(152)), Some(DeletedEntry::TooLong)),
         "the directory that does not fit"
     );
-    assert!(!cache.0.contains_key(&at(153)), "not walked yet");
+    assert!(!cache.entries.contains_key(&at(153)), "not walked yet");
 
     let b = mft.resolve_deleted_path(&name_of_record(&mft, 155), &mut cache);
     assert_eq!(b, marked(TooLong, &["b.txt"]));
     assert!(
-        matches!(cache.0.get(&at(153)), Some(DeletedEntry::TooLong)),
+        matches!(cache.entries.get(&at(153)), Some(DeletedEntry::TooLong)),
         "learnt from the cached directory"
     );
     assert_eq!(
@@ -1151,6 +1176,34 @@ fn a_parent_that_is_not_a_directory_is_lost() {
     ]);
     assert_eq!(resolve(&mft, 25), marked(Lost(24), &["leaf.txt"]));
     assert_eq!(resolve(&mft, 27), marked(Lost(26), &["leaf2.txt"]));
+}
+
+// A parent reference must identify a base directory, never an extension record. The extension
+// here sets its own directory flag while its base is a plain file, so `is_directory()` alone
+// cannot establish that it is a valid parent. Resolving through it must report a lost parent.
+#[test]
+fn a_parent_that_is_an_extension_record_flagged_as_a_directory_is_lost() {
+    let base = FIRST_NORMAL_RECORD;
+    let ext = FIRST_NORMAL_RECORD + 1;
+    let child = FIRST_NORMAL_RECORD + 2;
+
+    let mut ext_record = new_record(ext, 1, at(base));
+    set_record_flags(&mut ext_record, directory_flags());
+    let offset = add_end_marker(&mut ext_record, ATTRIBUTES_OFFSET);
+    finish_record(&mut ext_record, offset);
+
+    let records = vec![
+        (ROOT_RECORD, root_record()),
+        (base, Node::file(base, root(), "base").record()),
+        (ext, ext_record),
+        (
+            child,
+            Node::file(child, at(ext), "leaf.txt").freed().record(),
+        ),
+    ];
+    let mft = mft_with_at_freed(records, &[child]);
+
+    assert_eq!(resolve(&mft, child), marked(Lost(ext), &["leaf.txt"]));
 }
 
 // An unnamed directory adds no units to a path, but its separator does: a chain of 40k unnamed

@@ -207,9 +207,15 @@ fn ioctl_bits(volume: &File, first: u64, count: u64) -> (u64, Vec<bool>) {
 // where allocated runs have lengths and starts that are not multiples of 8 (small files of odd
 // sizes, every other one deleted). The two snapshots are taken at slightly different moments, so
 // a cluster may differ only where the driver's own bitmap changed between them.
+//
+// The window around the fixture needs enough allocation transitions to expose ordering bugs.
+// A fixed 64k-cluster window can fall inside a long contiguous extent, including space released
+// by a shadow copy's diff area. Grow the window until enough transitions are visible, or until
+// it covers the whole volume.
 #[test]
 fn the_cluster_bitmap_agrees_with_the_bitmap_ioctl_cluster_by_cluster() {
     const WINDOW: u64 = 64 * 1024;
+    const MAX_WINDOW: u64 = 8 * 1024 * 1024;
     let letter = test_volume_letter();
     let volume = open_volume(&letter);
     let total = ntfs_volume_data(&volume).TotalClusters as u64;
@@ -246,55 +252,66 @@ fn the_cluster_bitmap_agrees_with_the_bitmap_ioctl_cluster_by_cluster() {
         panic!("the fixture file is not stored in clusters");
     };
     let near = offset / bitmap.cluster_size();
-    let first = near.saturating_sub(WINDOW / 2) & !7;
-    let end = (first + WINDOW).min(total);
-    assert!(
-        end - first >= WINDOW.min(total),
-        "the window is {} clusters",
-        end - first
-    );
-
-    let (before_start, before) = ioctl_bits(&volume, first, end - first);
-    flush_volume(&letter);
-    let bitmap_now = ClusterBitmap::new(&mft).expect("read the cluster bitmap again");
-    let (after_start, after) = ioctl_bits(&volume, first, end - first);
-    assert_eq!((before_start, after_start), (first, first));
-    assert!(before.len() as u64 >= end - first && after.len() as u64 >= end - first);
     drop(bitmap);
 
-    let mut differing = 0;
-    let mut runs = 0;
-    for cluster in first..end {
-        let index = (cluster - first) as usize;
-        let ours = bitmap_now.is_allocated(cluster);
-        if index > 0 && before[index] != before[index - 1] {
-            runs += 1;
+    let mut window = WINDOW;
+    loop {
+        let first = near.saturating_sub(window / 2) & !7;
+        let end = (first + window).min(total);
+        assert!(
+            end - first >= window.min(total),
+            "the window is {} clusters",
+            end - first
+        );
+
+        let (before_start, before) = ioctl_bits(&volume, first, end - first);
+        flush_volume(&letter);
+        let bitmap_now = ClusterBitmap::new(&mft).expect("read the cluster bitmap again");
+        let (after_start, after) = ioctl_bits(&volume, first, end - first);
+        assert_eq!((before_start, after_start), (first, first));
+        assert!(before.len() as u64 >= end - first && after.len() as u64 >= end - first);
+
+        let mut differing = 0;
+        let mut runs = 0;
+        for cluster in first..end {
+            let index = (cluster - first) as usize;
+            let ours = bitmap_now.is_allocated(cluster);
+            if index > 0 && before[index] != before[index - 1] {
+                runs += 1;
+            }
+            if before[index] != after[index] {
+                // The driver's own bitmap moved here: either answer is right.
+                continue;
+            }
+            if ours != before[index] {
+                differing += 1;
+                assert!(
+                    differing < 20,
+                    "cluster {cluster} (bit {} of byte {}) is {ours} in the crate and {} in the ioctl",
+                    cluster % 8,
+                    cluster / 8,
+                    before[index]
+                );
+            }
         }
-        if before[index] != after[index] {
-            // The driver's own bitmap moved here: either answer is right.
-            continue;
-        }
-        if ours != before[index] {
-            differing += 1;
+        assert_eq!(
+            differing, 0,
+            "clusters where the crate and the ioctl disagree"
+        );
+
+        let exhausted = window >= MAX_WINDOW || end - first >= total;
+        if runs >= 20 || exhausted {
             assert!(
-                differing < 20,
-                "cluster {cluster} (bit {} of byte {}) is {ours} in the crate and {} in the ioctl",
-                cluster % 8,
-                cluster / 8,
-                before[index]
+                runs >= 20,
+                "the stretch has only {runs} changes between allocated and free even at a \
+                 {window}-cluster window (of {total} on the volume): it cannot show a bit order"
             );
+            eprintln!(
+                "bit order: {} clusters from {first} agree, {runs} allocation changes (window {window})",
+                end - first
+            );
+            break;
         }
+        window *= 8;
     }
-    assert_eq!(
-        differing, 0,
-        "clusters where the crate and the ioctl disagree"
-    );
-    assert!(
-        runs >= 20,
-        "the stretch has only {runs} changes between allocated and free: it cannot show a bit order"
-    );
-    eprintln!(
-        "bit order: {} clusters from {first} agree, {runs} allocation changes",
-        end - first
-    );
 }

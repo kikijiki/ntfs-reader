@@ -3,6 +3,7 @@
 // See the LICENSE files in the project root for details.
 
 use std::cell::Cell;
+use std::mem;
 
 use crate::api::*;
 use crate::file_info::FileInfo;
@@ -17,7 +18,7 @@ struct CountingCache {
 }
 
 impl PathCache for CountingCache {
-    fn get(&self, reference: u64) -> CachedPath<'_> {
+    fn get(&mut self, reference: u64) -> CachedPath<'_> {
         self.gets.set(self.gets.get() + 1);
         self.inner.get(reference)
     }
@@ -186,9 +187,8 @@ fn stale_and_valid_siblings() -> (Mft, NtfsFileName, NtfsFileName) {
     (mft, stale_name, valid_name)
 }
 
-// Found by review after the first fix: the cache must key on the full reference (record +
-// sequence), not the bare record number, or a stale reference resolved first poisons the cache
-// for a later, valid sibling with the same record number.
+// The cache must key on the full reference (record and sequence), or a stale reference
+// resolved first poisons the cache for a later, valid sibling with the same record number.
 #[test]
 fn resolve_path_does_not_cache_a_failure_across_a_valid_sibling() {
     let (mft, stale_name, valid_name) = stale_and_valid_siblings();
@@ -207,8 +207,8 @@ fn resolve_path_does_not_cache_a_failure_across_a_valid_sibling() {
     );
 }
 
-// Found by review after the first fix, reverse ordering: a valid reference resolved first must
-// not let a later, stale reference to the same record number reuse its cached path.
+// A valid reference resolved first must not let a later, stale reference to the same record
+// number reuse its cached path.
 #[test]
 fn resolve_path_does_not_reuse_a_cached_path_for_a_stale_reference() {
     let (mft, stale_name, valid_name) = stale_and_valid_siblings();
@@ -225,9 +225,49 @@ fn resolve_path_does_not_reuse_a_cached_path_for_a_stale_reference() {
     );
 }
 
-// Found by review after the first fix: the root special case must also check the sequence, not
-// just the record number, or a parent reference masking to ROOT_RECORD with the wrong sequence
-// counts as the root.
+// Reusing a cache with a second `Mft` must discard the first image's paths, even when both
+// images share a directory record number and sequence.
+#[test]
+fn default_path_cache_reused_on_a_second_mft_starts_empty_instead_of_stale() {
+    let build = |name: &str| {
+        mft_with(vec![
+            directory_under(
+                FIRST_NORMAL_RECORD,
+                reference(ROOT_SEQUENCE, ROOT_RECORD),
+                name,
+            ),
+            file_under(
+                FIRST_NORMAL_RECORD + 1,
+                reference(1, FIRST_NORMAL_RECORD),
+                "leaf.txt",
+            ),
+        ])
+    };
+    let mft1 = build("from-mft1");
+    let mft2 = build("from-mft2");
+
+    let mut cache = DefaultPathCache::new();
+    assert_eq!(
+        mft1.resolve_path(&first_name(&mft1, FIRST_NORMAL_RECORD + 1), &mut cache),
+        Some(
+            PathBuf::from(VOLUME_PATH)
+                .join("from-mft1")
+                .join("leaf.txt")
+        ),
+    );
+    assert_eq!(
+        mft2.resolve_path(&first_name(&mft2, FIRST_NORMAL_RECORD + 1), &mut cache),
+        Some(
+            PathBuf::from(VOLUME_PATH)
+                .join("from-mft2")
+                .join("leaf.txt")
+        ),
+        "reusing the cache on a second Mft must resolve its own path, not the first Mft's stale one",
+    );
+}
+
+// The root special case must check both sequence and record number, or a parent reference
+// masking to ROOT_RECORD with the wrong sequence counts as the root.
 #[test]
 fn resolve_path_rejects_stale_root_reference() {
     let mut root = new_record(ROOT_RECORD, 3, 0);
@@ -598,6 +638,193 @@ fn resolve_path_rejects_a_parent_that_is_not_in_use() {
         mft.resolve_path(&first_name(&mft, control), &mut ()),
         Some(PathBuf::from(VOLUME_PATH).join("live").join("f")),
         "the control resolves"
+    );
+}
+
+// A parent reference must name a live base directory record. An allocated, in-use plain file
+// must not be accepted as a directory just because its record number and sequence match.
+#[test]
+fn resolve_path_rejects_a_parent_that_is_a_file() {
+    let root = reference(ROOT_SEQUENCE, ROOT_RECORD);
+    let not_a_dir = FIRST_NORMAL_RECORD;
+    let child = FIRST_NORMAL_RECORD + 1;
+
+    let mft = mft_with(vec![
+        file_under(not_a_dir, root, "notadir"),
+        file_under(child, reference(1, not_a_dir), "child.txt"),
+    ]);
+    let name = first_name(&mft, child);
+
+    assert_eq!(
+        mft.resolve_path(&name, &mut ()),
+        None,
+        "a file cannot be a parent"
+    );
+    assert_eq!(
+        mft.resolve_path(&name, &mut DefaultPathCache::new()),
+        None,
+        "same, with a cache"
+    );
+}
+
+// A parent reference must identify a base directory, never an extension record. The extension
+// here sets its own directory flag while its base is a plain file, so `is_directory()` alone
+// cannot establish that it is a valid parent.
+#[test]
+fn resolve_path_rejects_a_parent_that_is_an_extension_record_flagged_as_a_directory() {
+    let root = reference(ROOT_SEQUENCE, ROOT_RECORD);
+    let base = FIRST_NORMAL_RECORD;
+    let ext = FIRST_NORMAL_RECORD + 1;
+    let child = FIRST_NORMAL_RECORD + 2;
+
+    let mut ext_record = new_record(ext, 1, reference(1, base));
+    set_record_flags(&mut ext_record, directory_flags());
+    let offset = add_end_marker(&mut ext_record, ATTRIBUTES_OFFSET);
+    finish_record(&mut ext_record, offset);
+
+    let mft = mft_with(vec![
+        file_under(base, root, "base"),
+        ext_record,
+        file_under(child, reference(1, ext), "child.txt"),
+    ]);
+    let name = first_name(&mft, child);
+
+    assert_eq!(
+        mft.resolve_path(&name, &mut ()),
+        None,
+        "an extension record cannot be a parent, whatever its own directory flag says"
+    );
+    assert_eq!(
+        mft.resolve_path(&name, &mut DefaultPathCache::new()),
+        None,
+        "same, with a cache"
+    );
+}
+
+// A bounded cache evicts the least recently used entry. A successful `get` refreshes recency,
+// just like `insert`, so eviction must remove the untouched tail and retain a freshly inserted
+// entry. Removing the index entry too prevents stale lookups after the freed slot is reused.
+#[test]
+fn default_path_cache_evicts_the_least_recently_used_entry() {
+    // A warm-up of 20 entries, and a budget that is their exact cost in a fresh cache (growth
+    // included: a fresh `with_max_bytes` cache fed the same inserts in the same order reaches
+    // the same `bytes()`, since `HashMap`/`Vec` capacity growth depends only on the count of
+    // entries inserted so far, not on hash randomization). 20 is comfortably past both
+    // structures' early growth thresholds, so the one further insert below is unlikely to grow
+    // either again; even if it does, the touched entry sits two places from the head (behind
+    // only the entry just inserted) and the evicted one starts at the very tail, so the
+    // assertions hold whether that insert evicts one entry or, from a big enough growth jump,
+    // several.
+    const WARM_UP: u64 = 20;
+    let mut probe = DefaultPathCache::new();
+    for i in 0..WARM_UP {
+        probe.insert(i, PathBuf::from(format!("dir-{i:02}")));
+    }
+    let budget = probe.bytes();
+
+    let mut cache = DefaultPathCache::with_max_bytes(budget);
+    for i in 0..WARM_UP {
+        cache.insert(i, PathBuf::from(format!("dir-{i:02}")));
+    }
+    assert_eq!(
+        cache.len(),
+        WARM_UP as usize,
+        "the exact cost of the warm-up entries must fit with no eviction"
+    );
+
+    // Touching 0 through `get` makes it the most recently used of the warm-up entries, ahead of
+    // every entry inserted after it (1 through 19); 1 is now the least recently used of all.
+    assert!(matches!(cache.get(0), CachedPath::Resolved(_)));
+    cache.insert(WARM_UP, PathBuf::from("dir-new"));
+
+    assert!(
+        matches!(cache.get(WARM_UP), CachedPath::Resolved(_)),
+        "the entry just inserted must not be the one evicted to make room for itself",
+    );
+    assert!(
+        matches!(cache.get(0), CachedPath::Resolved(_)),
+        "0 was touched right before the insert, must survive whatever eviction it caused",
+    );
+    assert_eq!(
+        cache.get(1),
+        CachedPath::Unknown,
+        "1 is the least recently used entry (never touched, inserted right after 0), must be \
+         the first evicted",
+    );
+}
+
+// `bytes()` sums structural capacity growth and currently live path capacities. Eviction
+// releases the path's charge but retains the slab and index allocations. The index uses a
+// high-water mark because `HashMap::capacity()` can dip after a removal and recover on insert
+// without allocating. Charging that recovery again would inflate the total. Free-slot metadata
+// is excluded, so eviction cannot increase the estimate while trying to lower it.
+// Check the incremental accounting against capacities read directly after repeated evictions.
+#[test]
+fn default_path_cache_bytes_matches_its_documented_model() {
+    let mut cache = DefaultPathCache::with_max_bytes(4096);
+    for i in 0..500u64 {
+        cache.insert(
+            i,
+            PathBuf::from(format!("{i:06}-a-somewhat-longer-directory-name")),
+        );
+    }
+    assert!(
+        cache.len() < 500,
+        "a 4096-byte limit must have evicted most of the 500 entries, got {}",
+        cache.len()
+    );
+
+    let structural = cache.slots.capacity() * mem::size_of::<Slot>()
+        + cache.index_capacity_seen * INDEX_BUCKET_BYTES;
+    let content: usize = cache
+        .slots
+        .iter()
+        .filter_map(|slot| slot.value.as_ref())
+        .map(PathBuf::capacity)
+        .sum();
+    assert_eq!(
+        cache.bytes(),
+        structural + content,
+        "bytes() must equal the index's and slab's real capacity growth plus the live entries' \
+         path capacities"
+    );
+}
+
+// A cache that evicts on almost every insert must return the same paths as an unbounded cache
+// or no cache. Eviction changes only how much work the next lookup needs. In particular, an
+// evicted reference must not retain an index entry pointing to a slot reused by another path.
+#[test]
+fn resolve_path_gives_the_same_answer_with_a_bounded_cache() {
+    let (mft, deep, shallow) = deep_chain(200, 100, "d");
+
+    let mut bounded = DefaultPathCache::with_max_bytes(256);
+    for file in mft.files() {
+        for name in file.names() {
+            let cached = mft.resolve_path(&name, &mut bounded);
+            let uncached = mft.resolve_path(&name, &mut ());
+            assert_eq!(
+                cached,
+                uncached,
+                "file {}: a bounded cache changed what resolve_path returns",
+                file.number()
+            );
+        }
+    }
+    assert!(
+        bounded.len() < 200,
+        "a 256-byte limit must have evicted most of the 200 directories, got {}",
+        bounded.len()
+    );
+
+    assert_eq!(
+        mft.resolve_path(&deep, &mut bounded),
+        mft.resolve_path(&deep, &mut ()),
+        "a bounded cache gave a different deep answer"
+    );
+    assert_eq!(
+        mft.resolve_path(&shallow, &mut bounded),
+        mft.resolve_path(&shallow, &mut ()),
+        "a bounded cache gave a different shallow answer"
     );
 }
 

@@ -22,6 +22,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arbitrary::Arbitrary;
 
+use crate as reader;
+#[path = "../snapshot.rs"]
+mod snapshot;
+use snapshot::FileSnapshot;
+
 use crate::api::{
     FileId, NtfsAttributeType, NtfsFileName, NtfsFileNamespace, FIRST_NORMAL_RECORD, ROOT_RECORD,
 };
@@ -31,6 +36,7 @@ use crate::mft::test_records::*;
 use crate::mft::Mft;
 use crate::path::{DefaultPathCache, DeletedPathCache, DeletedPathMarker};
 use crate::property::{coverage, heavy_property, list, show_on_replay};
+use crate::scan::MftScan;
 use crate::volume::Volume;
 
 /// Records after `$MFT` itself.
@@ -42,6 +48,10 @@ const MAX_RUNS: usize = 3;
 const MAX_LIST_ENTRIES: usize = 4;
 /// Files whose paths are resolved several ways per input.
 const MAX_CHECKED_FILES: usize = 12;
+/// A budget small enough to force `DefaultPathCache` to evict on almost every insert, so
+/// `check_paths` exercises eviction on every random image instead of only the dedicated unit
+/// test's synthetic chain.
+const BOUNDED_CACHE_BYTES: usize = 64;
 const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// `test_records::test_volume()` has `volume_size: 0` (unbounded); a real volume never does. The
 /// bound only rejects a `$DATA` larger than the volume itself, so a small one keeps a
@@ -919,10 +929,10 @@ impl World<'_> {
     }
 
     /// Walks the parent chain of a name by record number, from the description alone: every hop
-    /// needs an in-use, allocated record with the same full reference (sequence included).
-    /// Directory names use the file's `best_name` (first Win32, else first). The chain ends at
-    /// the root only if the reference matches the root's; one that revisits a reference never
-    /// ends.
+    /// needs an in-use, allocated base record (not an extension) with the same full
+    /// reference (sequence included) and its own directory flag set. Directory names use the
+    /// file's `best_name` (first Win32, else first). The chain ends at the root only if the
+    /// reference matches the root's; one that revisits a reference never ends.
     fn resolve(&self, parent_reference: u64, leaf: &[u16]) -> Outcome {
         let mut components: Vec<&[u16]> = Vec::new();
         let mut seen = Vec::new();
@@ -946,7 +956,12 @@ impl World<'_> {
             if self.tainted.contains(&number) {
                 return Outcome::Unknown;
             }
-            if record.own_reference != reference || !record.in_use || !Self::allocated(record) {
+            if record.own_reference != reference
+                || !record.in_use
+                || !Self::allocated(record)
+                || record.base_reference != 0
+                || !record.is_directory
+            {
                 return Outcome::Unresolved;
             }
             let Some(names) = self.names(number) else {
@@ -1239,14 +1254,21 @@ fn has_ordinary_parents(mft: &Mft, name: &NtfsFileName) -> bool {
     true
 }
 
-/// Whether every parent of `name`, up to the root, is a base record (not an extension record).
-fn has_only_base_records_as_parents(mft: &Mft, name: &NtfsFileName) -> bool {
+/// Whether every parent of a resolved live name is a base record with the same record family
+/// after deletion. A synthetic, already-freed extension can join a deleted directory and
+/// change its preferred name or parent, even when the child's own records stay the same.
+fn has_unchanged_parent_families(before: &Mft, after: &Mft, name: &NtfsFileName) -> bool {
     let mut parent = name.parent_reference() & RECORD_NUMBER_MASK;
     while parent != ROOT_RECORD {
-        let Some(record) = mft.record(parent) else {
+        let (Some(record), Some(gone)) = (before.record(parent), after.record(parent)) else {
             return false;
         };
-        if record.is_extension() {
+        if record.is_extension()
+            || !record
+                .records()
+                .map(|record| record.number())
+                .eq(gone.records().map(|record| record.number()))
+        {
             return false;
         }
         let Some(next) = record.best_name() else {
@@ -1932,8 +1954,10 @@ fn model_path(
             return ModelPath::Unknown;
         }
         if record.base_reference != 0 {
-            // An extension record answers for its base's names: not modelled here.
-            return ModelPath::Unknown;
+            // A parent reference never names an extension record: its own directory
+            // flag does not answer for the file (`is_directory_parent`), so the walk refuses it
+            // like any other unresolvable parent, whatever its liveness.
+            break Some(DeletedPathMarker::Lost(number));
         }
         let named = if is_live(record) {
             record.own_reference == reference
@@ -2217,8 +2241,8 @@ fn check_deleted_model(image: &Image) -> ModelStats {
         }
     }
 
-    // A file deleted while its directories live keeps the path it had, complete. The live volume
-    // says what that was.
+    // A deleted file keeps its live path when its own and every ancestor's record family stay
+    // the same. The independent model above checks paths even when a family changes.
     for number in &history.chosen {
         let (Some(gone), Some(before)) = (mft.record(*number), history.live.record(*number)) else {
             continue;
@@ -2238,11 +2262,10 @@ fn check_deleted_model(image: &Image) -> ModelStats {
             let Some(path) = history.live.resolve_path(&live_name, &mut ()) else {
                 continue;
             };
-            // The image can put an extension record where a directory is expected, and one that
-            // names a base it does not belong to is a file's record with somebody else's names:
-            // only base records are parents here.
+            // Parents must be ordinary base records, with the same families after deletion:
+            // a directory can gain a preferred name from an already-freed extension too.
             if !has_ordinary_parents(&history.live, &live_name)
-                || !has_only_base_records_as_parents(&history.live, &live_name)
+                || !has_unchanged_parent_families(&history.live, mft, &live_name)
             {
                 continue;
             }
@@ -2257,11 +2280,74 @@ fn check_deleted_model(image: &Image) -> ModelStats {
     stats
 }
 
+/// Keep unconstrained images for three choices out of four. The fourth generates a connected
+/// directory/child pair: independent random records almost never line up a valid child, the
+/// special directory name, its `$Extend` parent and the partial deletion in a short search.
+/// These images still go through the same byte builder, deletion and independent model.
+fn partly_deleted_image(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Image> {
+    if u.arbitrary::<u8>()? % 4 != 0 {
+        return Image::arbitrary(u);
+    }
+    let directory = RecordSpec {
+        sequence: u.arbitrary()?,
+        flags: 0x7F, // Live, allocated base directory.
+        base: None,
+        attributes: vec![AttributeSpec::DeletedName {
+            upper: u.arbitrary()?,
+            extend: true,
+        }],
+    };
+    let child = RecordSpec {
+        sequence: u.arbitrary()?,
+        flags: 0x3F, // Live, allocated base file, deleted below.
+        base: None,
+        attributes: vec![
+            AttributeSpec::FileName {
+                parent: ParentSpec::Record(Link {
+                    target: 1, // Record 24: the directory above.
+                    claim: Claim::Right,
+                }),
+                namespace: u.arbitrary()?,
+                name: list::<u8, MAX_NAME_UNITS>(u)?,
+                reparse: u.arbitrary()?,
+            },
+            AttributeSpec::StandardInformation,
+        ],
+    };
+    Ok(Image {
+        mft: RecordSpec {
+            sequence: 0,
+            flags: 0,
+            base: None,
+            attributes: vec![],
+        },
+        records: vec![directory, child],
+        corruptions: vec![],
+        order: vec![],
+        // Check both a still-live parent and one deleted with its child, including sequence wrap.
+        deleted: vec![u.arbitrary()?, 1],
+        wrap_skips_zero: u.arbitrary()?,
+    })
+}
+
+#[test]
+fn the_partial_delete_generator_reaches_deleted_paths_from_small_inputs() {
+    for fill in [0, 5, u8::MAX] {
+        let mut bytes = [fill; 64];
+        bytes[0] = 0;
+        let image = partly_deleted_image(&mut arbitrary::Unstructured::new(&bytes)).unwrap();
+        assert!(
+            check_deleted_model(&image).paths_deleted > 0,
+            "the targeted generator must reach a Deleted path, fill {fill}"
+        );
+    }
+}
+
 #[test]
 fn the_deleted_view_is_what_the_description_says_for_a_partly_deleted_volume() {
     let stats = std::sync::Mutex::new(ModelStats::default());
     heavy_property(|u| {
-        let image = Image::arbitrary(u)?;
+        let image = partly_deleted_image(u)?;
         show_on_replay(&image);
         let found = check_deleted_model(&image);
         stats.lock().unwrap().add(found);
@@ -2302,6 +2388,129 @@ fn the_deleted_view_is_what_the_description_says_for_a_partly_deleted_volume() {
         stats.live_paths_after_partial_delete as u64,
         10,
     );
+}
+
+/// A synthetic freed extension can still hold a name (on a real volume it would be empty).
+/// Deleting its live base attributes that name to the directory, so a child's path can change
+/// even though the child's own records did not. The independent model must still check it.
+#[test]
+fn a_deleted_ancestor_can_gain_a_preferred_name_from_a_freed_extension() {
+    // Direct parent, a grandparent above a live directory, and both sequence-wrap forms.
+    for (nested, sequence, wrap_skips_zero) in [
+        (false, 1, false),
+        (true, 1, false),
+        (true, 5, false),
+        (true, 5, true),
+    ] {
+        let record = |flags, base, attributes| RecordSpec {
+            sequence,
+            flags,
+            base,
+            attributes,
+        };
+        let name = |parent, namespace, text| AttributeSpec::FileName {
+            parent,
+            namespace,
+            name: vec![text],
+            reparse: false,
+        };
+        let mut image = Image {
+            mft: record(0, None, vec![]),
+            records: vec![
+                // 24: live directory "a", with a Posix name in its base.
+                record(
+                    0x7F,
+                    None,
+                    vec![name(
+                        ParentSpec::Root(Claim::Right),
+                        NamespaceSpec::Posix,
+                        0,
+                    )],
+                ),
+                // 25: already freed, naming the live directory. Its preferred name "b" is
+                // invisible while 24 is live, but belongs to it after the delete.
+                record(
+                    0,
+                    Some(Link {
+                        target: 1,
+                        claim: Claim::Right,
+                    }),
+                    vec![name(
+                        ParentSpec::Root(Claim::Right),
+                        NamespaceSpec::Win32,
+                        1,
+                    )],
+                ),
+                // 26: live child "c", whose one-record family stays the same after deletion.
+                record(
+                    0x3F,
+                    None,
+                    vec![name(
+                        ParentSpec::Record(Link {
+                            target: if nested { 4 } else { 1 },
+                            claim: Claim::Right,
+                        }),
+                        NamespaceSpec::Win32,
+                        2,
+                    )],
+                ),
+            ],
+            corruptions: vec![],
+            order: vec![],
+            deleted: vec![1, 0, 1],
+            wrap_skips_zero,
+        };
+        if nested {
+            // 27: an intermediate directory "d" that stays live. Its family is unchanged, so
+            // the guard has to reach its parent to notice the changed family.
+            image.records.push(record(
+                0x7F,
+                None,
+                vec![name(
+                    ParentSpec::Record(Link {
+                        target: 1,
+                        claim: Claim::Right,
+                    }),
+                    NamespaceSpec::Win32,
+                    3,
+                )],
+            ));
+        }
+        let history = delete_some(&image).expect("an image");
+        let before = history.live.record(26).unwrap();
+        let gone = history.deleted.record(26).unwrap();
+        let expected_path = |directory| {
+            let mut path = Path::new(VOLUME_PATH).join(directory);
+            if nested {
+                path.push("d");
+            }
+            path.join("c")
+        };
+        assert_eq!(
+            history
+                .live
+                .resolve_path(&before.best_name().unwrap(), &mut ()),
+            Some(expected_path("a"))
+        );
+        let resolved = history
+            .deleted
+            .resolve_deleted_path(&gone.best_name().unwrap(), &mut DeletedPathCache::new());
+        assert!(resolved.is_complete());
+        assert_eq!(resolved.path, expected_path("b"));
+
+        let stats = check_deleted_model(&image);
+        assert_eq!((stats.newly_deleted, stats.with_extensions), (2, 1));
+        assert_eq!(stats.paths_complete, 3);
+        assert_eq!(stats.live_paths_after_partial_delete, 0);
+
+        // Keeping the ancestor live keeps its preferred name too: path preservation must still
+        // be checked, not skipped for every file below a directory with a freed extension.
+        image.deleted[0] = 0;
+        let stats = check_deleted_model(&image);
+        assert_eq!(stats.newly_deleted, 1);
+        assert_eq!(stats.paths_complete, 1);
+        assert_eq!(stats.live_paths_after_partial_delete, 1);
+    }
 }
 
 /// What `remove_dir_all` leaves: a directory renamed below `$Extend\$Deleted` (a directory called
@@ -2749,4 +2958,315 @@ fn check_paths(mft: &Mft, world: &World, files: &[NtfsFile], order: &[u8]) {
             );
         }
     }
+
+    // A cache too small to hold everything must still answer exactly as none: bounded equals
+    // unbounded equals no cache.
+    let mut bounded = DefaultPathCache::with_max_bytes(BOUNDED_CACHE_BYTES);
+    for &index in &sequence {
+        let file = &files[index];
+        for (position, name) in file.names().take(3).enumerate() {
+            let with_bounded = mft.resolve_path(&name, &mut bounded);
+            check_one(file, position, with_bounded.clone(), "bounded-cache");
+            assert_eq!(
+                with_bounded,
+                mft.resolve_path(&name, &mut ()),
+                "file {}: a bounded cache changed what resolve_path returns",
+                file.number()
+            );
+        }
+    }
+}
+
+/// A scan sees the same public logical-file observations as a whole Mft, including every
+/// hard link, named stream and deleted-path marker. Count live/deleted coverage separately.
+fn check_scan(image: &Image, chunk_records: u64) -> [(usize, usize); 2] {
+    let Some(assembled) = assemble(image) else {
+        return [(0, 0); 2];
+    };
+    let (volume, data, bitmap) = (assembled.volume, assembled.data, assembled.bitmap);
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let expected = snapshots(&whole);
+    let mut scan = MftScan::from_parts(volume, data, bitmap, chunk_records).expect("a scan");
+    let (mut cache, mut deleted_cache) = (DefaultPathCache::new(), DeletedPathCache::new());
+    let mut found = [Vec::new(), Vec::new()];
+    while let Some(chunk) = scan.next_chunk().expect("a chunk") {
+        found[0].extend(
+            chunk
+                .files()
+                .map(|file| FileSnapshot::new(&file, &chunk, &mut cache, &mut deleted_cache)),
+        );
+        found[1].extend(
+            chunk
+                .deleted_files()
+                .map(|file| FileSnapshot::new(&file, &chunk, &mut cache, &mut deleted_cache)),
+        );
+    }
+    assert_eq!(
+        scan.corrupt_records(),
+        whole.corrupt_records(),
+        "scan corrupt_records"
+    );
+    assert_eq!(found, expected, "scan public-file snapshots");
+    found.map(|files| {
+        (
+            files.len(),
+            files.iter().filter(|file| file.info.path.is_some()).count(),
+        )
+    })
+}
+
+fn snapshots(mft: &Mft) -> [Vec<FileSnapshot>; 2] {
+    let (mut cache, mut deleted_cache) = (DefaultPathCache::new(), DeletedPathCache::new());
+    [
+        mft.files()
+            .map(|file| FileSnapshot::new(&file, mft, &mut cache, &mut deleted_cache))
+            .collect(),
+        mft.deleted_files()
+            .map(|file| FileSnapshot::new(&file, mft, &mut cache, &mut deleted_cache))
+            .collect(),
+    ]
+}
+
+#[test]
+fn a_scan_finds_what_the_whole_mft_finds() {
+    let live_files = AtomicUsize::new(0);
+    let live_paths = AtomicUsize::new(0);
+    let deleted_files = AtomicUsize::new(0);
+    let deleted_paths = AtomicUsize::new(0);
+    heavy_property(|u| {
+        let image = Image::arbitrary(u)?;
+        let chunk_records = u.int_in_range(1..=8)?;
+        show_on_replay(&(&image, chunk_records));
+        let [(live_compared, live_with_path), (deleted_compared, deleted_with_path)] =
+            check_scan(&image, chunk_records);
+        live_files.fetch_add(live_compared, Ordering::Relaxed);
+        live_paths.fetch_add(live_with_path, Ordering::Relaxed);
+        deleted_files.fetch_add(deleted_compared, Ordering::Relaxed);
+        deleted_paths.fetch_add(deleted_with_path, Ordering::Relaxed);
+        Ok(())
+    });
+    coverage("live files compared", live_files.into_inner() as u64, 100);
+    coverage("live paths compared", live_paths.into_inner() as u64, 50);
+    coverage(
+        "deleted files compared",
+        deleted_files.into_inner() as u64,
+        20,
+    );
+    coverage(
+        "deleted paths compared",
+        deleted_paths.into_inner() as u64,
+        5,
+    );
+}
+
+/// The compact store preserves the whole Mft's public logical-file observations exactly.
+fn check_compact(image: &Image) -> (usize, usize) {
+    let Some(assembled) = assemble(image) else {
+        return (0, 0);
+    };
+    let (volume, data, bitmap) = (assembled.volume, assembled.data, assembled.bitmap);
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let compact = Mft::from_parts_compact(volume, data, bitmap).expect("a compact Mft");
+    let expected = snapshots(&whole);
+    assert_eq!(
+        snapshots(&compact),
+        expected,
+        "compact public-file snapshots"
+    );
+    assert_eq!(
+        compact.corrupt_records(),
+        whole.corrupt_records(),
+        "compact corrupt_records"
+    );
+    (expected[0].len(), expected[1].len())
+}
+
+#[test]
+fn a_compact_mft_equals_a_normal_one() {
+    let live = AtomicUsize::new(0);
+    let deleted = AtomicUsize::new(0);
+    heavy_property(|u| {
+        let image = Image::arbitrary(u)?;
+        show_on_replay(&image);
+        let (live_compared, deleted_compared) = check_compact(&image);
+        live.fetch_add(live_compared, Ordering::Relaxed);
+        deleted.fetch_add(deleted_compared, Ordering::Relaxed);
+        Ok(())
+    });
+    coverage("live files compared", live.into_inner() as u64, 100);
+    coverage("deleted files compared", deleted.into_inner() as u64, 10);
+}
+
+#[test]
+fn quiet_parity_rejects_one_difference_in_a_large_population() {
+    let quiet = snapshot::ComparisonPolicy::Quiet;
+    assert!(quiet.accepts_populations([(0, 1_000_000), (0, 10)]));
+    assert!(quiet.accepts_populations([(0, 0), (0, 0)]));
+    assert!(!quiet.accepts_populations([(1, 1_000_000), (0, 10)]));
+    assert!(!quiet.accepts_populations([(0, 1_000_000), (1, 1_000_000)]));
+    assert!(!quiet.accepts_populations([(0, 1_000_000), (10, 10)]));
+    assert!(!quiet.accepts_populations([(0, 1_000_000), (1, 0)]));
+}
+
+#[test]
+fn live_parity_reports_deleted_churn_without_gating_it() {
+    let live = snapshot::ComparisonPolicy::Live;
+    // Tiny chunks on a live volume allow minutes of deleted-record reuse between snapshots.
+    assert!(live.accepts_populations([(27, 141_947), (20, 508)]));
+    assert!(
+        live.accepts_populations([(96, 141_947), (64, 508)]),
+        "live C: deleted churn must be reported without failing the live-file gate"
+    );
+    assert!(live.accepts_populations([(0, 1_000_000), (508, 508)]));
+    assert!(live.accepts_populations([(0, 1_000_000), (1, 0)]));
+}
+
+#[test]
+fn live_parity_gates_live_files_without_a_deleted_denominator() {
+    let live = snapshot::ComparisonPolicy::Live;
+    assert!(live.accepts_populations([(10, 200), (0, 0)]));
+    assert!(live.accepts_populations([(0, 0), (1, 0)]));
+    assert!(live.accepts_populations([(usize::MAX / 20, usize::MAX), (0, 0)]));
+    assert!(!live.accepts_populations([(11, 200), (0, 1_000_000)]));
+    assert!(!live.accepts_populations([(1, 19), (0, 1_000_000)]));
+    assert!(!live.accepts_populations([(1, 0), (0, 1_000_000)]));
+}
+
+/// Keep the rich oracle non-vacuous even in a short property run: an ADS and hard link in an
+/// extension, DOS aliases, a lost parent, and a deleted file with both intact and lost streams.
+fn rich_parity_parts() -> (Volume, Vec<u8>, Vec<u8>) {
+    let mut live = new_record(24, 1, 0);
+    let offset = add_standard_information(&mut live, ATTRIBUTES_OFFSET, 0x20);
+    let offset = add_file_name(&mut live, offset, "first.txt", 0);
+    let offset = add_file_name_ex(
+        &mut live,
+        offset,
+        2,
+        reference(1, ROOT_RECORD),
+        NtfsFileNamespace::Dos,
+        "FIRST~1.TXT",
+        0,
+    );
+    let offset =
+        add_resident_attribute(&mut live, offset, NtfsAttributeType::Data, 3, "", b"hello");
+    finish_record(&mut live, offset);
+
+    let mut deleted = new_record(25, 1, 0);
+    let offset = add_file_name_ex(
+        &mut deleted,
+        ATTRIBUTES_OFFSET,
+        0,
+        reference(1, 100),
+        NtfsFileNamespace::Win32,
+        "deleted.txt",
+        0,
+    );
+    let offset = add_resident_attribute(
+        &mut deleted,
+        offset,
+        NtfsAttributeType::AttributeList,
+        1,
+        "",
+        &[],
+    );
+    let offset = add_resident_attribute(
+        &mut deleted,
+        offset,
+        NtfsAttributeType::Data,
+        2,
+        "",
+        b"intact",
+    );
+    finish_record(&mut deleted, offset);
+    delete_record(&mut deleted);
+
+    let mut live_extension = new_record(26, 1, reference(1, 24));
+    let offset = add_file_name_ex(
+        &mut live_extension,
+        ATTRIBUTES_OFFSET,
+        0,
+        reference(1, 99),
+        NtfsFileNamespace::Win32,
+        "another-link.txt",
+        0,
+    );
+    let offset = add_resident_attribute(
+        &mut live_extension,
+        offset,
+        NtfsAttributeType::Data,
+        1,
+        "Zone.Identifier",
+        b"named-stream",
+    );
+    finish_record(&mut live_extension, offset);
+
+    let mut deleted_extension = new_record(27, 1, reference(1, 25));
+    let offset = add_truncated_nonresident(
+        &mut deleted_extension,
+        ATTRIBUTES_OFFSET,
+        NtfsAttributeType::Data,
+        "lost-ads",
+    );
+    finish_record(&mut deleted_extension, offset);
+    delete_record(&mut deleted_extension);
+    let (volume, data, mut bitmap) =
+        raw_parts(vec![live, deleted, live_extension, deleted_extension]);
+    for number in [25usize, 27] {
+        bitmap[number / 8] &= !(1 << (number % 8));
+    }
+    (volume, data, bitmap)
+}
+
+#[test]
+fn scan_preserves_all_links_streams_and_deleted_markers() {
+    let (volume, data, bitmap) = rich_parity_parts();
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let expected = snapshots(&whole);
+    assert_eq!(whole.record(24).unwrap().names().count(), 3);
+    assert_eq!(whole.record(24).unwrap().hard_links().count(), 2);
+    assert_eq!(expected[0].len(), 1);
+    assert_eq!(expected[1].len(), 1);
+    assert_eq!(expected[0][0].streams.len(), 2);
+    assert_eq!(expected[1][0].streams.len(), 2);
+    assert!(!expected[1][0].streams[0].data_lost);
+    assert!(expected[1][0].streams[1].data_lost);
+    assert_eq!(
+        expected[1][0].paths[0].1.marker,
+        Some(DeletedPathMarker::Lost(100))
+    );
+    for chunk_records in [1, 2, 3, 4096] {
+        let mut scan =
+            MftScan::from_parts(volume.clone(), data.clone(), bitmap.clone(), chunk_records)
+                .unwrap();
+        let (mut cache, mut deleted_cache) = (DefaultPathCache::new(), DeletedPathCache::new());
+        let mut found = [Vec::new(), Vec::new()];
+        while let Some(chunk) = scan.next_chunk().unwrap() {
+            found[0].extend(
+                chunk
+                    .files()
+                    .map(|file| FileSnapshot::new(&file, &chunk, &mut cache, &mut deleted_cache)),
+            );
+            found[1].extend(
+                chunk
+                    .deleted_files()
+                    .map(|file| FileSnapshot::new(&file, &chunk, &mut cache, &mut deleted_cache)),
+            );
+        }
+        assert_eq!(
+            found, expected,
+            "scan rich snapshots, chunk_records={chunk_records}"
+        );
+    }
+}
+
+#[test]
+fn compact_preserves_all_links_streams_and_deleted_markers() {
+    let (volume, data, bitmap) = rich_parity_parts();
+    let whole = build_from_parts(volume.clone(), data.clone(), bitmap.clone());
+    let compact = Mft::from_parts_compact(volume, data, bitmap).unwrap();
+    assert_eq!(
+        snapshots(&compact),
+        snapshots(&whole),
+        "compact rich snapshots"
+    );
 }

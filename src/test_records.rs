@@ -125,8 +125,7 @@ pub fn raw_parts(records: Vec<Vec<u8>>) -> (Volume, Vec<u8>, Vec<u8>) {
 
 /// Applies fixups and indexes extension records: the work `Mft::new` does
 /// after reading a volume's `$MFT`. `Mft::from_parts` is crate-private, so
-/// this is the entry point a bench uses to time it (Card 008 made this step
-/// about 25x faster; nothing measured that until now).
+/// this is the entry point a bench uses to time it.
 pub fn build_from_parts(volume: Volume, data: Vec<u8>, bitmap: Vec<u8>) -> Mft {
     Mft::from_parts(volume, data, bitmap).expect("synthetic MFT")
 }

@@ -66,12 +66,22 @@ pub(crate) struct Record<'a> {
 impl<'a> Record<'a> {
     /// The record `number` held in `data` (one whole record, update sequence fixups already
     /// applied), or `None` if `data` does not look like a file record. See [`Self::is_valid`].
+    /// Equivalent to [`Self::new_sized`] with `data.len()` as the record size: for every caller
+    /// except a compact [`Mft`] store, `data` is the whole record, so the two agree.
     pub(crate) fn new(number: u64, data: &'a [u8]) -> Option<Self> {
-        if !Self::is_valid(data) {
+        Self::new_sized(number, data, data.len() as u64)
+    }
+
+    /// Like [`Self::new`], but `data` may be `record_size`'s record trimmed to fewer bytes (a
+    /// compact [`Mft`] store): `record_size` is what the update sequence array's declared length
+    /// is checked against (the record's real on-disk size, in sectors), while `data.len()` still
+    /// bounds `used_size` and the array itself, since those are about the bytes actually present.
+    pub(crate) fn new_sized(number: u64, data: &'a [u8], record_size: u64) -> Option<Self> {
+        if !Self::is_valid_sized(data, record_size) {
             return None;
         }
-        // SAFETY: `is_valid` checked `data` holds a whole header, and the header is a packed
-        // struct of plain integers (alignment 1).
+        // SAFETY: `is_valid_sized` checked `data` holds a whole header, and the header is a
+        // packed struct of plain integers (alignment 1).
         let header = unsafe { &*(data.as_ptr() as *const NtfsFileRecordHeader) };
         Some(Record {
             number,
@@ -83,7 +93,17 @@ impl<'a> Record<'a> {
     /// Whether `data` (one whole record) has a plausible header: the `FILE` signature, a
     /// complete update sequence array (the sequence number plus one saved value per 512-byte
     /// sector, as Windows requires), and a used size and attribute offset inside the record.
+    /// Equivalent to [`Self::is_valid_sized`] with `data.len()` as the record size.
     pub(crate) fn is_valid(data: &[u8]) -> bool {
+        Self::is_valid_sized(data, data.len() as u64)
+    }
+
+    /// Like [`Self::is_valid`], but checks the update sequence array's declared length against
+    /// `record_size` (the record's real on-disk size, sectors) instead of `data.len()`, so a
+    /// compact store's trimmed `data` (shorter than `record_size`) still validates as the record
+    /// it always was: it was already fixed up and checked once, at full size, when the store was
+    /// built.
+    pub(crate) fn is_valid_sized(data: &[u8], record_size: u64) -> bool {
         if data.len() < size_of::<NtfsFileRecordHeader>() {
             return false;
         }
@@ -95,7 +115,7 @@ impl<'a> Record<'a> {
         }
 
         // A short array leaves the last sectors' ends unrestored.
-        if header.update_sequence_length as usize != data.len() / SECTOR_SIZE + 1 {
+        if header.update_sequence_length as usize != record_size as usize / SECTOR_SIZE + 1 {
             return false;
         }
 
@@ -200,7 +220,7 @@ impl<'a> NtfsFile<'a> {
     /// if `data` is not a valid file record.
     pub(crate) fn new(mft: &'a Mft, number: u64, data: &'a [u8]) -> Option<Self> {
         Some(NtfsFile {
-            record: Record::new(number, data)?,
+            record: Record::new_sized(number, data, mft.volume().file_record_size())?,
             mft,
         })
     }

@@ -9,12 +9,8 @@ on:
       - master
 
 jobs:
-  lint-build-test:
+  lint-build:
     runs-on: windows-latest
-    env:
-      # The property tests still run; only their coverage counts are skipped: how far a timed
-      # search gets depends on the runner's speed, and CI must not fail by chance.
-      ARBTEST_COVERAGE: "off"
 
     steps:
       - uses: actions/checkout@v6
@@ -26,6 +22,10 @@ jobs:
 
       - name: Check
         run: mise run check
+
+      - name: Check skip policy
+        shell: pwsh
+        run: ./.github/scripts/test-check-skips.ps1
 
       - name: Check (internals feature)
         run: mise run check-internals
@@ -41,6 +41,28 @@ jobs:
 
       - name: Build benchmarks
         run: mise run bench-build
+
+  # One test job per architecture, on separate runners, so the 32-bit tests (a cold i686 build,
+  # slower 32-bit code, one test thread) do not add to the 64-bit ones.
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            task: test
+          - arch: x86
+            task: test-32
+    env:
+      # The property tests still run; only their coverage counts are skipped: how far a timed
+      # search gets depends on the runner's speed, and CI must not fail by chance.
+      ARBTEST_COVERAGE: "off"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
 
       # The integration tests need an explicit volume and refuse the system drive
       # (tests/common/mod.rs). The checkout lives on the runner's workspace drive
@@ -67,51 +89,21 @@ jobs:
       # NTFS_READER_SKIP_LOG set, appends that line to the file (libtest hides passing-test
       # output, so a skip would look like a pass otherwise). NTFS_READER_ALLOW_FSUTIL and
       # NTFS_READER_REQUIRE_ALL stay unset: their tests fill volumes for minutes and change
-      # system wide settings, so they run on the maintainer's VM instead. Nine skips are expected
-      # per runner; see SKIP_EXPECTED below.
-      - name: Test
+      # system wide settings, so they run on the maintainer's VM instead. The four shadow tests
+      # also skip: this job does not create a VSS shadow. check-skips.ps1 names all 13 expected skips.
+      - name: Test (${{ matrix.arch }})
         env:
-          NTFS_READER_SKIP_LOG: ${{ runner.temp }}\skips-x64.txt
-        run: mise run test
+          NTFS_READER_SKIP_LOG: ${{ runner.temp }}\skips-${{ matrix.arch }}.txt
+        run: mise run ${{ matrix.task }}
 
-      - name: Test (32-bit)
-        env:
-          NTFS_READER_SKIP_LOG: ${{ runner.temp }}\skips-x86.txt
-        run: mise run test-32
-
-      # Prints which tests skipped, and fails the job if the count is not the expected one: a
-      # missing fixture, a changed environment, or a new unnoticed skip. The nine (per
-      # architecture) are:
-      #   recoverability_tests, five tests that change DisableDeleteNotify (NTFS_READER_ALLOW_FSUTIL unset);
-      #   stream_tests::a_huge_fragmented_sparse_file... (needs T:\large-fragmented.rar, a VM fixture),
-      #     ::a_wof_compressed_file... (needs NTFS_READER_PARITY_VOLUME) and
-      #     ::compressed_and_encrypted_streams_are_refused (its EFS case creates a certificate in the
-      #     user's profile and needs NTFS_READER_ALLOW_FSUTIL);
-      #   volume_invariants_tests::the_parity_volume_is_smoke_checked (NTFS_READER_PARITY_VOLUME unset).
-      # Update this count in the same change that adds, removes, or newly runs a test here.
+      # Compare named skips for this architecture; a missing fixture or a newly skipped test
+      # must not hide behind an unchanged count. Partial logs after failed jobs are printed only.
       - name: Skipped tests
         if: ${{ !cancelled() }}
         shell: pwsh
         env:
-          SKIP_EXPECTED: "9"
           JOB_STATUS: ${{ job.status }}
-        run: |
-          $failed = $false
-          foreach ($arch in 'x64', 'x86') {
-            $log = Join-Path $env:RUNNER_TEMP "skips-$arch.txt"
-            $lines = if (Test-Path $log) { @(Get-Content $log) } else { @() }
-            $envSkips = @($lines | Where-Object { $_ -match '^\[env\]' })
-            $skips = @($lines | Where-Object { $_ -notmatch '^\[env\]' })
-            Write-Host "::group::$arch skips: $($skips.Count) (expected $env:SKIP_EXPECTED), environment skips: $($envSkips.Count)"
-            $lines | ForEach-Object { Write-Host $_ }
-            Write-Host "::endgroup::"
-            # After a failed test the log may be partial: the failure is what to read then.
-            if ($env:JOB_STATUS -eq 'success' -and $skips.Count -ne [int]$env:SKIP_EXPECTED) {
-              Write-Host "::error::${arch}: $($skips.Count) skipped tests, expected $env:SKIP_EXPECTED (SKIP_EXPECTED in ci-check.yml)"
-              $failed = $true
-            }
-          }
-          if ($failed) { exit 1 }
+        run: ./.github/scripts/check-skips.ps1 -LogDirectory $env:RUNNER_TEMP -JobStatus $env:JOB_STATUS -Architectures ${{ matrix.arch }}
 
   # Type-checks what the Windows job cannot run: the `internals` feature natively.
   check-linux:

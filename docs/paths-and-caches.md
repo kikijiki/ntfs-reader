@@ -13,14 +13,17 @@ volume's path, e.g. `\\.\C:\Users\me\file.txt`; each component comes from
 `NtfsFileName::to_os_string`, so a name invalid in UTF-16 still gives a path that opens the file.
 It follows each parent's `best_name`.
 
-It returns `None` when the chain cannot resolve: a parent is missing, not in use, unnamed, or
-stale (record number freed and reused: the full reference, sequence number included, is
-compared), or the chain loops; or when the path would exceed Win32's 32767 UTF-16 unit limit,
-counting the volume path and separators (a name outside the Basic Multilingual Plane costs two
-units per character). The result never depends on the cache: warm or cold, same answer.
+It returns `None` when the chain cannot resolve: a parent is missing, not in use, unnamed, not a
+directory, or stale (record number freed and reused: the full reference, sequence number
+included, is compared), or the chain loops; or when the path would exceed Win32's 32767 UTF-16
+unit limit, counting the volume path and separators (a character above U+FFFF costs two units).
+The result never depends on the cache: warm or cold, same answer.
 
 `FileInfo::path` is the same, for a whole file, from its best name. A live file never resolves
-through a freed or reused directory: `resolve_path` refuses a parent that is not in use.
+through a freed or reused directory, or through a record that is not a directory: `resolve_path`
+refuses such a parent like any other unresolvable one. An extension record is refused too,
+whatever its own directory flag says (extension records don't answer that meaningfully; ask the
+base record), since a parent reference never names one on an uncorrupted volume.
 
 ```rust,no_run
 # use ntfs_reader::{DefaultPathCache, Mft, Volume};
@@ -76,13 +79,27 @@ The root directory is record `ROOT_RECORD` (5); ordinary files start at `FIRST_N
 path as it is walked, so later lookups stop at the first cached parent.
 
 - `DefaultPathCache`: the cache to use, one entry per directory visited. Cheap for a few lookups,
-  pays off on a full scan.
+  pays off on a full scan. `new()` is unbounded, as before; `with_max_bytes(n)` bounds it and
+  evicts the least recently used directory (by `get`, `insert` or `insert_failed`) once its cost
+  would exceed `n`. The cost tracks real memory, not just entry count or path length: each live
+  path's real capacity plus the index's and slab's own real capacity growth (see
+  `DefaultPathCache`'s doc comment), so real heap held tracks `n` instead of a multiple of it. A
+  bound never changes what `resolve_path` returns, only how much of the walk a later lookup
+  redoes: bounded, unbounded and no cache all agree. `bytes()`/`len()` report what is currently
+  held.
 - `()`: caches nothing, used by `FileInfo::new`; fine for a single lookup.
 
-`PathCache` is a trait: plug in your own storage if you want.
+`PathCache` is a trait: plug in your own storage if you want (`get` takes `&mut self`, since a hit
+counts as a use for a bounded implementation's eviction order).
 
-One `Mft` can be shared by threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap` and the
-path caches are all `Send + Sync`). A path cache needs `&mut`, so give each thread its own.
+`DeletedPathCache` (below) has no size limit: its entries link to each other by reference (a
+directory's path is its parent's plus its own name), so evicting one that another cached entry
+still points at would leave that pointer dangling.
+
+One `Mft` can be shared by threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap`,
+`MftChunk` and the path caches are all `Send + Sync`). A path cache needs `&mut`, so give each
+thread its own. `MftScan` itself is `Send` (move a scan to a background thread) but not `Sync`
+(`next_chunk` needs `&mut self`, so nothing shares one by reference across threads at once).
 
 Measured on 0.5.0, on a Windows 11 VM system volume (175k files, 190k MFT records, 186 MiB MFT in
 memory), fresh cache per run (not repeated for 0.5.2; the deleted-file walk is not in this table):
@@ -113,8 +130,9 @@ deleted file needs a walk through freed directories that marks where it had to g
 
 A parent reference is followed when it names a live directory, like `resolve_path`, or a freed
 one: not in use, not allocated, sequence number one above the reference's, which is what deleting
-a directory does to its record. A parent must have the directory flag; its names are whatever the
-record still holds.
+a directory does to its record. A parent must be a base record with the directory flag; an
+extension record is refused whatever its own flag says (same rule as `resolve_path`'s). Its names
+are whatever the record still holds.
 
 When the walk cannot continue, it does not return `None`: it stops at a `DeletedPathMarker` and
 keeps whatever resolved below it. A complete `path` starts with the volume path, like
@@ -144,7 +162,9 @@ not necessarily where it was when deleted.
 directories and ends at markers, which a live lookup must never see. It remembers every directory
 passed, loops and too-long paths included, so one cache for a scan of many files walks each
 directory once, however the tree is shaped; a fresh cache per call walks the whole chain every
-time. Never reuse one across two `Mft`s; the result does not depend on the cache.
+time. Reusing one, or a `DefaultPathCache`, across two `Mft`s (a rescan that keeps a cache, a live
+`Mft` then an `MftScan`) starts it empty for the new `Mft` instead of returning a path from the
+old one: safe, but a warm cache is wasted; give each `Mft` its own if you want to keep both warm.
 
 `FileInfo` uses the same walk: for a deleted file, `path` is `Some` only when complete.
 `FileInfo::new` and `with_cache` give it a cache of its own, dropped right after, so a scan
@@ -180,3 +200,51 @@ for file in mft.deleted_files() {
 # Ok(())
 # }
 ```
+
+## Scanning a large volume
+
+`Mft::new` holds the whole `$MFT` in memory: about 1 KiB per file, so a volume with a million
+files costs over 1 GiB. `MftScan` visits every file, live and deleted, without holding it all: it
+reads `$MFT` twice instead, once to index directories and extension records (a few MiB even on a
+million-file volume, see `MftScan::size_in_memory`), once to hand out each file as it goes.
+
+```rust,no_run
+# use ntfs_reader::{DefaultPathCache, FileInfo, MftScan, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut scan = MftScan::new(Volume::new(r"\\.\C:")?)?;
+let mut cache = DefaultPathCache::new();
+while let Some(chunk) = scan.next_chunk()? {
+    for file in chunk.files() {
+        let info = FileInfo::with_cache(&file, &mut cache);
+    }
+}
+# Ok(())
+# }
+```
+
+`MftChunk::files`, `deleted_files`, `record`, `resolve_path` and `resolve_deleted_path` work like
+their `Mft` counterparts; `FileInfo::with_cache`/`with_caches` take a file from a chunk exactly as
+they take one from a whole `Mft`, since they read through `NtfsFile::mft()` either way. Share one
+`PathCache`/`DeletedPathCache` across the whole scan, not one per chunk: a scan is one reference
+space, like an `Mft`.
+
+`record(number)` can retrieve a base record in the current chunk or a retained record. An extension
+record is returned only when its base is also available (usually in the current chunk); otherwise
+it returns `None`. This keeps a successfully returned record's logical-file accessors complete.
+The `files()` and `deleted_files()` iterators still include all retained extensions for each base
+they yield.
+
+`MftScan::new` reads 4 MiB chunks; `MftScan::with_chunk_records` picks another size.
+
+The two reads are not one snapshot: on a live volume they can disagree. A directory or extension
+record the first read indexed is seen as it read it, in every chunk, even though the second read
+passes over it again; anything else is as the second read found it. So a directory renamed
+between the two reads keeps its old name in paths, a directory created after the first read is
+not seen by path resolution (files under it get no path), and a record reused as a plain file after the first read
+still reads as what that read indexed. This is documented on `MftScan` itself; a shadow copy of
+the volume, read twice, removes the difference by giving both reads the same snapshot.
+
+The directory index is authoritative even for misses: a directory rejected in the first read
+cannot appear temporarily as a parent while its repaired record passes through the current chunk.
+The root also comes from the first read. Warm, cold and bounded caches therefore give the same
+paths throughout a scan. A deleted path through a missing parent retains its `Lost` marker.
