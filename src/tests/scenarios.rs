@@ -22,6 +22,7 @@ use crate::file_info::FileInfo;
 use crate::mft::test_records::*;
 use crate::mft::Mft;
 use crate::path::{DefaultPathCache, DeletedPathCache};
+use crate::scan::{MftChunk, MftScan};
 use crate::stream::{open, ExtentLocation, StreamExtent};
 use crate::volume::Volume;
 
@@ -1767,4 +1768,14 @@ fn what_the_guides_say_can_be_shared_between_threads_can() {
     shared::<DefaultPathCache>();
     shared::<crate::DeletedPath>();
     shared::<crate::DeletedPathMarker>();
+    shared::<MftChunk<'static>>();
+}
+
+// `MftScan` holds a boxed reader and mutates through `&mut self` methods such as `next_chunk`.
+// It must be `Send` so a scan can move to a worker thread, for example to keep a UI responsive.
+// Sharing a single scan by reference across threads is unnecessary, so it need not be `Sync`.
+#[test]
+fn mft_scan_moves_to_another_thread() {
+    fn sendable<T: Send>() {}
+    sendable::<MftScan>();
 }

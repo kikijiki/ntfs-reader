@@ -33,6 +33,8 @@ pub mod guide {
     pub mod paths_and_caches {}
     #[doc = include_str!("../docs/reading-data.md")]
     pub mod reading_data {}
+    #[doc = include_str!("../docs/shadow-copies.md")]
+    pub mod shadow_copies {}
 }
 
 #[cfg(not(any(windows, feature = "internals")))]
@@ -67,6 +69,10 @@ mod journal;
 mod mft;
 #[cfg(any(windows, feature = "internals"))]
 mod path;
+// Off Windows only the tests start a scan; `MftScan::new` opens a real volume.
+#[cfg(any(windows, feature = "internals"))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod scan;
 #[cfg(any(windows, feature = "internals"))]
 mod stream;
 #[cfg(any(windows, feature = "internals"))]
@@ -106,11 +112,13 @@ pub use file_info::FileInfo;
 #[cfg(windows)]
 pub use journal::{HistorySize, Journal, JournalOptions, JournalPosition, NextUsn, UsnReadResult};
 #[cfg(any(windows, feature = "internals"))]
-pub use mft::Mft;
+pub use mft::{Mft, MftId};
 #[cfg(any(windows, feature = "internals"))]
 pub use path::{
     CachedPath, DefaultPathCache, DeletedPath, DeletedPathCache, DeletedPathMarker, PathCache,
 };
+#[cfg(any(windows, feature = "internals"))]
+pub use scan::{MftChunk, MftScan};
 #[cfg(any(windows, feature = "internals"))]
 pub use stream::{ExtentLocation, StreamExtent, StreamReader};
 #[cfg(any(windows, feature = "internals"))]

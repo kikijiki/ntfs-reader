@@ -7,13 +7,14 @@
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
-    fmt,
+    fmt, mem,
     path::{Path, PathBuf, MAIN_SEPARATOR_STR},
 };
 
 use crate::{
     api::{NtfsFileName, ROOT_RECORD},
-    mft::{Mft, RECORD_NUMBER_MASK},
+    file::NtfsFile,
+    mft::{Liveness, Mft, MftId, RECORD_NUMBER_MASK},
 };
 
 /// The longest path [`Mft::resolve_path`] returns, in UTF-16 units: the Win32
@@ -83,21 +84,36 @@ pub enum CachedPath<'a> {
 /// calls. [`DefaultPathCache`] is the implementation to use; `()` caches
 /// nothing. Keying by the full reference lets a stale reference and a valid
 /// one sharing a record number coexist without either poisoning the other.
-/// Do not reuse an instance across two [`Mft`]s: a reference is only
-/// meaningful for the `Mft` it came from.
+///
+/// A reference is only meaningful for the `Mft` it came from: reusing an instance across two
+/// `Mft`s (a rescan that keeps the cache "for efficiency", a live `Mft` then an `MftScan`) can
+/// resolve a reference to the wrong `Mft`'s path if the same record number and sequence occur in
+/// both, coincidentally or after a wrap. [`Self::check_owner`] is how a cache protects
+/// against that; [`DefaultPathCache`] and [`DeletedPathCache`] use it to start empty on a new
+/// `Mft` instead of returning a stale path. A custom cache that does not override it (the
+/// default does nothing) must not be reused across two `Mft`s.
 pub trait PathCache {
-    /// What is known about `reference`.
-    fn get(&self, reference: u64) -> CachedPath<'_>;
+    /// What is known about `reference`. On a bounded cache this counts as a
+    /// use of `reference`, keeping it from eviction a little longer: `&mut
+    /// self` records that.
+    fn get(&mut self, reference: u64) -> CachedPath<'_>;
     /// Remember that `reference` (a directory) has this full path.
     fn insert(&mut self, reference: u64, path: PathBuf);
     /// Remember that `reference` could not be resolved, so a later lookup
     /// can return [`CachedPath::Failed`] instead of repeating the failing
     /// walk.
     fn insert_failed(&mut self, reference: u64);
+    /// Called once by [`Mft::resolve_path`] before any lookup of the walk, with the identity of
+    /// the `Mft` doing the walking. The default does nothing, so a custom cache must override it
+    /// to clear on a new owner (as [`DefaultPathCache`] does) before it can safely be reused
+    /// across two `Mft`s.
+    fn check_owner(&mut self, owner: MftId) {
+        let _ = owner;
+    }
 }
 
 impl PathCache for () {
-    fn get(&self, _reference: u64) -> CachedPath<'_> {
+    fn get(&mut self, _reference: u64) -> CachedPath<'_> {
         CachedPath::Unknown
     }
 
@@ -106,53 +122,245 @@ impl PathCache for () {
     fn insert_failed(&mut self, _reference: u64) {}
 }
 
+/// One entry of [`DefaultPathCache`]'s slab, and its place in the recency
+/// list (most recently used at `head`, least at `tail`). Slots freed by
+/// eviction are reused, so the slab never grows past the largest number of
+/// entries alive at once.
+struct Slot {
+    reference: u64,
+    value: Option<PathBuf>,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+/// Approximate cost of one more bucket in the `HashMap<u64, usize>` index: the key, the value,
+/// and one byte for hashbrown's per-bucket control tag. `HashMap` itself is what decides how
+/// many buckets a given `capacity()` needs (rounded up for its load factor), so this only
+/// multiplies buckets `capacity()` already reports growing by, not a guess at that rounding.
+const INDEX_BUCKET_BYTES: usize = mem::size_of::<u64>() + mem::size_of::<usize>() + 1;
+
 /// The full path of every directory resolved so far, and every reference
 /// known not to resolve. Grows with directories visited, not the volume, so
-/// it suits a few lookups as well as a full scan. Do not reuse across two
-/// [`Mft`]s (see [`PathCache`]).
+/// it suits a few lookups as well as a full scan. Unbounded by default
+/// ([`new`](Self::new)); [`with_max_bytes`](Self::with_max_bytes) evicts the
+/// least recently used entry (by [`get`](PathCache::get),
+/// [`insert`](PathCache::insert) or [`insert_failed`](PathCache::insert_failed))
+/// once the cache's cost would exceed the limit. A bound never changes what
+/// [`Mft::resolve_path`] returns, only how much of the walk a later lookup
+/// redoes: a warm, bounded or evicting cache answers the same as none.
+/// Reusing an instance across two [`Mft`]s (see [`PathCache`]) starts it
+/// empty again instead of returning a path from the previous `Mft`: safe,
+/// but throws away whatever it held.
+///
+/// The cost tracked is bytes over entries because what makes this cache big in practice is the
+/// length of the paths it holds, not how many of them there are (a scan of a deeply nested
+/// volume was measured at 27 of 44 MiB, one full path per directory). It is the sum of two
+/// things, so the *real* heap held tracks the limit instead of a multiple of it: a resolved
+/// path's `PathBuf` capacity (not its length: a clone can round up), which shrinks back on
+/// eviction; and the index's and slab's own growth, charged
+/// once, when it happens, and never given back (`remove` and dropping a freed slot do not shrink
+/// either structure). `Vec::capacity` only grows, so the slab's growth is exactly the difference
+/// between two readings of it; `HashMap::capacity` is current length plus remaining headroom, so
+/// it *drops* by one on every `remove` even though nothing shrank, and recovers on the next
+/// `insert` without a new allocation - `index_capacity_seen`, a high-water mark, is what tells an
+/// insert that recovers old headroom (not a charge) apart from one that needs a real, bigger
+/// table (a charge). A cache that grew its structures once and then shrank to a few entries
+/// still carries that growth as a floor on `bytes`; that floor is itself bounded by the same
+/// `max_bytes` that made it grow in the first place, so the cache still self-limits, it just
+/// cannot un-grow its bookkeeping.
 #[derive(Default)]
-pub struct DefaultPathCache(HashMap<u64, Option<PathBuf>>);
+pub struct DefaultPathCache {
+    index: HashMap<u64, usize>,
+    /// High-water mark of `index.capacity()`, so a dip from `remove` (see the type's doc
+    /// comment) recovering on a later `insert` is not mistaken for a second real allocation.
+    index_capacity_seen: usize,
+    slots: Vec<Slot>,
+    free: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    bytes: usize,
+    max_bytes: Option<usize>,
+    /// The `Mft` this cache's contents belong to, `None` before the first lookup. Checked by
+    /// [`PathCache::check_owner`], set on every call: a mismatch means the cache was reused
+    /// across two `Mft`s, and resets everything but `max_bytes`.
+    owner: Option<MftId>,
+}
 
 impl fmt::Debug for DefaultPathCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DefaultPathCache")
             .field("len", &self.len())
+            .field("bytes", &self.bytes)
+            .field("max_bytes", &self.max_bytes)
             .finish()
     }
 }
 
 impl DefaultPathCache {
-    /// An empty cache.
+    /// An empty, unbounded cache.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An empty cache that evicts its least recently used entry whenever its
+    /// total cost (see the type's doc comment) would otherwise exceed
+    /// `max_bytes`. The entry just inserted is never evicted to make room
+    /// for itself, so a single path longer than `max_bytes` is still cached,
+    /// alone.
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            max_bytes: Some(max_bytes),
+            ..Self::default()
+        }
+    }
+
     /// Number of references cached, resolved or failed.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.index.len()
     }
 
     /// Whether nothing is cached.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.index.is_empty()
+    }
+
+    /// Current total cost of what is cached, in the same unit as
+    /// [`with_max_bytes`](Self::with_max_bytes)'s argument (see the type's
+    /// doc comment for what counts).
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// A value's own heap cost: a resolved path's real `PathBuf` capacity (not its length),
+    /// 0 for a failed entry. Unlike the index/slab growth charged in [`Self::put`] and
+    /// [`Self::evict_tail`], this is given back: it is subtracted when the entry's value is
+    /// replaced or the entry is evicted.
+    fn content_cost(value: &Option<PathBuf>) -> usize {
+        value.as_ref().map_or(0, PathBuf::capacity)
+    }
+
+    /// Removes `slot` from the recency list, wherever it sits.
+    fn unlink(&mut self, slot: usize) {
+        let (prev, next) = (self.slots[slot].prev, self.slots[slot].next);
+        match prev {
+            Some(prev) => self.slots[prev].next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(next) => self.slots[next].prev = prev,
+            None => self.tail = prev,
+        }
+    }
+
+    /// Makes `slot` the most recently used.
+    fn push_front(&mut self, slot: usize) {
+        self.slots[slot].prev = None;
+        self.slots[slot].next = self.head;
+        if let Some(head) = self.head {
+            self.slots[head].prev = Some(slot);
+        }
+        self.head = Some(slot);
+        self.tail.get_or_insert(slot);
+    }
+
+    /// Marks `slot` as just used, without changing its value.
+    fn touch(&mut self, slot: usize) {
+        if self.head != Some(slot) {
+            self.unlink(slot);
+            self.push_front(slot);
+        }
+    }
+
+    /// Drops the least recently used entry. `free`'s own growth is not charged: unlike growing
+    /// the index or the slab to fit a new entry (charged once, in [`Self::put`]), growing `free`
+    /// is a side effect of eviction itself, and charging it here would fight the eviction it is
+    /// trying to do: a growth charge bigger than the content it just freed would make the cache
+    /// worse off for having evicted, never converging back under budget except by evicting down
+    /// to the floor of one entry. `free` is one `usize` per slot ever evicted, a small fraction
+    /// of the slab it parallels, so leaving it out of the budget costs little accuracy.
+    fn evict_tail(&mut self) {
+        let Some(slot) = self.tail else { return };
+        self.unlink(slot);
+        let entry = &mut self.slots[slot];
+        self.bytes -= Self::content_cost(&entry.value);
+        self.index.remove(&entry.reference);
+        entry.value = None;
+        self.free.push(slot);
+    }
+
+    fn put(&mut self, reference: u64, value: Option<PathBuf>) {
+        let content = Self::content_cost(&value);
+        if let Some(&slot) = self.index.get(&reference) {
+            self.bytes -= Self::content_cost(&self.slots[slot].value);
+            self.slots[slot].value = value;
+            self.bytes += content;
+            self.touch(slot);
+        } else {
+            let slot = match self.free.pop() {
+                Some(slot) => slot,
+                None => {
+                    let before = self.slots.capacity();
+                    self.slots.push(Slot {
+                        reference,
+                        value: None,
+                        prev: None,
+                        next: None,
+                    });
+                    self.bytes += (self.slots.capacity() - before) * mem::size_of::<Slot>();
+                    self.slots.len() - 1
+                }
+            };
+            self.slots[slot] = Slot {
+                reference,
+                value,
+                prev: None,
+                next: None,
+            };
+            self.index.insert(reference, slot);
+            let capacity = self.index.capacity();
+            if capacity > self.index_capacity_seen {
+                self.bytes += (capacity - self.index_capacity_seen) * INDEX_BUCKET_BYTES;
+                self.index_capacity_seen = capacity;
+            }
+            self.push_front(slot);
+            self.bytes += content;
+        }
+        // Never evict down to nothing: the entry just written stays even if
+        // it alone is over budget.
+        while self.index.len() > 1 && self.max_bytes.is_some_and(|max| self.bytes > max) {
+            self.evict_tail();
+        }
     }
 }
 
 impl PathCache for DefaultPathCache {
-    fn get(&self, reference: u64) -> CachedPath<'_> {
-        match self.0.get(&reference) {
-            None => CachedPath::Unknown,
-            Some(None) => CachedPath::Failed,
-            Some(Some(path)) => CachedPath::Resolved(path.as_path()),
+    fn get(&mut self, reference: u64) -> CachedPath<'_> {
+        let Some(&slot) = self.index.get(&reference) else {
+            return CachedPath::Unknown;
+        };
+        self.touch(slot);
+        match &self.slots[slot].value {
+            None => CachedPath::Failed,
+            Some(path) => CachedPath::Resolved(path.as_path()),
         }
     }
 
     fn insert(&mut self, reference: u64, path: PathBuf) {
-        self.0.insert(reference, Some(path));
+        self.put(reference, Some(path));
     }
 
     fn insert_failed(&mut self, reference: u64) {
-        self.0.insert(reference, None);
+        self.put(reference, None);
+    }
+
+    fn check_owner(&mut self, owner: MftId) {
+        if self.owner != Some(owner) {
+            *self = Self {
+                max_bytes: self.max_bytes,
+                owner: Some(owner),
+                ..Self::default()
+            };
+        }
     }
 }
 
@@ -281,10 +489,25 @@ enum DeletedEntry {
 /// directory is walked once, whatever the tree's shape, loops included.
 /// A separate type on purpose: a deleted walk goes through freed
 /// directories and ends at markers, and a live lookup must never see what
-/// it left behind, or vice versa. Do not reuse across two [`Mft`]s (see
-/// [`PathCache`]).
+/// it left behind, or vice versa.
+///
+/// Reusing an instance across two [`Mft`]s (see [`PathCache`]) starts it empty again instead of
+/// walking through the wrong `Mft`'s directories: [`Mft::resolve_deleted_path`] checks
+/// the owner on every call, the same protection [`PathCache::check_owner`] gives
+/// [`DefaultPathCache`].
+///
+/// Unbounded, unlike [`DefaultPathCache`]: a directory entry here names its
+/// parent by reference, so evicting one that another live entry still
+/// points at would leave that pointer dangling. Bounding it soundly would need either pinning
+/// every ancestor of what is kept (the working set is then whatever chain is deepest, not a
+/// fixed limit) or a scheme that tears down or rebuilds a dangling chain on the next lookup.
+/// This cache keeps its entries until dropped or used with another `Mft`.
 #[derive(Default)]
-pub struct DeletedPathCache(HashMap<u64, DeletedEntry>);
+pub struct DeletedPathCache {
+    entries: HashMap<u64, DeletedEntry>,
+    /// The `Mft` this cache's contents belong to; see `DefaultPathCache::owner`.
+    owner: Option<MftId>,
+}
 
 impl fmt::Debug for DeletedPathCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -302,12 +525,22 @@ impl DeletedPathCache {
 
     /// Number of references cached, resolved or too long.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// Whether nothing is cached.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
+    }
+
+    /// Same protection as [`PathCache::check_owner`], called by
+    /// [`Mft::resolve_deleted_path`] before any lookup of the walk: notices a different `Mft`
+    /// than last time and starts empty instead of walking through its directories.
+    fn check_owner(&mut self, owner: MftId) {
+        if self.owner != Some(owner) {
+            self.entries.clear();
+            self.owner = Some(owner);
+        }
     }
 }
 
@@ -366,6 +599,7 @@ impl Mft {
     /// name outside the Basic Multilingual Plane costs 2 units per
     /// character).
     pub fn resolve_path(&self, name: &NtfsFileName, cache: &mut impl PathCache) -> Option<PathBuf> {
+        cache.check_owner(self.id());
         let mut components: Vec<(u64, OsString)> = Vec::new();
         // UTF-16 units walked so far, components and separators, base path
         // excluded: exceeding the limit here only ends a walk that could
@@ -379,10 +613,7 @@ impl Mft {
             walk_budget::step();
             let record_number = reference & RECORD_NUMBER_MASK;
             if record_number == ROOT_RECORD {
-                let is_root = self
-                    .record(ROOT_RECORD)
-                    .is_some_and(|root| root.reference() == reference);
-                if !is_root {
+                if !self.is_root_reference(reference) {
                     Self::cache_chain_as_failed(cache, &components, reference);
                     return None;
                 }
@@ -411,22 +642,11 @@ impl Mft {
                 return None;
             }
 
-            // The record must be live: a freed record still holds its names,
-            // and `best_name` returns them to whoever asks.
-            let directory = self
-                .record(record_number)
-                .filter(|record| {
-                    record.reference() == reference
-                        && record.is_used()
-                        && self.is_allocated(record_number)
-                })
-                .and_then(|record| record.best_name());
-            let Some(directory) = directory else {
+            let Some((component, parent)) = self.directory_name(reference) else {
                 Self::cache_chain_as_failed(cache, &components, reference);
                 return None;
             };
 
-            let component = directory.to_os_string();
             walked += utf16_len(&component) + 1;
             if walked > MAX_PATH_UNITS {
                 // The path is too long. Nothing is cached: from where each of
@@ -434,7 +654,7 @@ impl Mft {
                 return None;
             }
             components.push((reference, component));
-            reference = directory.parent_reference();
+            reference = parent;
         };
 
         // Top down. A too-long directory can never resolve, so it is cached
@@ -467,6 +687,69 @@ impl Mft {
         join_within_limit(&path, &name.to_os_string())
     }
 
+    /// The best name of the live record `reference` names, and the parent reference that name
+    /// holds: one step of [`Self::resolve_path`]'s walk. A scan's directory name index
+    /// (see [`MftScan`](crate::MftScan)) is authoritative, including a missing entry: a directory
+    /// readable only in pass 2 must not change the answer with the current window or cache.
+    pub(crate) fn directory_name(&self, reference: u64) -> Option<(OsString, u64)> {
+        let record_number = reference & RECORD_NUMBER_MASK;
+        if let Some(names) = self.side().and_then(|side| side.names()) {
+            let entry = names.get(record_number)?;
+            return (entry.liveness == Liveness::Live && entry.reference == reference)
+                .then(|| (entry.name.to_os_string(), entry.parent));
+        }
+        // The record must be a live base directory: a freed record still holds its names, and
+        // `best_name` returns them to whoever asks; an extension record's own directory flag is
+        // meaningless (see `is_directory_parent`).
+        self.record(record_number)
+            .filter(|record| {
+                record.reference() == reference
+                    && record.is_used()
+                    && self.is_allocated(record_number)
+                    && Self::is_directory_parent(record)
+            })
+            .and_then(|record| record.best_name())
+            .map(|name| (name.to_os_string(), name.parent_reference()))
+    }
+
+    /// The best name of the live or freed record `reference` names, and the parent reference
+    /// that name holds: one step of [`Self::resolve_deleted_path`]'s walk, live or freed
+    /// directories alike. A scan's directory name index (see [`MftScan`](crate::MftScan)) also
+    /// keeps freed directories, with the liveness they were indexed at. As for the live walk,
+    /// a missing entry stays missing in every chunk.
+    pub(crate) fn deleted_directory_name(&self, reference: u64) -> Option<(OsString, u64)> {
+        let record_number = reference & RECORD_NUMBER_MASK;
+        if let Some(names) = self.side().and_then(|side| side.names()) {
+            let entry = names.get(record_number)?;
+            return entry
+                .liveness
+                .names(reference, entry.reference)
+                .then(|| (entry.name.to_os_string(), entry.parent));
+        }
+        // A parent is a directory the reference names: live, or freed with the sequence a
+        // delete leaves. A file's record is never one, and neither is an extension record (see
+        // `is_directory_parent`).
+        self.record(record_number)
+            .filter(|record| {
+                Self::is_directory_parent(record)
+                    && self.reference_liveness(reference, &record.record).is_some()
+            })
+            .and_then(|record| record.best_name())
+            .map(|name| (name.to_os_string(), name.parent_reference()))
+    }
+
+    /// Root has no directory-name entry. During a scan its pass-1 bytes are authoritative too:
+    /// if pass 1 rejected it, a readable root in the current window cannot revive the path.
+    fn is_root_reference(&self, reference: u64) -> bool {
+        let root = if let Some(side) = self.side() {
+            side.record(ROOT_RECORD)
+                .and_then(|data| NtfsFile::new(self, ROOT_RECORD, data))
+        } else {
+            self.record(ROOT_RECORD)
+        };
+        root.is_some_and(|root| root.reference() == reference)
+    }
+
     /// Marks every reference on a failing chain, plus the reference whose
     /// lookup failed, as unresolvable, so a later resolution through any of
     /// them short-circuits instead of repeating the walk.
@@ -479,6 +762,19 @@ impl Mft {
             cache.insert_failed(*reference);
         }
         cache.insert_failed(failed_at);
+    }
+
+    /// Whether `record` can stand as a directory in a parent chain: shared by
+    /// [`resolve_path`](Self::resolve_path) and
+    /// [`resolve_deleted_path`](Self::resolve_deleted_path), the one place
+    /// that decides it. Only a base record answers
+    /// [`NtfsFile::is_directory`] meaningfully ("Extension records never
+    /// say: ask the base record."), so an extension record is refused
+    /// whatever its own directory flag says; a parent reference naming one
+    /// (corrupt: a real parent reference never does) is refused like any
+    /// other unresolvable one instead of resolving to the base's name.
+    fn is_directory_parent(record: &NtfsFile) -> bool {
+        !record.is_extension() && record.is_directory()
     }
 }
 
@@ -556,6 +852,7 @@ impl Mft {
         name: &NtfsFileName,
         cache: &mut DeletedPathCache,
     ) -> DeletedPath {
+        cache.check_owner(self.id());
         let leaf = name.to_os_string();
         // Directories walked so far, leaf's parent first, with no cache entry.
         let mut pending: Vec<(u64, OsString)> = Vec::new();
@@ -569,16 +866,13 @@ impl Mft {
             walk_budget::step();
             let record_number = reference & RECORD_NUMBER_MASK;
             if record_number == ROOT_RECORD {
-                let is_root = self
-                    .record(ROOT_RECORD)
-                    .is_some_and(|root| root.reference() == reference);
-                break Some(if is_root {
+                break Some(if self.is_root_reference(reference) {
                     Parent::Volume
                 } else {
                     Parent::Marker(DeletedPathMarker::Lost(record_number))
                 });
             }
-            match cache.0.get(&reference) {
+            match cache.entries.get(&reference) {
                 Some(DeletedEntry::Marker(marker)) => break Some(Parent::Marker(*marker)),
                 Some(DeletedEntry::Dir { .. }) => break Some(Parent::Dir(reference)),
                 Some(DeletedEntry::TooLong) => break None,
@@ -609,7 +903,7 @@ impl Mft {
                     .min()
                     .unwrap_or(record_number);
                 for (member, _) in members {
-                    cache.0.insert(
+                    cache.entries.insert(
                         member,
                         DeletedEntry::Marker(DeletedPathMarker::Lost(lowest)),
                     );
@@ -617,36 +911,26 @@ impl Mft {
                 break Some(Parent::Marker(DeletedPathMarker::Lost(lowest)));
             }
 
-            // A parent is a directory the reference names: live, or freed with
-            // the sequence a delete leaves. A file's record is never one.
-            let directory = self
-                .record(record_number)
-                .filter(|record| {
-                    record.is_directory()
-                        && self.reference_liveness(reference, &record.record).is_some()
-                })
-                .and_then(|record| record.best_name());
-            let Some(directory) = directory else {
+            let Some((component, parent)) = self.deleted_directory_name(reference) else {
                 break Some(Parent::Marker(DeletedPathMarker::Lost(record_number)));
             };
 
-            let component = directory.to_os_string();
             if component.eq_ignore_ascii_case(DELETED_DIRECTORY)
-                && directory.parent_reference() & RECORD_NUMBER_MASK == EXTEND_RECORD
+                && parent & RECORD_NUMBER_MASK == EXTEND_RECORD
             {
                 cache
-                    .0
+                    .entries
                     .insert(reference, DeletedEntry::Marker(DeletedPathMarker::Deleted));
                 break Some(Parent::Marker(DeletedPathMarker::Deleted));
             }
             pending.push((reference, component));
-            reference = directory.parent_reference();
+            reference = parent;
         };
 
         let Some(mut parent) = end else {
             // Everything below a too-long directory is too long.
             for (reference, _) in pending {
-                cache.0.insert(reference, DeletedEntry::TooLong);
+                cache.entries.insert(reference, DeletedEntry::TooLong);
             }
             return Self::too_long_path(&leaf);
         };
@@ -669,7 +953,7 @@ impl Mft {
                     Some(marker),
                 )
             }
-            Parent::Dir(reference) => match cache.0.get(&reference) {
+            Parent::Dir(reference) => match cache.entries.get(&reference) {
                 Some(DeletedEntry::Dir {
                     units,
                     name,
@@ -684,7 +968,7 @@ impl Mft {
             let next = units + usize::from(!ends_with_separator_now) + utf16_len(&component);
             if resolvable && next <= MAX_PATH_UNITS {
                 (units, ends_with_separator_now) = (next, ends_with_separator_after(&component));
-                cache.0.insert(
+                cache.entries.insert(
                     reference,
                     DeletedEntry::Dir {
                         parent,
@@ -696,7 +980,7 @@ impl Mft {
                 parent = Parent::Dir(reference);
             } else {
                 resolvable = false;
-                cache.0.insert(reference, DeletedEntry::TooLong);
+                cache.entries.insert(reference, DeletedEntry::TooLong);
             }
         }
         let leaf_units = units + usize::from(!ends_with_separator_now) + utf16_len(&leaf);
@@ -718,7 +1002,7 @@ impl Mft {
             match current {
                 Parent::Volume => break self.volume().path(),
                 Parent::Marker(_) => break Path::new(""),
-                Parent::Dir(reference) => match cache.0.get(&reference) {
+                Parent::Dir(reference) => match cache.entries.get(&reference) {
                     Some(DeletedEntry::Dir { parent, name, .. }) => {
                         names.push(name.as_os_str());
                         current = *parent;

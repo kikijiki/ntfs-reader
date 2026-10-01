@@ -133,6 +133,25 @@ fn main() {
     );
     drop(cache);
 
+    // A bound comfortably below the unbounded heap just measured above shows whether a full
+    // scan's real heap tracks the limit (not a multiple of it): `cache.bytes()` charges the
+    // index's and slab's real capacity growth plus each live path's real capacity, so it should
+    // track this line's own allocator-counted Heap column closely (see `DefaultPathCache`'s doc
+    // comment). The allocator's own count is the ground truth.
+    let limit = cache_heap / 4;
+    let before = LIVE.load(Ordering::Relaxed);
+    let mut bounded = DefaultPathCache::with_max_bytes(limit);
+    let time = full_scan(&mft, &mut bounded);
+    let bounded_heap = LIVE.load(Ordering::Relaxed) - before;
+    println!(
+        "| full scan, DefaultPathCache::with_max_bytes({:.1} MiB) | {time:.2?} | {} | {:.1} MiB (cache.bytes() {:.1} MiB) |\n",
+        mib(limit),
+        per_file(time),
+        mib(bounded_heap),
+        mib(bounded.bytes())
+    );
+    drop(bounded);
+
     println!("| Files resolved | Directories cached | Heap |");
     println!("| --- | --- | --- |");
     for count in [10, 100, 1000, files.len()] {

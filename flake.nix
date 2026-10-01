@@ -64,7 +64,7 @@
               require_file "$vm_dir/uefi-vars.fd"
               require_file "$vm_dir/payload"
 
-              # The stress disk (`S:` in the guest, see tools/vm/stress.ps1 in the dev docs) is thin
+              # The stress disk (`S:` in the guest) is thin
               # and created on first start. `NTFS_READER_STRESS_DISK` moves it (for example onto an
               # external SSD); a directory that is not there means the drive is not mounted, and the
               # disk is never created anywhere else. Deleting the file is safe: the next start makes

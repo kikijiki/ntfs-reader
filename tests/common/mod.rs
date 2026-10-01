@@ -7,7 +7,12 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
-use ntfs_reader::{Journal, Mft, NtfsReaderResult};
+use ntfs_reader::{DefaultPathCache, DeletedPathCache, Journal, Mft, MftScan, NtfsReaderResult};
+
+use ntfs_reader as reader;
+#[path = "../../src/tests/snapshot.rs"]
+mod snapshot;
+pub use snapshot::FileSnapshot;
 
 /// Letter of the NTFS volume the integration tests and benches may write to.
 ///
@@ -24,6 +29,25 @@ pub fn test_volume_letter() -> String {
         "the tests would delete and recreate its USN journal. Use a disposable volume, or set \
          NTFS_READER_ALLOW_SYSTEM_DRIVE=1 on a throwaway machine",
     )
+}
+
+/// Device path of a Volume Shadow Copy of [`test_volume_letter`]'s volume, taken after
+/// creating the fixtures required by `shadow_copy_tests.rs`. Set `NTFS_READER_TEST_SHADOW`
+/// to a device path such as `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy4`.
+/// The crate does not create shadow copies. Returns `None` when the variable is unset.
+pub fn shadow_device_path() -> Option<String> {
+    env::var("NTFS_READER_TEST_SHADOW")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Device path of a Volume Shadow Copy of [`parity_volume_letter`]'s volume, supplied by
+/// `NTFS_READER_PARITY_SHADOW`. Its frozen contents permit exact comparisons between loaders.
+/// Returns `None` when unset; tests requiring a shadow then report a skip.
+pub fn parity_shadow_device_path() -> Option<String> {
+    env::var("NTFS_READER_PARITY_SHADOW")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Letter of the NTFS volume the Win32 parity test reads (`NTFS_READER_PARITY_VOLUME`, same
@@ -63,8 +87,19 @@ fn volume_letter(variable: &str, unset_hint: &str, system_drive_hint: &str) -> S
     letter.to_string()
 }
 
+/// `NTFS_READER_PARITY_STRIDE=n`: check only every n-th file on a whole-volume comparison
+/// (default 1, all of them). The scan/cache comparisons in `scan_stress_tests.rs` and the
+/// separate helper in `win32_parity_tests.rs` use this to sample large volumes.
+pub fn parity_stride() -> u64 {
+    env::var("NTFS_READER_PARITY_STRIDE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&stride| stride > 0)
+        .unwrap_or(1)
+}
+
 /// Whether `NTFS_READER_REQUIRE_ALL=1` is set: a test that cannot reach the state it checks then
-/// fails instead of reporting a skip (the maintainer's VM run sets it for the normal pass).
+/// fails instead of reporting a skip.
 pub fn require_all() -> bool {
     env::var("NTFS_READER_REQUIRE_ALL").is_ok_and(|v| v == "1")
 }
@@ -72,30 +107,37 @@ pub fn require_all() -> bool {
 /// Whether `NTFS_READER_ALLOW_FSUTIL=1` is set: the test may make a persistent change outside the
 /// test volume. Two things do: `fsutil behavior set DisableDeleteNotify` (system-wide, survives
 /// reboots) and `EncryptFileW` (creates an EFS certificate and key in the user profile if none
-/// exists). Set on the maintainer's VM; unset on a dev machine, where those tests skip instead.
+/// exists). Tests requiring these changes skip when the variable is unset.
 pub fn allow_fsutil() -> bool {
     env::var("NTFS_READER_ALLOW_FSUTIL").is_ok_and(|v| v == "1")
 }
 
 /// Appends `line` to the file `NTFS_READER_SKIP_LOG` names, when it names one.
+///
+/// Tests run on parallel threads, and `writeln!` on an unbuffered `File` writes the text and the
+/// newline as separate calls, so two skips at once could interleave into one malformed line. The
+/// whole line goes out in one `write_all`, under a lock shared by this process's tests.
 fn append_to_skip_log(line: &str) {
     use std::io::Write;
+    use std::sync::Mutex;
 
+    static LOCK: Mutex<()> = Mutex::new(());
     if let Some(log) = env::var_os("NTFS_READER_SKIP_LOG") {
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)
         {
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
 
 /// Reports that `test` could not check what it is for, then returns so the test ends. Prints
 /// `SKIPPED: <test>: <reason>` and, if `NTFS_READER_SKIP_LOG` names a file, appends the line
-/// there too (libtest hides a passing test's output, so the maintainer's VM run counts these
-/// lines instead). Panics under `NTFS_READER_REQUIRE_ALL=1`: a skip must not look like a pass.
+/// there too, so skips remain visible even when libtest hides a passing test's output. Panics
+/// under `NTFS_READER_REQUIRE_ALL=1`: a skip must not look like a pass.
 ///
 /// Use [`skip_environment`] instead for a test that cannot run because of the machine, not a
 /// missing fixture or an unreached state.
@@ -114,13 +156,11 @@ pub fn skip(test: &str, reason: &str) {
 /// `NTFS_READER_SKIP_LOG` with an `[env]` marker, counted apart from other skips. Unlike [`skip`],
 /// does NOT fail under `NTFS_READER_REQUIRE_ALL=1`.
 ///
-/// For a machine property the crate cannot control and a retry will not change: whether TRIM
-/// reaches a virtual disk depends on the disk and its load (measured on the test VM: a lone delete
-/// followed by raw reads saw freed clusters zeroed at 10s, 1011 of 1024; the same wait after
-/// heavy fills in one process saw none in 30s on the same disk). Such a test only shows crate
-/// behavior when the environment cooperates (here: that `Free` can hide zeroes), so a quiet disk
-/// must not fail it, though the skip stays visible in the log. A skip caused by the test itself
-/// (a missing fixture, a fill that missed the victim) goes through [`skip`] instead.
+/// For a machine property the crate cannot control and a retry will not reliably change: for
+/// example, whether TRIM reaches a virtual disk depends on the disk and its load. A test of
+/// zeroed freed clusters can only exercise that behavior when the environment cooperates, so
+/// absent TRIM must not fail it, though the skip stays visible in the log. A skip caused by the
+/// test itself (a missing fixture, a fill that missed the victim) goes through [`skip`] instead.
 pub fn skip_environment(test: &str, reason: &str) {
     let line = format!("SKIPPED (environment): {test}: {reason}");
     eprintln!("{line}");
@@ -290,4 +330,190 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+// ---- MftScan vs. Mft -------------------------------------------------------------------------
+
+/// Chunk sizes for the scan-vs-`Mft` comparison: 1, 2, a prime, one record less and more than
+/// the whole `$MFT`, and the default `MftScan::new` picks. `record_count` is
+/// the volume's `Mft::record_count()`; the two edge sizes are clamped to stay at least 1 so a
+/// near-empty test volume does not panic here (`with_chunk_records` clamps too, but a 0 or
+/// negative size would collapse two cases into one, weakening the sweep instead of failing it).
+pub fn scan_chunk_sizes(record_count: u64) -> Vec<u64> {
+    const A_PRIME: u64 = 97;
+    const DEFAULT_CHUNK_RECORDS: u64 = 4096;
+    let mut sizes = vec![
+        1,
+        2,
+        A_PRIME,
+        record_count.saturating_sub(1).max(1),
+        record_count + 1,
+        DEFAULT_CHUNK_RECORDS,
+    ];
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// `NTFS_READER_PARITY_POLICY=live` opts in to tolerance for changing volumes; `quiet` requires
+/// exact comparison and is the default when unset. Reject misspellings rather than weakening
+/// the comparison.
+pub fn parity_policy() -> ComparisonPolicy {
+    match env::var("NTFS_READER_PARITY_POLICY").as_deref() {
+        Ok("live") => ComparisonPolicy::Live,
+        Ok("quiet") | Err(env::VarError::NotPresent) => ComparisonPolicy::Quiet,
+        value => panic!("NTFS_READER_PARITY_POLICY must be quiet or live, got {value:?}"),
+    }
+}
+
+pub use snapshot::ComparisonPolicy;
+
+#[derive(Default)]
+pub struct Differences {
+    compared: usize,
+    count: usize,
+    examples: Vec<String>,
+}
+
+impl Differences {
+    fn add(&mut self, message: impl FnOnce() -> String) {
+        self.count += 1;
+        if self.examples.len() < 10 {
+            self.examples.push(message());
+        }
+    }
+}
+
+/// Compare one population in record-number order without retaining every rich snapshot. This
+/// keeps the million-file x86 stress runs bounded by their path caches and the loaded Mft.
+struct FileComparison<'a, I: Iterator<Item = reader::NtfsFile<'a>>> {
+    whole: &'a Mft,
+    expected: std::iter::Peekable<I>,
+    expected_cache: DefaultPathCache,
+    expected_deleted_cache: DeletedPathCache,
+    found_cache: DefaultPathCache,
+    found_deleted_cache: DeletedPathCache,
+    differences: Differences,
+}
+
+impl<'a, I: Iterator<Item = reader::NtfsFile<'a>>> FileComparison<'a, I> {
+    fn new(whole: &'a Mft, expected: I) -> Self {
+        Self {
+            whole,
+            expected: expected.peekable(),
+            expected_cache: DefaultPathCache::new(),
+            expected_deleted_cache: DeletedPathCache::new(),
+            found_cache: DefaultPathCache::new(),
+            found_deleted_cache: DeletedPathCache::new(),
+            differences: Differences::default(),
+        }
+    }
+
+    fn observe(&mut self, file: &reader::NtfsFile<'_>, source: &impl snapshot::PathSource) {
+        while self
+            .expected
+            .peek()
+            .is_some_and(|expected| expected.number() < file.number())
+        {
+            let missing = self.expected.next().unwrap();
+            self.differences.compared += 1;
+            self.differences
+                .add(|| format!("missing file {}", missing.number()));
+        }
+        if !self
+            .expected
+            .peek()
+            .is_some_and(|expected| expected.number() == file.number())
+        {
+            self.differences
+                .add(|| format!("unexpected file {}", file.number()));
+            return;
+        }
+        let expected = self.expected.next().unwrap();
+        self.differences.compared += 1;
+        let expected = FileSnapshot::new(
+            &expected,
+            self.whole,
+            &mut self.expected_cache,
+            &mut self.expected_deleted_cache,
+        );
+        let found = FileSnapshot::new(
+            file,
+            source,
+            &mut self.found_cache,
+            &mut self.found_deleted_cache,
+        );
+        if found != expected {
+            self.differences.add(|| {
+                format!(
+                    "file {}: found {found:?}, expected {expected:?}",
+                    file.number()
+                )
+            });
+        }
+    }
+
+    fn finish(mut self) -> Differences {
+        for missing in self.expected {
+            self.differences.compared += 1;
+            self.differences
+                .add(|| format!("missing file {}", missing.number()));
+        }
+        self.differences
+    }
+}
+
+pub fn compare_scan(whole: &Mft, scan: &mut MftScan) -> [Differences; 2] {
+    let mut live = FileComparison::new(whole, whole.files());
+    let mut deleted = FileComparison::new(whole, whole.deleted_files());
+    while let Some(chunk) = scan.next_chunk().expect("a chunk") {
+        for file in chunk.files() {
+            live.observe(&file, &chunk);
+        }
+        for file in chunk.deleted_files() {
+            deleted.observe(&file, &chunk);
+        }
+    }
+    [live.finish(), deleted.finish()]
+}
+
+pub fn compare_mfts(whole: &Mft, found: &Mft) -> [Differences; 2] {
+    let mut live = FileComparison::new(whole, whole.files());
+    let mut deleted = FileComparison::new(whole, whole.deleted_files());
+    for file in found.files() {
+        live.observe(&file, found);
+    }
+    for file in found.deleted_files() {
+        deleted.observe(&file, found);
+    }
+    [live.finish(), deleted.finish()]
+}
+
+#[track_caller]
+pub fn assert_parity(policy: ComparisonPolicy, context: &str, differences: [Differences; 2]) {
+    let accepted =
+        policy.accepts_populations(differences.each_ref().map(|d| (d.count, d.compared)));
+    for (kind, differences) in ["live", "deleted"].into_iter().zip(differences) {
+        if policy == ComparisonPolicy::Live && kind == "deleted" {
+            eprintln!(
+                "{context}: deleted differences are informational on a live volume; \
+                 exact deleted parity requires a quiet volume or shadow"
+            );
+        }
+        eprintln!(
+            "{context}: {kind}: {} differences / {} expected files, policy={policy:?}",
+            differences.count, differences.compared
+        );
+        for problem in differences.examples {
+            eprintln!("{kind}: {problem}");
+        }
+    }
+    let requirement = match policy {
+        ComparisonPolicy::Quiet => "live and deleted checked separately",
+        ComparisonPolicy::Live => "live files gated; deleted differences informational",
+    };
+    assert!(
+        accepted,
+        "{context}: public-file parity failed under {policy:?} policy ({requirement})"
+    );
 }

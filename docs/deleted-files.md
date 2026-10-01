@@ -176,8 +176,9 @@ so zeroes or noise are an answer, not an error.
   directories alike; `name.parent_reference() == directory.reference()` does not, since a freed
   record's sequence number is one higher.
 - Compressed and encrypted streams cannot be read (see [reading data](reading-data.md)); like the rest of the crate, everything here needs an elevated process.
-- One `Mft` can be shared across threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap` and
-  the path caches are `Send + Sync`); a path cache needs `&mut`, so give each thread its own.
+- One `Mft` can be shared across threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap`,
+  `MftChunk` and the path caches are `Send + Sync`); a path cache needs `&mut`, so give each
+  thread its own. `MftScan` is `Send` but not `Sync` (`next_chunk` needs `&mut self`).
 - To find what a USN journal `FILE_DELETE` record deleted, load the `Mft` before the delete: it
   then has both the record and its parent as live records (`record_by_id(record.file_id)` returns
   the file, `resolve_path` works, `record.parent_id` names its directory). An `Mft` loaded after

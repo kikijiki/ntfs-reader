@@ -68,7 +68,7 @@ pub enum NtfsReaderError {
         /// What is wrong with it.
         details: &'static str,
     },
-    /// A boot sector field is out of range.
+    /// A boot sector field is out of range, including a file-system size above the device or image length.
     #[error("invalid boot sector field: {field}")]
     InvalidBootSector {
         /// The offending field.

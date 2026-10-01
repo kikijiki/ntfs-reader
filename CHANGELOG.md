@@ -5,7 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-10-01
+
+### Added
+
+- `MftScan` and `MftChunk` for scanning live and deleted files without holding the whole `$MFT`
+  in memory. Existing file metadata, path and stream APIs work on files from a chunk. Random
+  record lookup is limited to the current chunk and retained records; use `Mft` for whole-volume
+  random access. Changes to a live volume can affect results; a Volume Shadow Copy provides a
+  consistent snapshot. See [scanning a large volume](docs/paths-and-caches.md#scanning-a-large-volume).
+- `Mft::new_compact(volume)` loads a whole `Mft` with 30 to 70 percent less memory on the volumes
+  measured, at roughly 1.5 to 2 times the load time. All existing accessors work, including those
+  for deleted files.
+- `DefaultPathCache::with_max_bytes(max_bytes)` sets a memory budget with least recently used
+  eviction; `bytes()` reports the cache's current memory cost. A single oversized entry can
+  exceed the budget. `new()` remains unbounded, and eviction does not change resolved paths.
+- `MftId`, the opaque identity of one `Mft` load or `MftScan`, and `PathCache::check_owner` for
+  detecting reuse across loads. `DefaultPathCache` and `DeletedPathCache` clear their contents
+  when used with a different load. The hook defaults to doing nothing; custom caches reused
+  across loads should override it to clear entries when the identity changes. Chunks of one
+  scan share an identity, so they can share a cache.
+- A guide to [reading from a Volume Shadow Copy](docs/shadow-copies.md), using the shadow device
+  paths already accepted by `Volume::new`.
+- `--compact` and `--scan` modes in the `read_mft` example, plus file counts and memory usage
+  reporting in every mode.
+
+### Changed
+
+- **Breaking:** `PathCache::get` now takes `&mut self` instead of `&self`. Update custom
+  implementations to match; this lets a bounded cache track accesses for eviction.
+- `Volume::new` rejects a boot sector claiming a file-system size larger than what backs it, with
+  `NtfsReaderError::InvalidBootSector { field: "total_sectors" }`: the device's length for a volume
+  or disk path, the file's length for a flat NTFS image opened by path. Unused space after the file
+  system is allowed; the reported volume size still excludes it. A path whose length cannot be
+  obtained either way now fails construction with an I/O error.
+
+### Fixed
+
+- On corrupt volumes, `Mft::resolve_path` no longer resolves through a parent that is not a
+  directory, and both it and `Mft::resolve_deleted_path` reject extension-record parents. These
+  invalid references now produce `None` or `DeletedPathMarker::Lost`, respectively.
 
 ## [0.5.3] - 2026-09-28
 
@@ -442,7 +481,7 @@ is 6 times faster.
 First tagged release. The crate could already read the `$MFT` into memory and read the USN journal.
 Earlier history (0.1.0 to 0.2.0, 2022) is not tagged and is not covered here.
 
-[Unreleased]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.3...HEAD
+[0.6.0]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/kikijiki/ntfs-reader/compare/v0.5.0...v0.5.1
