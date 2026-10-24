@@ -1,13 +1,14 @@
 # Deleted files
 
-Reading deleted files: what you get back, and what was measured. Reads the raw volume, so it
-needs an elevated process (see "Opening a volume" in the README). Other guides:
-[reading data](reading-data.md),
-[paths and caches](paths-and-caches.md), [the journal](journal.md).
+How to read deleted files and what you can expect to get back. This reads the raw volume, so it
+needs an elevated process (see "Opening a volume" in the README).
 
-Deleting a file frees its MFT record and clusters; little else changes. Name, times, size and
-cluster list usually stay in the record; the data stays in the clusters until NTFS reuses them.
-This crate reads all of it. Recovery is best effort.
+Deleting a file frees its MFT record and clusters, and not much else. The name, times, size and
+cluster list usually stay in the record, and the data stays in the clusters until NTFS reuses
+them. Recovery is best effort.
+
+Other guides: [reading data](reading-data.md), [paths and caches](paths-and-caches.md),
+[the journal](journal.md).
 
 ## What you can get
 
@@ -24,12 +25,13 @@ This crate reads all of it. Recovery is best effort.
 | Is it deleted             | `NtfsFile::is_deleted`. `FileInfo::is_deleted`.                                                  |
 | What a journal delete was | `Mft::record_by_id` with a `FILE_DELETE` record's `file_id`.                                     |
 
-`is_deleted()` means the file's base record is freed. `deleted_files()` is narrower: it also
-needs record number 24+ and a `$STANDARD_INFORMATION` or `$FILE_NAME`, so a freed record without
-either, or a freed system record, counts as deleted but is not listed. The accessors work the same
-on live and deleted files, so code for `mft.files()` also works on `mft.deleted_files()`.
-`NtfsFile::file_id` keeps a file's live id, so `record_by_id(file.file_id())` finds it either way;
-`reference`'s sequence number bumps by one on delete.
+- `is_deleted()` means the file's base record is freed.
+- `deleted_files()` is narrower. It also needs record number 24 or higher and a
+  `$STANDARD_INFORMATION` or `$FILE_NAME`, so some freed records are not listed.
+- Accessors work the same on live and deleted files, so code for `mft.files()` also works on
+  `mft.deleted_files()`.
+- `NtfsFile::file_id` keeps the live id, so `record_by_id(file.file_id())` finds the file either way.
+  The sequence number in `reference` goes up by one on delete.
 
 ```rust,no_run
 use std::{fs::File, io};
@@ -68,145 +70,178 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`examples/list_deleted.rs` and `examples/recover_file.rs` build on these calls with the checks a
-real tool needs (partial copies, refused destinations, exit codes). Paths and their markers are
-covered in [paths and caches](paths-and-caches.md).
+`examples/list_deleted.rs` and `examples/recover_file.rs` add the checks a real tool needs: partial
+copies, refused destinations, exit codes. Paths and markers are in
+[paths and caches](paths-and-caches.md).
 
 ## Flush the volume first
 
-Everything here reads through a normal volume handle; the measurements below were made with the
-volume flushed before every load. A file deleted a moment ago can still look live in a raw read,
-or, since its in-use flag and `$BITMAP` bit are written at different times, appear in neither
-`Mft::files()` nor `Mft::deleted_files()`. Flush before `Mft::new`, `ClusterBitmap::new` and
-`open_stream`:
+The reader goes through a normal volume handle, so a file deleted a moment ago can still look live.
+It can also show up in neither `Mft::files()` nor `Mft::deleted_files()`, because its in-use flag
+and `$BITMAP` bit are written at different times.
+
+Flush before `Mft::new`, `ClusterBitmap::new` and `open_stream`:
 
 ```rust,no_run
-# fn main() -> std::io::Result<()> {
-// `sync_all` on a volume opened for writing is `FlushFileBuffers`. Nothing is written.
-// It needs the same elevation as reading the volume. In PowerShell: `Write-VolumeCache C`.
-std::fs::OpenOptions::new().read(true).write(true).open(r"\\.\C:")?.sync_all()?;
-# Ok(())
-# }
+fn main() -> std::io::Result<()> {
+    // `sync_all` on a volume opened for writing is `FlushFileBuffers`. Nothing is written.
+    // It needs the same elevation as reading the volume. In PowerShell: `Write-VolumeCache C`.
+    std::fs::OpenOptions::new().read(true).write(true).open(r"\\.\C:")?.sync_all()?;
+    Ok(())
+}
 ```
 
-## How much of a file you get back
+## How much you get back
 
-Read the bytes, and look at the allocation first. There are three outcomes.
+Check the allocation before trusting the bytes. There are three outcomes.
 
-- **Whole.** Nothing was written to the clusters after delete: `allocation()` gives
-  `AllocationState::Free`, and the bytes read are the file's own. `Free` only means unallocated
-  now, not untouched: if file B took the clusters and was deleted in turn, both show `Free` and
-  hold B's bytes. Measured: a file read right after deletion came back intact, every cluster.
-- **Partly.** NTFS gave some clusters to new files: `AllocationState::PartlyAllocated`.
-  `StreamAllocation` counts bytes in free clusters (`in_free_clusters`) and allocated ones
-  (`in_allocated_clusters`); allocated-cluster bytes belong to another file now. A stream can also
-  have `missing` bytes, when the extension record holding their location is gone: reading them
-  returns `NtfsReaderError::StreamExtentMissing` (inside the `io::Error` from `read`) after the
-  bytes before them. `AllocationState::Incomplete` then means part has no known location,
-  regardless of the rest.
-- **Not at all.** Either every cluster was reused (`Allocated`), or the record lost the data's
-  location (`data_lost` is `true`, state `Lost`). The latter hits a deleted file with an
-  `$ATTRIBUTE_LIST`, which NTFS creates for files with many hard links or alternate streams (30 of
-  either tested): NTFS zeroes such a file's non-resident stream sizes and cluster lists on
-  delete. They open as empty streams, same as one that was actually empty; only `data_lost` tells
-  the two apart. A resident stream, small enough for the MFT record, stays intact even when
-  another stream of the same file is lost (`stream_data_lost` per file, `data_lost` per stream).
+### Whole
 
-What each `AllocationState` (from `StreamAllocation::state`) means for a deleted file:
+Nothing was written to the clusters after the delete.
 
-| State             | Meaning                                                                          | What to do                                        |
-| ----------------- | --------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `Free`            | Byte sits in a now-unallocated cluster. Not "untouched": see above.  | Read it, then check the bytes.                    |
-| `PartlyAllocated` | Some bytes in free clusters, some allocated.                         | Use `in_free_clusters` and `in_allocated_clusters`. |
-| `Allocated`       | Every byte is in a cluster another file uses now.                    | Another file's bytes. Nothing to recover.         |
-| `NoStoredData`    | Nothing stored: empty, resident, sparse, or past initialized size.   | A resident stream reads normally.                 |
-| `Incomplete`      | Part has no known place (`missing`, `outside_bitmap`). Wins over the others. | Read what's located, expect an error at the rest. |
-| `Lost`            | Runs lost on delete (`data_lost`); nothing else known missing.       | Nothing can be located.                           |
+- `allocation()` gives `AllocationState::Free` and the bytes are the file's own.
+- `Free` only means "unallocated now". If file B took the clusters and was deleted too, both files
+  show `Free` and both read B's bytes.
 
-`AllocationState` is `#[non_exhaustive]`: keep a `_` arm.
+### Partly
 
-A free cluster is no guarantee either. On a disk that receives TRIM (an SSD, a thin-provisioned
-virtual disk, any volume with delete notifications on), freed clusters are erased within seconds,
-with no change to `AllocationState::Free`. On a physical NVMe SSD the whole file stayed intact for
-5 to 11 s after the delete, then was erased within half a second, a few edge clusters aside; on a
-virtual disk it took 6 to 20 s, and one busy run saw nothing erased in 30 s. Erased clusters read as
-zeroes, or as random-looking bytes on a BitLocker volume, where the zeroes the SSD returns are
-decrypted. With delete notifications off
-(`fsutil behavior set DisableDeleteNotify NTFS 1`) nothing was erased in 22 minutes. The reader
-returns whatever the volume handle gives, not necessarily what's on the disk (see [The reader is not the disk](reading-data.md#the-reader-is-not-the-disk)),
-so zeroes or noise are an answer, not an error.
+NTFS gave some clusters to new files.
 
-## What erodes it
+- The state is `PartlyAllocated`. `StreamAllocation` counts bytes in free clusters
+  (`in_free_clusters`) and in allocated ones (`in_allocated_clusters`). The latter belong to
+  another file now.
+- A stream can also have `missing` bytes, when the extension record that held their location is
+  gone. Reading them fails with `NtfsReaderError::StreamExtentMissing`, inside the `io::Error`,
+  after the bytes before them. The state is then `Incomplete`.
 
-- **Record reuse.** NTFS assigns the lowest free record number immediately; on a quiet volume the
-  very next file created took it. A deleted file's name, times and sizes last only until a new
-  file takes its record, so expect this fast on an active machine. Low record numbers go first.
-- **Cluster reuse.** New data goes to free clusters, unpredictably. Read right after the delete,
-  and do not write to the volume you recover from.
-- **TRIM**, see above.
-- **Deleted while open.** Measured with `std::fs::remove_file`: a file deleted while a program
-  holds it open keeps its MFT record in use, under `$Extend\$Deleted` with a random name, until
-  the last handle closes. Until then `Mft::files()` lists it under that name and
-  `NtfsFile::is_deleted` is `false`. Once the handle closes, the record frees and the original
-  name and directory are gone for good: only the random name remains, `DeletedPath::marker` is
-  `Some(DeletedPathMarker::Deleted)` and `path` is `<random name>` (shown as
-  `\\.\C:\<deleted>\<random name>`). Seen whenever something (Windows Defender, observed)
-  still held the file open.
-- **`remove_dir_all`.** `std::fs::remove_dir_all` renames each directory to a random name before
-  deleting it. Files inside keep their names, but directory names are lost: the marker is
-  `DeletedPathMarker::Deleted` where the real directories were and `path` is
-  `<random name>\file.txt` (shown as `\\.\C:\<deleted>\<random name>\file.txt`). Deleting
-  entries one at a time (`remove_file`, then `remove_dir`) keeps every directory name. `del`,
-  `rd /s`, `Remove-Item -Recurse` and a Shell permanent delete left the same record state as
-  `remove_file`.
-- **The Recycle Bin.** Sending a file to the Recycle Bin is a rename, not a delete: it stays a
-  live file under `$RECYCLE.BIN`, and `Mft::files()` lists it.
+### Not at all
 
-## Other things to know
+Either every cluster was reused (`Allocated`), or the record lost the data's location
+(`data_lost` is true, state `Lost`).
 
-- There is no deletion time: delete does not change a file's created, modified or accessed times.
-  Modified is when the file was last written, not deleted. The crate offers no "deleted first"
-  order.
-- The `Mft` is a snapshot. A file deleted after `Mft::new` is still live in it; one created after
-  is not in it. Load a new `Mft` to see a new delete. `ClusterBitmap` is a snapshot too.
-- A deleted record may have lost its name: `NtfsFile::best_name` is then `None`, leaving
-  `Mft::resolve_deleted_path` nothing to start from. A deleted directory loses its child list, so
-  find them by scanning names whose parent is the directory:
-  `file.names().any(|name| name.parent_id() == directory.file_id())`. Holds for live and deleted
-  directories alike; `name.parent_reference() == directory.reference()` does not, since a freed
-  record's sequence number is one higher.
-- Compressed and encrypted streams cannot be read (see [reading data](reading-data.md)); like the rest of the crate, everything here needs an elevated process.
-- One `Mft` can be shared across threads (`Mft`, `NtfsFile`, `StreamReader`, `ClusterBitmap`,
-  `MftChunk` and the path caches are `Send + Sync`); a path cache needs `&mut`, so give each
-  thread its own. `MftScan` is `Send` but not `Sync` (`next_chunk` needs `&mut self`).
-- To find what a USN journal `FILE_DELETE` record deleted, load the `Mft` before the delete: it
-  then has both the record and its parent as live records (`record_by_id(record.file_id)` returns
-  the file, `resolve_path` works, `record.parent_id` names its directory). An `Mft` loaded after
-  can still find the file up to a point: `record_by_id` accepts a freed record, but rejects one
-  NTFS has reused, which happened for the very next file on a quiet volume. Paths are a second
-  problem when the directory was also deleted: `resolve_path` returns `None`, while
-  `resolve_deleted_path` still walks it. See [the journal guide](journal.md), "Paths of deleted files".
+- `data_lost` affects deleted files with an `$ATTRIBUTE_LIST`. NTFS creates one for files with many
+  hard links or alternate streams (30 of either were tested).
+- On delete, NTFS zeroes such a file's non-resident stream sizes and cluster lists. The streams
+  open as empty, the same as a stream that really was empty. Only `data_lost` tells them apart.
+- A resident stream stays intact even if another stream of the same file is lost. `data_lost` is
+  per stream, and `stream_data_lost` is per file.
 
-## What was measured
+### States
 
-Measured on Windows 11 (build 10.0.26200), NTFS 3.1, 4 KiB clusters, 1 KiB file records, 8.3
-names on: a quiet 600 GB volume on a VM's virtual disk, and the system volume of a laptop (NVMe
-SSD, BitLocker). Deletions used `std::fs::remove_file` and `remove_dir` unless noted.
+| State             | Meaning                                                                | What to do                                          |
+| ----------------- | ---------------------------------------------------------------------- | --------------------------------------------------- |
+| `Free`            | In a cluster that is unallocated now. Not necessarily untouched.       | Read it, then check the bytes.                      |
+| `PartlyAllocated` | Some bytes in free clusters, some in allocated ones.                   | Use `in_free_clusters` and `in_allocated_clusters`. |
+| `Allocated`       | Every byte is in a cluster another file uses now.                      | Nothing to recover.                                 |
+| `NoStoredData`    | Empty, resident, sparse, or past the initialized size.                 | A resident stream reads normally.                   |
+| `Incomplete`      | Part has no known location (`missing`, `outside_bitmap`). Wins over the others. | Read what is located, expect an error at the rest. |
+| `Lost`            | Runs lost on delete (`data_lost`), nothing else known to be missing.   | Nothing can be located.                             |
+
+`AllocationState` is `#[non_exhaustive]`, so keep a `_` arm.
+
+### TRIM
+
+A free cluster is no guarantee either. On a disk that gets TRIM, freed clusters are erased within
+seconds, and `AllocationState::Free` doesn't change.
+
+- Physical NVMe SSD: intact for 5 to 11 s after the delete, then erased within half a second
+  (a few edge clusters aside).
+- Virtual disk: erased after 6 to 20 s. One busy run saw nothing erased in 30 s.
+- Delete notifications off (`fsutil behavior set DisableDeleteNotify NTFS 1`): nothing erased in
+  22 minutes.
+- Erased clusters read as zeroes, or as random-looking bytes on BitLocker (the SSD's zeroes get
+  decrypted).
+
+The reader returns what the volume handle gives, which isn't always what is on the disk (see
+[The reader is not the disk](reading-data.md#the-reader-is-not-the-disk)). Zeroes or noise are an
+answer, not an error.
+
+## Why recovery fails
+
+### Record reuse
+
+NTFS gives the lowest free record number to the next file created. On a quiet volume that was the
+very next file. Name, times and size are gone once a new file takes the record, and low record
+numbers go first.
+
+### Cluster reuse
+
+New data goes to free clusters unpredictably. Read right after the delete, and don't write to the
+volume you are recovering from.
+
+### TRIM
+
+See above.
+
+### Deleted while open
+
+With `std::fs::remove_file`, the record stays in use under `$Extend\$Deleted` with a random name
+until the last handle closes. Until then `Mft::files()` lists it and `is_deleted` is `false`.
+
+After the close the record is freed, and the real name and directory are lost for good.
+`DeletedPath::marker` is `Some(DeletedPathMarker::Deleted)` and `path` is `<random name>`
+(displayed as `\\.\C:\<deleted>\<random name>`). Windows Defender kept files open like this in
+testing.
+
+### `remove_dir_all`
+
+It renames each directory to a random name before deleting it.
+
+- Files keep their names, but directory names are lost.
+- The marker is `Deleted` where the directories were, and `path` is `<random name>\file.txt`.
+- Deleting entry by entry (`remove_file`, then `remove_dir`) keeps every name.
+- `del`, `rd /s`, `Remove-Item -Recurse` and a Shell permanent delete behave like `remove_file`.
+
+### Recycle Bin
+
+Moving a file to the Recycle Bin is a rename, not a delete. The file stays live under
+`$RECYCLE.BIN`.
+
+## Notes
+
+- Delete doesn't change the created, modified or accessed times, so there is no deletion time. The
+  crate has no "deleted first" order.
+- `Mft` and `ClusterBitmap` are snapshots. A file deleted after `Mft::new` is still live in it, and
+  a file created after isn't in it. Load a new `Mft` to see a new delete.
+- A deleted record may have lost its name. `best_name` is then `None` and `resolve_deleted_path` has
+  nothing to start from.
+- A deleted directory loses its child list. To find its children, scan for names whose parent is
+  the directory: `file.names().any(|name| name.parent_id() == directory.file_id())`. Don't compare
+  `parent_reference()` with `reference()`, because the sequence number of a freed record is one
+  higher.
+- Compressed and encrypted streams can't be read (see [reading data](reading-data.md)).
+- For sharing an `Mft` across threads, see "Sharing across threads" in
+  [paths and caches](paths-and-caches.md).
+
+### Finding what a journal delete removed
+
+Load the `Mft` before the delete, so the file and its parent are both live records.
+
+- `record_by_id(record.file_id)` returns the file, `resolve_path` works, and `record.parent_id`
+  names the directory.
+- An `Mft` loaded later still finds the file if its record wasn't reused. `record_by_id` accepts a
+  freed record but rejects a reused one.
+- If the directory was deleted too, `resolve_path` returns `None` but `resolve_deleted_path` still
+  works. See "Paths of deleted files" in [the journal](journal.md).
+
+## Measurements
+
+Windows 11 (build 10.0.26200), NTFS 3.1, 4 KiB clusters, 1 KiB file records, 8.3 names on. Tested on
+a quiet 600 GB volume on a VM's virtual disk, and on a laptop's system volume (NVMe SSD,
+BitLocker). Deletions used `std::fs::remove_file` and `remove_dir` unless noted.
 
 - Delete changes only three header fields. Names, times, sizes, resident data and cluster lists
-  survive for a resident file, a contiguous one, a fragmented one (16 runs), a sparse one, and one
-  with alternate streams. A file with an attribute list loses its non-resident streams (from hard
-  links, streams, or data runs alone; resident or non-resident list; sparse and compressed files
-  too), while its clusters keep their bytes until reused or trimmed.
-- A 4 MiB file deleted and read right away: all 1,024 clusters intact. NTFS did not reuse the freed
-  clusters for the next file in two runs; reusing all of them took 124 MiB and 250 MiB of new
-  data.
-- TRIM: intact for 5 to 11 s after the delete on the laptop's SSD (10 runs), 6 to 20 s on the
-  virtual disk, then erased. With delete notifications off, intact for 22 minutes.
-- The sequence number wraps from 0xFFFF to 0 on free; the next live use of the record gets 1.
-- The very next file created after one delete took its record; in another run, 20 new files took
-  the 20 records of 20 deleted ones.
+  survived for resident, contiguous, fragmented (16 runs), sparse and alternate-stream files.
+- A file with an attribute list loses its non-resident streams. This happened with hard links,
+  streams or data runs alone, with resident or non-resident lists, and for sparse and compressed
+  files. The clusters keep their bytes until reused or trimmed.
+- A 4 MiB file read right after deletion had all 1,024 clusters intact. NTFS didn't reuse them for
+  the next file in two runs. Reusing all of them took 124 MiB and 250 MiB of new data.
+- TRIM: see the numbers above.
+- The sequence number wraps from 0xFFFF to 0 on free. The next live use of the record gets 1.
+- The next file created took the freed record. In another run, 20 new files took the 20 records of
+  20 deleted files.
 
-Not measured: other Windows builds, other cluster sizes, 8.3 names off, a spinning disk, `chkdsk`,
-EFS-encrypted files, and Explorer's delete to the Recycle Bin followed by emptying it. Verify what
-this crate reports; treat it as "what the disk holds", not certainty.
+Not measured: other Windows builds, other cluster sizes, 8.3 names off, spinning disks, `chkdsk`,
+EFS-encrypted files, and emptying the Recycle Bin from Explorer. Treat results as what the disk
+holds, not as certainty.
